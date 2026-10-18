@@ -16,8 +16,8 @@ jobs:
     name: Warn on untrusted announcement metadata push
     runs-on: ubuntu-latest
     env:
-      TRUSTED_ANNOUNCERS: KozyBlake
-      WARNING_MENTIONS: "@KozyBlake"
+      TRUSTED_ANNOUNCERS: Hatson321
+      WARNING_MENTIONS: "@Hatson321"
     steps:
       - name: Check actor trust
         id: trust
