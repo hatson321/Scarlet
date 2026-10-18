@@ -50,7 +50,7 @@ public final class LinuxNotificationInstallDialogs
     {
         if (isNotifierInstalled())
             return InstallDialogResult.ALREADY_INSTALLED;
-        if (Platform.CURRENT != Platform.$NIX || Platform.isAndroid() || Platform.isTermux())
+        if (Platform.CURRENT != Platform.$NIX)
             return InstallDialogResult.UNSUPPORTED_PLATFORM;
 
         LOG.warn("notify-send not found on this system");
@@ -222,7 +222,7 @@ public final class LinuxNotificationInstallDialogs
     private static InstallDialogResult handleHeadlessMode(LinuxPackageManagerDetector.PackageManager pm)
     {
         System.out.println("\n========================================");
-        System.out.println("[KozyBlake/Scarlet] Linux desktop notifier required");
+        System.out.println("[Hatson321/Scarlet Logger] Linux desktop notifier required");
         System.out.println("========================================");
         System.out.println("Scarlet needs notify-send to show Linux desktop notifications.");
         if (pm != null)

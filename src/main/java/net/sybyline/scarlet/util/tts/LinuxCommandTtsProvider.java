@@ -1,11 +1,7 @@
 package net.sybyline.scarlet.util.tts;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,16 +12,16 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import net.sybyline.scarlet.Scarlet;
+import net.sybyline.scarlet.util.BoundedProcess;
 
 /**
- * Linux TTS provider backed by distro-packaged command-line engines.
+ * Linux TTS provider backed by locally installed command-line engines.
  *
  * <p>The first Scarlet Linux provider only drove {@code espeak}. This broader
  * implementation keeps eSpeak compatibility, but also discovers Flite, Mimic,
@@ -48,7 +44,7 @@ public class LinuxCommandTtsProvider implements TtsProvider
         this.dir = TtsProviderUtil.checkDir(dir);
         this.initEngines();
         if (this.voices.isEmpty())
-            throw new IOException("No supported Linux TTS command was found on PATH");
+            throw new IOException("No supported Linux TTS command was found on PATH or in the standard Linuxbrew location");
         this.lastVoice.set(this.voices.get(0));
         LOG.info("Linux TTS voices available: {}", this.voices);
     }
@@ -63,17 +59,12 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     public static boolean isCommandAvailable(String command)
     {
-        try
-        {
-            return new ProcessBuilder("sh", "-c", "command -v " + command + " >/dev/null 2>&1")
-                .redirectErrorStream(true)
-                .start()
-                .waitFor() == 0;
-        }
-        catch (Exception ex)
-        {
-            return false;
-        }
+        return LinuxTtsExecutables.find(command) != null;
+    }
+
+    static boolean isCommandAvailable(String command, String searchPath)
+    {
+        return LinuxTtsExecutables.find(command, searchPath) != null;
     }
 
     private void initEngines() throws IOException, InterruptedException
@@ -86,11 +77,12 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private void registerEspeak(String command, String displayName) throws IOException, InterruptedException
     {
-        if (!isCommandAvailable(command))
+        String executable = LinuxTtsExecutables.find(command);
+        if (executable == null)
             return;
 
-        Engine engine = new EspeakEngine(command, displayName);
-        List<String> voiceNames = listEspeakVoices(command);
+        Engine engine = new EspeakEngine(command, displayName, executable);
+        List<String> voiceNames = listEspeakVoices(executable);
         if (voiceNames.isEmpty())
             voiceNames.add("default");
         this.addVoices(engine, voiceNames);
@@ -98,11 +90,12 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private void registerFliteFamily(String command, String displayName, boolean mimic) throws IOException, InterruptedException
     {
-        if (!isCommandAvailable(command))
+        String executable = LinuxTtsExecutables.find(command);
+        if (executable == null)
             return;
 
-        Engine engine = new FliteFamilyEngine(command, displayName, mimic);
-        List<String> voiceNames = listFliteVoices(command);
+        Engine engine = new FliteFamilyEngine(command, displayName, executable, mimic);
+        List<String> voiceNames = listFliteVoices(executable);
         if (voiceNames.isEmpty())
             voiceNames.add("default");
         // A flite-family binary can be installed but non-functional \u2014 e.g. a Mimic 3 binary
@@ -121,7 +114,7 @@ public class LinuxCommandTtsProvider implements TtsProvider
      * are offered. Returns true only on a zero exit code and a non-empty output file. Best-effort;
      * any failure counts as "doesn't work" so the engine is skipped rather than trusted.
      */
-    private boolean engineProducesAudio(Engine engine, String voiceName)
+    private boolean engineProducesAudio(Engine engine, String voiceName) throws InterruptedException
     {
         Path wav = null, log = null;
         try
@@ -130,6 +123,10 @@ public class LinuxCommandTtsProvider implements TtsProvider
             log = Files.createTempFile("scarlet-tts-probe", ".log");
             int code = engine.synthesize(new Voice(engine.key + "/" + voiceName, voiceName, engine), "test", wav, log.toFile(), 1.0F, 1.0F);
             return code == 0 && Files.size(wav) > 0L;
+        }
+        catch (InterruptedException ex)
+        {
+            throw ex;
         }
         catch (Exception ex)
         {
@@ -144,10 +141,11 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private void registerPico()
     {
-        if (!isCommandAvailable("pico2wave"))
+        String executable = LinuxTtsExecutables.find("pico2wave");
+        if (executable == null)
             return;
 
-        Engine engine = new PicoEngine();
+        Engine engine = new PicoEngine(executable);
         this.addVoices(engine, Arrays.asList("en-US", "en-GB", "de-DE", "es-ES", "fr-FR", "it-IT"));
     }
 
@@ -214,6 +212,12 @@ public class LinuxCommandTtsProvider implements TtsProvider
                 LOG.info("Linux TTS generated {} using {}", outWav, voice.id);
                 return outWav;
             }
+            catch (InterruptedException ex)
+            {
+                Thread.currentThread().interrupt();
+                LOG.debug("Linux TTS request interrupted; cleanup was requested for its owned child.");
+                return null;
+            }
             catch (Exception ex)
             {
                 LOG.warn("Linux TTS engine {} failed for voice {}", voice.engine.displayName, voice.id, ex);
@@ -251,8 +255,21 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private static List<String> listEspeakVoices(String command) throws IOException, InterruptedException
     {
-        List<String> out = runAndCollect(Arrays.asList("sh", "-c", command + " --voices 2>/dev/null | awk 'NR>1 {print $2}'"));
-        return cleanVoiceTokens(out);
+        return parseEspeakVoices(runAndCollect(Arrays.asList(command, "--voices")));
+    }
+
+    static List<String> parseEspeakVoices(List<String> lines)
+    {
+        List<String> tokens = new ArrayList<>();
+        for (String line : lines)
+        {
+            if (line == null)
+                continue;
+            String[] columns = line.trim().split("\\s+");
+            if (columns.length >= 2 && columns[0].matches("[0-9]+"))
+                tokens.add(columns[1]);
+        }
+        return cleanVoiceTokens(tokens);
     }
 
     private static List<String> listFliteVoices(String command) throws IOException, InterruptedException
@@ -307,33 +324,31 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private static List<String> runAndCollect(List<String> command) throws IOException, InterruptedException
     {
-        List<String> lines = new ArrayList<>();
         Process process = new ProcessBuilder(command)
             .redirectErrorStream(true)
             .start();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)))
-        {
-            String line;
-            while ((line = reader.readLine()) != null)
-                lines.add(line);
-        }
-        if (!process.waitFor(10L, TimeUnit.SECONDS))
-        {
-            process.destroyForcibly();
-            return Collections.emptyList();
-        }
-        return process.exitValue() == 0 ? lines : Collections.emptyList();
+        BoundedProcess.Result result = BoundedProcess.await(process, 10_000L, 1024 * 1024, () -> false, null);
+        return result.exitCode == 0 && result.terminated
+            ? java.util.Arrays.asList(result.output.split("\\R")) : Collections.emptyList();
     }
 
-    private static int waitFor(Process process, File logFile) throws InterruptedException
+    private static int waitFor(Process process, File logFile) throws IOException, InterruptedException
     {
-        if (!process.waitFor(SYNTH_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+        return waitFor(process, logFile, SYNTH_TIMEOUT_SECONDS * 1000L);
+    }
+
+    static int waitFor(Process process, File logFile, long timeoutMillis) throws IOException, InterruptedException
+    {
+        BoundedProcess.Result result = BoundedProcess.await(process, timeoutMillis, 1024 * 1024, () -> false, null);
+        Files.write(logFile.toPath(), result.output.getBytes(StandardCharsets.UTF_8));
+        if (!result.terminated)
         {
-            process.destroyForcibly();
-            LOG.warn("Linux TTS process timed out after {}s. Log: {}", Integer.valueOf(SYNTH_TIMEOUT_SECONDS), logFile);
+            LOG.warn("Linux TTS child termination could not be confirmed. Log: {}", logFile);
             return -1;
         }
-        return process.exitValue();
+        if (result.exitCode == BoundedProcess.TIMED_OUT)
+            LOG.warn("Linux TTS process timed out after {}ms. Log: {}", Long.valueOf(timeoutMillis), logFile);
+        return result.exitCode;
     }
 
     private static int amplitude(float volume)
@@ -384,9 +399,9 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private static final class EspeakEngine extends Engine
     {
-        EspeakEngine(String command, String displayName)
+        EspeakEngine(String key, String displayName, String command)
         {
-            super(command, displayName, command);
+            super(key, displayName, command);
         }
 
         @Override
@@ -407,8 +422,7 @@ public class LinuxCommandTtsProvider implements TtsProvider
             cmd.add(outWav.toString());
             cmd.add(text);
             Process process = new ProcessBuilder(cmd)
-                .redirectOutput(outLog)
-                .redirectError(outLog)
+                .redirectErrorStream(true)
                 .start();
             return waitFor(process, outLog);
         }
@@ -418,9 +432,9 @@ public class LinuxCommandTtsProvider implements TtsProvider
     {
         final boolean mimic;
 
-        FliteFamilyEngine(String command, String displayName, boolean mimic)
+        FliteFamilyEngine(String key, String displayName, String command, boolean mimic)
         {
-            super(command, displayName, command);
+            super(key, displayName, command);
             this.mimic = mimic;
         }
 
@@ -445,8 +459,7 @@ public class LinuxCommandTtsProvider implements TtsProvider
                 cmd.add("duration_stretch=" + Float.toString(stretch));
             }
             Process process = new ProcessBuilder(cmd)
-                .redirectOutput(outLog)
-                .redirectError(outLog)
+                .redirectErrorStream(true)
                 .start();
             return waitFor(process, outLog);
         }
@@ -454,9 +467,9 @@ public class LinuxCommandTtsProvider implements TtsProvider
 
     private static final class PicoEngine extends Engine
     {
-        PicoEngine()
+        PicoEngine(String command)
         {
-            super("pico2wave", "Pico TTS", "pico2wave");
+            super("pico2wave", "Pico TTS", command);
         }
 
         @Override
@@ -470,8 +483,7 @@ public class LinuxCommandTtsProvider implements TtsProvider
             cmd.add(outWav.toString());
             cmd.add(text);
             Process process = new ProcessBuilder(cmd)
-                .redirectOutput(outLog)
-                .redirectError(outLog)
+                .redirectErrorStream(true)
                 .start();
             return waitFor(process, outLog);
         }

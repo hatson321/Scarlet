@@ -9,11 +9,13 @@ on:
       - 'src/**'
       - 'pom.xml'
       - 'libdave-maven/**'
+      - 'scripts/**'
+      - 'BUILDING.md'
       - '.github/workflows/build-scarlet.yml'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -24,14 +26,19 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-          cache: maven
 
-      - name: Build and install vendored libdave
-        working-directory: libdave-maven
-        run: mvn -B clean install
+      - name: Cache workspace-local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build-cache/maven
+            .build-cache/vrchat-sdk
+          key: ${{ runner.os }}-scarlet-maven-${{ hashFiles('**/pom.xml', 'scripts/BootstrapVrchatSdk.java') }}
+          restore-keys: |
+            ${{ runner.os }}-scarlet-maven-
 
-      - name: Build Scarlet
-        run: mvn -B clean package
+      - name: Build and verify supported Linux packages
+        run: sh scripts/linux/build-and-verify.sh
 
       - name: Upload Scarlet JAR
         uses: actions/upload-artifact@v4
@@ -40,6 +47,6 @@ jobs:
           path: |
             target/scarlet-*.jar
             !target/scarlet-*-debug.jar
-            !target/scarlet-*-android.jar
+            target/SHA256SUMS-linux.txt
           if-no-files-found: error
           retention-days: 30

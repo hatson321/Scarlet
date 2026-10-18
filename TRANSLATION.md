@@ -40,7 +40,7 @@ split; treat it as the working checklist, refined as each area is keyed.)
 - L766: menu.view
 - L771: a
 - L784: menu.help
-- L887: Open KozyBlake/Scarlet's data directory
+- L887: Open Hatson321/Scarlet Logger's data directory
 - L892: Create a VRChat group instance and open it in the VRChat client
 - L897: Import watched groups from a URL
 - L902: Import watched groups from a local file
@@ -49,7 +49,7 @@ split; treat it as the working checklist, refined as each area is keyed.)
 - L920: Pause or resume text-to-speech announcements
 - L930: TTS: Paused
 - L937: Skip the currently playing TTS announcement
-- L1036: KozyBlake/Scarlet CLI  —  type a command below or run 'help' to list all commands. /
+- L1036: Hatson321/Scarlet Logger CLI  —  type a command below or run 'help' to list all commands. /
 - L1066: Run
 - L1351: I'm moving to another computer (offer to remove this copy after export)
 - L1357: <html>Set a PIN to encrypt this bundle (required, at least 4 characters).<br>
@@ -136,7 +136,7 @@ split; treat it as the working checklist, refined as each area is keyed.)
 - L895: Confirmation dialog for group invites
 - L896: Notify for updates
 - L897: Notify for preview updates
-- L898: Notify for KozyBlake announcements
+- L898: Notify for Hatson321 announcements
 - L899: Show UI during load
 - L900: Show CLI tab
 - L901: Enable built-in Discord moderation commands

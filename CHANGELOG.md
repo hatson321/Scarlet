@@ -1,6 +1,20 @@
 
 # Changelog
 
+## 0.5.0 (prepared locally; not yet published)
+
+See [0.5.0 release notes](RELEASE_NOTES_0.5.0.md) for the cumulative desktop maintenance changes and remaining limitations. The build, runtime fallback, local update metadata, and launcher version marker now agree on `0.5.0`; historical release entries below keep their original numbers.
+
+### Fixed
+
+- Restored the configured-template autofill link on the moderation Report button alongside the copy-and-paste report and simple notes/tags link. Both template outputs now share the same content and footer setting, and an empty template falls back to the event details. Oversized reports and URLs are preserved in private text attachments. Removed the obsolete warning about filling the audit actor's requester ID, which the current form URL does not do. Help Desk sign-in, evidence requirements, and manual submission still apply.
+
+### Removed
+
+- Completely removed the Android/mobile companion feature from active Scarlet and future build/distribution paths. This includes the companion application, desktop mobile-delivery subsystem, phone pairing and device state, direct-LAN listener, FCM/OAuth delivery, mobile settings/UI/status hooks, Android/mobile packaging, and the previously removed maintainer-operated relay implementations. Historical release/acquisition artifacts and quarantined relay evidence remain inert and must not be distributed as future builds.
+
+> Mobile and Android entries under older release headings below are retained as historical records of what those releases contained; they do not describe the active product.
+
 ## 0.4.20
 
 Adds **VRChat trust ranks** to the player list with Nuisance/Visitor advisories and callouts, makes the **follow-into-new-instance** feature react in about a third of the time, and reworks the **advisory colors** so they read cleanly on a dark theme and over a Discord screenshare.
@@ -17,7 +31,7 @@ Adds **VRChat trust ranks** to the player list with Nuisance/Visitor advisories 
 - **Report button now gives a copy-paste report, not just a sign-in link.** VRChat moved general reporting in-app and restricted the Help Desk form to appeals and evidence-backed reports (and it requires signing in), so the old pre-filled Help Desk links mostly hit a login wall or get auto-closed. The `vrchat-report` button now outputs a **plain-text, copy-paste report block** (target, actor, reason, internal tags, group/audit IDs) for a signed-in moderator to paste straight into VRChat's in-app report. The Help Desk link is kept but labelled for its now-narrow use (appeals / evidence). No automated/bot-account reporting — a human still files it.
 - **Report a user's profile picture / user icon to VRChat.** Moderation embeds now carry pre-filled VRChat T&S report links for a user's **profile picture** and **user icon** — the two account-level content types that had a report-URL builder but were never surfaced anywhere. (Sticker, emoji, print and prop reports were already offered on their in-instance spawn embeds.) As with everything else, Scarlet only assembles the pre-filled report; a human files it with VRChat.
 - **Bundled alert SFX set.** The `BL_SFX_*` sound effects are rendered to WAV and bundled in the build so they play on every audio route — local player, Java Sound, and the Discord-voice output — with no MP3 decoder dependency. SIREN_CHIRP drives the nuisance alarm today; the rest are ready to wire to their events.
-- **First-launch "vibe-coded" disclosure.** On first run, Scarlet shows a one-time notice that this fork is maintained by **KozyBlake** and developed largely with AI assistance, with **Continue** or **Close Scarlet** — so anyone who'd rather not run an AI-assisted project can bow out up front. Shown once (persisted as `vibecoded_notice_acknowledged`); headless/scheduled runs log the notice once and continue instead of blocking on a dialog. A matching note sits at the top of the README. (KozyBlake maintains and is accountable for the project; the AI is a tool, not the maintainer.)
+- **Maintainer and release-process disclosure.** scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested. The notice is shown once; headless or scheduled runs log it once and continue without blocking on a dialog.
 
 ### Changed
 
@@ -44,7 +58,7 @@ Adds **VRChat trust ranks** to the player list with Nuisance/Visitor advisories 
 - **Bans no longer show up as standalone kicks.** When you ban a user who's in an instance, VRChat auto-issues an instance-kick alongside the ban; Scarlet bundles that kick under the ban instead of logging it separately. A long-standing inverted date comparison (going back to the legacy builds) made the “most recent prior action” resolve to a user's *oldest* action, so for anyone with any moderation history the co-occurring ban was missed and its auto-kick was posted as a normal kick. Fixed the comparison; the same field also drove the embed's “Most recent” line, which was showing the oldest action rather than the newest.
 - **Headless: the multiple-data-folder prompt can no longer hang a service.** When Scarlet finds more than one data folder and there's no interactive console, it no longer opens a blocking read on stdin — it logs the folders and deterministically loads the first, so a headless bot never stalls at startup.
 - **A down or gated avatar-search provider no longer floods the console.** A provider that fails — DNS-dead, HTTP 403/404, timed out, or connection refused — now logs **one** warning when it first goes down and **one** when Scarlet gives up on it, then stays quiet; the stack traces for these expected network failures are dropped from WARN/DEBUG (TRACE only). Every failure now backs off, and the backoff **escalates** with each repeat (up to ~2h), so a permanently-down provider is retried a couple of times an hour at most instead of on every single search, and it auto-recovers (with a one-line note) the moment it responds again. This now also covers HTTP **4xx/5xx** responses, which previously slipped past the backoff and retried every search — e.g. a provider that starts returning **403** (as avtrDB's search did, before it was removed) used to dump a stack trace on every single lookup.
-- **ARM/glibc Discord voice (DAVE): groundwork + two protocol-version bugs.** On ARM/Termux, Discord voice can join/leave-thrash when the native DAVE library falls back to the JNA path. Two `(short) transitionId` casts that should have used the negotiated MLS protocol version were corrected, and the DAVE handshake path (`DAudioDaveSession`) now logs each epoch/transition step so a real ARM voice session can pinpoint where the handshake fails. ARM natives stay under `-android.jar`, out of the main desktop jar, by design. (Groundwork — the underlying glibc-aarch64 fallback still needs a test log from an affected user to close out.)
+- **ARM/glibc Discord voice (DAVE): groundwork + two protocol-version bugs.** On ARM/Termux, Discord voice can join/leave-thrash when the native DAVE library falls back to the JNA path. Two `(short) transitionId` casts that should have used the negotiated MLS protocol version were corrected, and the DAVE handshake path (`DAudioDaveSession`) now logs each epoch/transition step so a real ARM voice session can pinpoint where the handshake fails. This entry originally referred to a separate Android artifact; that artifact has since been removed and is no longer distributed or supported. (Groundwork — the underlying glibc-aarch64 fallback still needs a test log from an affected user to close out.)
 
 ### Removed
 
@@ -84,7 +98,7 @@ The largest maintenance release in a while: keeps Scarlet working against VRChat
 - **Smaller:** avatar-search author provider (stray literal, URL-encoding, malformed-row skipping); `volatile` User-Agent statics; iOS-vs-PC avatar-rating copy-paste; tag-rename autocomplete refresh; report-tag separators; GitHub release parsing; `:`-less location parsing; UTF-8 JSON read; an option helper honoring `required`.
 - **Linux TTS:** dropped the unreliable **Mimic** and **Festival** engines — Festival was registering an error message as ~22 bogus "voices", and Mimic (a Mimic-3 binary) failed on the Mimic-1 flags Scarlet sends; both only ever fell back to a working voice anyway. The Linux voice list is now Flite / Pico / eSpeak(-NG) only, and each Flite-family engine is probed at startup so a broken binary never offers a voice that can't speak.
 
-- **ARM/glibc Discord voice (DAVE) groundwork.** On a glibc arm64 box (e.g. a Raspberry Pi running the desktop jar) there is no native `libdave-jvm`, so voice falls back to the JNA `DAudioDaveSession` path — which currently mis-handshakes and makes the bot thrash (join/leave) in voice. That fallback (only ever active on such platforms) is now heavily logged at each DAVE handshake step, with the MLS-init failure surfaced at error level, so the next ARM voice attempt pinpoints where E2EE dies. Also fixed the two casts the author had flagged `// smells sus` (a transition id was being passed where a protocol version is expected on the failure-recovery paths). Termux/Android arm64 users should keep using **`-android.jar`**, which bundles the proper `native/android/arm64-v8a/libdave-jvm.so`.
+- **ARM/glibc Discord voice (DAVE) groundwork.** On a glibc arm64 box (e.g. a Raspberry Pi running the desktop jar) there is no native `libdave-jvm`, so voice falls back to the JNA `DAudioDaveSession` path — which currently mis-handshakes and makes the bot thrash (join/leave) in voice. That fallback (only ever active on such platforms) is now heavily logged at each DAVE handshake step, with the MLS-init failure surfaced at error level, so the next ARM voice attempt pinpoints where E2EE dies. Also fixed the two casts the author had flagged `// smells sus` (a transition id was being passed where a protocol version is expected on the failure-recovery paths). This historical entry previously directed Termux/Android users to a separate build; that build has since been removed and is no longer distributed or supported.
 
 ### Notes
 
@@ -331,7 +345,7 @@ Highlights:
 - Mixed-character username TTS now uses a short alert phrase and best-effort readable pronunciation instead of announcing script names such as Cyrillic or Greek for each character.
 - Mixed-character username normalization now favors Latin lookalike output when a display name is mostly readable as an English-style name, while still preserving full non-Latin names instead of forcing them through the lookalike path.
 - The main desktop shade excludes Android and Termux DAVE native payloads; the Android classifier build still includes them automatically during normal Maven packaging.
-- Bumped Scarlet release / version metadata to `0.4.17-b2` and pointed update / download release checks at the KozyBlake fork.
+- Bumped Scarlet release / version metadata to `0.4.17-b2` and pointed update / download release checks at the then-current maintained fork.
 
 ### Fixed
 
@@ -345,20 +359,20 @@ Highlights:
 
 ## 0.4.17-b1_hotfix
 
-Hotfix update for the first KozyBlake fork release.
+Hotfix update for the first Linux-compatible fork release.
 
 Credit to ChanAurora for reporting both the help-desk report issue with custom-font usernames and the stale Scarlet version shown in generated reports.
 
 Hotfix highlights:
 
 - **Readable help-desk reports for stylized usernames.** Report URLs now use a normalized ASCII subject while preserving the exact VRChat display name in the report description so staff can identify the reported user.
-- **Correct report versioning.** Report footers, Discord embed footers, UI labels, startup output, and packaged JAR metadata now report `KozyBlake/Scarlet 0.4.17-b1_hotfix`.
+- **Correct report versioning.** Report footers, Discord embed footers, UI labels, startup output, and packaged JAR metadata now report the fork-specific `0.4.17-b1_hotfix` identity.
 - **Fork update metadata.** `meta.json` now advertises `0.4.17-b1_hotfix` for both release and build update checks.
 - **Lower-bandwidth update checks.** Scarlet reuses the same `meta.json` fetch for update and announcement checks and asks GitHub for `304 Not Modified` when nothing changed.
 - **Security hardening for announcements.** Announcement link buttons are restricted to normal web links so `file://` paths and custom app protocols cannot be broadcast as clickable actions.
 - **Security hardening for VRChat launch links.** Windows client launch now uses argument-list process creation and URL-encodes the VRChat location, preventing crafted locations from injecting extra launch arguments.
 - **Announcement metadata guard.** GitHub now raises an immediate warning issue if `meta.json` announcement metadata is pushed by a GitHub actor outside the trusted announcer allowlist.
-- **Fork branding polish.** Remaining plain `Scarlet` version labels, startup text, and log prefixes now use `KozyBlake/Scarlet` where user-facing fork identity matters.
+- **Fork branding polish.** Remaining plain `Scarlet` version labels, startup text, and log prefixes were updated to the then-current fork identity where user-facing ownership mattered.
 
 Original 0.4.17-b1 highlights still included:
 
@@ -402,16 +416,16 @@ Original 0.4.17-b1 highlights still included:
 
 #### Misc
 
-- Startup data-folder warning explaining that the `KozyBlake/Scarlet` data folder is separate, the legacy folder is left in place, and switching back to the original repo may require setup again.
+- Startup data-folder warning explaining that the fork-specific data folder is separate, the legacy folder is left in place, and switching back to the original repo may require setup again.
 - Hidden `popup-test` CLI dispatcher for dry-run popup testing without performing the confirmed action.
 
 ### Changed
 
-- Bumped Scarlet release / version metadata to `0.4.17-b1_hotfix` and pointed update / download release checks at the KozyBlake fork.
+- Bumped Scarlet release / version metadata to `0.4.17-b1_hotfix` and pointed update / download release checks at the then-current maintained fork.
 - Periodic update poll runs **hourly** instead of every 3 hours.
 - Update prompt rewording: "Hey, your release is *X*, there is a new release of *Y*. Open the download page?" (in both the auto-prompt and the new manual dialog).
-- Default Scarlet data directories and user-agent branding moved from the legacy upstream owner name to `KozyBlake`, with a one-time opt-in prompt before copying data from the old default folder.
-- Log categories and direct console log prefixes rebranded to `KozyBlake/Scarlet`.
+- Default Scarlet data directories and user-agent branding moved from the legacy upstream owner name to the then-current fork identity, with a one-time opt-in prompt before copying data from the old default folder.
+- Log categories and direct console log prefixes were rebranded to the then-current fork identity.
 
 ### Fixed
 
@@ -421,7 +435,7 @@ Original 0.4.17-b1 highlights still included:
 - The custom-font username fix covers Latin-Extended stroke/bar glyphs like the `༒808 ȼɍᵾsȺđɇɍ༒` case (`tf_subject=808+crUsAder`), fullwidth and mathematical styled Latin, combining marks, CJK, Cyrillic, Greek, Hebrew, Arabic, Devanagari, and decorative Unicode flair.
 - Version reporting now reads the packaged implementation version at runtime instead of relying on a compile-time-inlined constant, preventing report footers from showing an older build after partial recompiles.
 - All primary packaged JAR variants now receive manifest implementation metadata so report/version text can resolve the correct build from the artifact itself.
-- Report footer branding now uses `KozyBlake/Scarlet` instead of plain `Scarlet`.
+- Report footer branding now uses the maintained fork identity instead of plain `Scarlet`.
 - Background update / announcement polling now uses HTTP validators (`ETag` / `Last-Modified`), a short in-memory cache, and a shared 5-minute metadata cache key so unchanged `meta.json` checks do not repeatedly download the full file or get pinned to a stale GitHub CDN object for too long.
 - Announcement checks now run every 10 minutes instead of hourly, while normal update checks remain hourly.
 - Announcement link buttons now only open `http://` and `https://` URLs; local files and app/protocol links are ignored defensively.

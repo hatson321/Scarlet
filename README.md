@@ -1,22 +1,269 @@
-[discord-invite]: https://discord.gg/CP3AyhypBF
-[discord-widget]: https://discord.com/api/guilds/1342131776876838912/widget.png
+<img src="images/sybyline_scarlet.png?raw=true" alt="Scarlet Logger logo" width="300" height="300"/>
 
-[![Discord Widget][discord-widget]][discord-invite]
-
-<img src="images/sybyline_scarlet.png?raw=true" alt="Scarlet logo" width="300" height="300"/>
-
-# Scarlet
+# Hatson321/Scarlet Logger
 
 A self-hostable VRChat Group management utility with Discord integration.
 
+> scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested.
+
+### Project history and acknowledgments
+
+The original fork's attribution is preserved below as historical context. Current maintenance is described above.
+
 > **About this fork.** Scarlet (this fork) is maintained by **KozyBlake** and developed largely with AI assistance — a "vibe-coded" project. Features and fixes come from KozyBlake and community ideas, implemented and reasoned through with an AI pair, then reviewed and built by KozyBlake. On first launch Scarlet shows this notice and lets you close it if running AI-assisted software isn't for you. (KozyBlake maintains and is accountable for the project; the AI is a tool, not the maintainer.)
 
-- [VRChat Group](https://vrchat.com/home/group/grp_f12667c7-df5f-454f-9a34-5ed8c33112a1)
+- [Maintained repository](https://github.com/Hatson321/Scarlet)
 - [Changelog](CHANGELOG.md)
+- [0.6.0 release notes](RELEASE_NOTES_0.6.0.md) — prepared locally; publication is a separate step.
 - [Settings](SETTINGS.md)
 - [Frequently Asked Questions](FAQ.md)
 - [Installation](#installation)
 - [Building from source](BUILDING.md)
+
+## Updating to 0.6.0
+
+Close the old Scarlet process and keep an independent backup before launching
+`scarlet-0.6.0.jar`. One JAR supports Windows and Linux. A new filename does not
+create a separate data directory.
+
+A10 and later compare numbered build suffixes numerically, so A11 sorts after A10.
+Older builds retain their old comparison behavior; install this JAR manually if
+your existing copy does not recognize it as newer.
+
+### VRChat launcher safety — A13
+
+Scarlet no longer closes VRChat by process name or force-kills it to follow an
+instance. A restart requires a client whose launch ancestry, process ID, start
+time and owner Scarlet can verify. It requests a normal close and waits for a
+confirmed exit before starting again. Unknown or ambiguous ownership means no
+automatic restart; close that client yourself or use an in-game invite instead.
+Steam/URI launches that cannot provide launch ancestry remain unowned.
+
+Only one launch lifecycle can run at a time, including its startup wait.
+Automatic launch waits run separately from moderation logging, and extra launch
+requests are skipped rather than queued. The instance-creation wizard still
+does not restart an already-running client. These checks do not establish that
+Easy Anti-Cheat has finished its own cleanup or diagnose an EAC failure.
+
+### Release-review safety fixes — A12
+
+A12 rechecks the requesting moderator's current authority before queued bulk
+unbans and before applying changes from an open Discord dialog. A dialog can
+expire, and old unban queue entries without verifiable requester/group context
+are rejected instead of being executed with the bot's privileges.
+
+Unreadable existing saved records are not treated as empty records and overwritten.
+This also covers settings, Discord configuration and permissions, schedules, watched
+lists and the regular staff list. The affected store refuses writes until a valid
+load/recovery, and unreadable permission rules cannot silently become default access.
+The original bytes remain available for recovery. Settings can still recover from
+a valid existing backup; failed settings saves now report an error rather than
+silently claiming success. Pending in-memory settings can be retried after storage
+is repaired. Redaction updates modify only their own fields, preserving concurrent
+changes to other saved moderation details.
+Backup/import plaintext staging requires enforceable private filesystem permissions;
+if those permissions cannot be established, the operation stops rather than
+silently creating sensitive temporary files in a shared location.
+
+Optional idle-instance auto-close now requires a healthy, current log session,
+the configured group, the logged-in bot alone in the local roster, and a fresh
+server occupancy check. Uncertainty restarts the grace period. It requests a
+normal soft close, not a hard close that ejects occupants. Occupancy and closing
+cannot be one atomic VRChat API operation, so a player can still join in between.
+This is separate from the optional feature that exits Scarlet's managed VRChat
+client after an already-closed instance becomes empty.
+
+For a source build, use the entrypoints in [BUILDING.md](BUILDING.md), including
+the pinned upstream VRChat SDK bootstrap. These changes do not remove the
+supervised release checks in [BETA_ACCEPTANCE.md](BETA_ACCEPTANCE.md).
+
+### Saved-history moderation summaries
+
+`moderation-summary` and scheduled moderation summaries now read Scarlet's saved
+audit records on this computer. They do not download VRChat audit history, scan
+Discord messages, or fetch staff profiles. A dedicated background worker keeps the
+scan off Scarlet's normal logging and command-handling paths. One summary can run
+at a time; additional requests receive a busy response. Shutdown cancels the worker.
+
+Summaries are scoped to the current group and include only visible, non-training
+records. Duplicate audit receipts count once; a related ban and kick still count
+as different events. Secret staff and redacted records remain hidden. Unprocessed
+outbox-only entries are omitted until attribution has been resolved. Local join
+records without a matching group are omitted rather than guessed.
+
+The result is labeled saved local history: missing, deleted, never-collected or
+still-unprocessed events cannot be counted. Even an empty result does not prove
+that no activity occurred. Unreadable files are skipped and contribute nothing to
+moderation counts. The final notice states how many files could not be read and
+were excluded, with safe file details in Scarlet's local logs. Such results are
+labeled partial because the skipped files may contain additional actions.
+An unreadable audit record cannot be counted using another saved copy whose
+privacy information cannot be trusted. Unsafe directories, privacy conflicts,
+cancellation or resource limits still prevent totals from being shown.
+The reader is bounded to five
+minutes, 250,000 directory entries, 100,000 selected records, 8 MiB per file and
+2 GiB total read. A shorter date range may reduce selected records and join reads,
+but the unindexed audit folder still has to be scanned.
+
+The separate `actor-moderation-summary` and `outstanding-moderation` commands still
+use VRChat audit queries. Their behavior is not changed by the local summary feature.
+
+### Full instance links
+
+`vrchat-group close-instance` now accepts complete official VRChat launch links
+with bare flags such as `~ageGate`, URL-encoded parameters, or reversed query order.
+It also accepts a full raw location. A world ID alone or a short link is not enough:
+provide both the world and complete instance ID. Invalid links and links for another
+group are rejected before calling the close API. Existing permission checks remain.
+
+A10 fixes date-only account-join values in returned instance user details, which
+could previously make a successful close look like a failure. Timed closes show
+the scheduled time; an immediate close and an already-closed response have distinct
+messages. Other permission errors remain errors. If a response still cannot be
+read, Scarlet warns that the outcome is uncertain and does not automatically
+resend the close request. Check the instance status before retrying that warning.
+The date compatibility rule is limited to the nested account-join field; closing
+timestamps and other event timestamps remain strict.
+
+### Privacy-filtered close diagnostics — A11
+
+An unexplained HTTP 403 now gets a neutral reply with a reference ID, rather than
+suggesting that missing permissions are the established cause. Match that reference
+to the local `Close-instance request`, `Close-instance response`, and
+`Instance-close outcome` entries. Requested hard-close and closing-time options
+remain visible even when a request is rejected. Omitted options are labeled:
+normal soft close, immediately. The effective closing time is a separate field:
+after an accepted request it uses the returned time, or the requested time when
+the response omits it. A rejected request leaves that result field empty.
+
+Only bounded, structured error fields are considered for the local diagnostic.
+The message uses a restricted diagnostic vocabulary: unknown words and sensitive
+values are masked. It is not a verbatim server response, and some reasons may
+remain unclear. Headers, cookies, other response fields, and raw launch links are
+not included in these new diagnostic entries. Discord receives the reference ID,
+not the server message. Review even the filtered log excerpt before sharing it.
+
+This is a diagnostic update, not a confirmed fix for the tester's unexplained 403.
+The request target, permission checks, and strict already-closed recognition are
+unchanged. The command does not automatically resubmit a failed or uncertain close;
+the HTTP client's existing connection-recovery behavior is unchanged. Check the
+instance's actual state before any deliberate retry. A normal close blocks new
+joins; it does not automatically eject players who are already inside.
+
+### Gentler audit fetching
+
+Audit-history GET requests share a single-permit pacer across API-backed queries, normal
+logging, counts and compatibility fallbacks: at most one request every two seconds.
+Local moderation summaries no longer use this pacer. Other API endpoint pacing is unchanged.
+
+A VRChat 429 applies at least a 30-second shared cooldown, including a zero or
+missing `Retry-After` value. Repeated limits increase the cooldown, and longer
+server-requested waits are honored. Waiting calls can be cancelled and do not
+release a refilled burst immediately after the cooldown.
+
+The bounded historical-query helper remains available, but local summaries do not
+call it. Routine polling and moderation writes are not automatically retried by
+this policy. Pacing cannot guarantee avoidance of all service limits.
+
+### Moderation delivery improvements
+
+A kick bundled into a ban thread waits durably while that thread is being prepared,
+without treating the normal wait as a failed delivery or a channel-permission warning.
+It becomes eligible for delivery when the thread is ready; periodic recovery still
+handles restarts or missed wake-ups. Actual delivery failures retain their warnings
+and retry backoff.
+
+The three independent moderation snapshot lookups use bounded parallelism while
+retaining privacy filtering, shared API rate limiting and cancellation safeguards.
+This can reduce preparation time; it does not guarantee a particular latency or fix
+authentication failures. The actual VRChat ban operation and polling cadence are unchanged.
+
+### Background moderation threads
+
+Moderation threads and their action buttons now build in the background after the
+main Discord embed is sent. Unfinished work remains in Scarlet's local delivery queue
+for retry after failures or restart, without deliberately reposting an acknowledged embed.
+Current privacy and destination checks still apply. Normal shutdown stops this worker
+before saving data or handing off to offline export/import.
+
+This removes thread-building work from the audit polling path; it does not change the
+polling intervals or guarantee an instant embed. Existing profile/snapshot requests and
+VRChat/Discord response times can still delay a single ban embed. Local timing entries
+help distinguish preparation, primary delivery, and background follow-up time.
+
+### Optional VRChat client exit
+
+In Settings, enable **VRChat Client: Exit when instance is closed and empty
+(Scarlet-launched clients only)** (`vrchat_client_exit_closed_empty`). It is off by default.
+Enable it before launching the client through Scarlet; process discovery is limited to
+the first two minutes after that launch request.
+This is separate from the existing setting that closes the bot's own instance remotely.
+
+The new option requests a normal exit of a local client launched by this Scarlet session
+only after its exact monitored group instance is confirmed closed and the live player
+list contains only that client's authenticated account. An open empty instance never
+qualifies. Scarlet waits 30 seconds and checks fresh server instance information before
+sending the exit request. A scheduled future closure is not treated as already closed.
+Scarlet itself stays running, and this option does not close the instance on the server.
+
+The client must have been newly launched through Scarlet; an already-running or manually
+started client is not deliberately adopted. Launch tracking correlates new process identity
+with Scarlet's launch request, not a guaranteed Steam process ancestry chain. Ambiguous
+processes, stale/incomplete logs, missing audit or server proof, another player, a world or
+account change, or unavailable process metadata leave the client running. Linux/Wine
+configurations that hide the executable or start time may therefore not support this option.
+No administrator elevation, forced termination, or name-wide process termination is used
+by this feature. A normal-exit request may be declined by the client; there is no force fallback.
+
+The existing snapshot-privacy and timed-ban safeguards from 0.5.0-a3 remain:
+
+Moderation snapshot buttons now display only approved public profile/group fields
+and check the current event access policy. Old local snapshot files are not scrubbed;
+keep those files and their backups private. Group snapshots with missing or uncertain
+visibility information may now show no verified public information.
+
+Automatic timed unbans now require the original ban's server identity and a fresh,
+complete audit-history check. **Timers created before this safeguard cannot establish
+that identity and require manual review; Scarlet leaves the current ban in place.**
+A replacement or ambiguous ban is retained for review rather than automatically lifted.
+Temporary verification failures delay the check by five minutes. Review the current
+group ban and audit history before manually unbanning anyone. The API cannot make
+the final verification and unban atomic, so a simultaneous external moderation change
+is still a limitation.
+
+## Restore and consistent export — 0.5.0-a1
+
+On a fresh or wiped installation, Scarlet offers **Restore from export / backup** before
+asking for account credentials. Choose a Scarlet migration export or Scarlet's automatic
+pre-import backup ZIP, confirm the destination, and enter the export PIN if requested.
+The normal restore includes settings, channel mappings and saved credentials. After success,
+launch Scarlet normally. Expired sessions or invalid credentials can still require sign-in or 2FA.
+Generic ZIPs, individual `.bak` files and manually created `.tar.gz` backups are not migration bundles.
+Cancelling or failing a first-run restore does not continue into account setup automatically.
+
+From an existing installation, Settings → Backup & Migration → Import or Export asks to
+**stop and save Scarlet first**. A separate offline tool waits for the previous process to exit
+and locks Scarlet's data and shared preference storage. Logging remains stopped until you
+start Scarlet again; do not assume that every live event during this gap can be recovered.
+Do not run older Scarlet builds or external file-editing tools against the same data during migration.
+
+Exports require a new filename outside the data folder and a PIN. The tool verifies the
+encrypted archive before offering the separately confirmed, delayed **Remove all local data**
+action. Optional log/cache/TTS cleanup is another explicit deletion: cancelling a later export
+does not undo cleanup. Keep an independent backup until restoration and sign-in have been checked.
+The wipe removes Scarlet's local files and saved credentials; it is not forensic secure erasure.
+
+For a desktop restore without starting the logger, run from the build's directory, preserving
+the same data location used by your launcher:
+
+```text
+java -DSCARLET_HOME="<Scarlet-data-folder>" -jar "scarlet-0.6.0.jar" --restore
+java -DSCARLET_HOME="<Scarlet-data-folder>" -jar "scarlet-0.6.0.jar" --export
+```
+
+The existing `--import-bundle "<bundle.zip>"` console workflow remains available.
+`--data-only` excludes incoming credential stores and preserves the destination's existing
+legacy Discord token instead of copying the token embedded in the incoming configuration.
 
 ---
 
@@ -26,7 +273,9 @@ Scarlet is self-hosted, meaning you have complete control of your group's data.
 Your VRChat and Discord credentials are held only on your own machine — they are never sent to a third party, and no Scarlet-operated service ever receives them.  
 Since there is no automatic synchronization of data between groups running Scarlet, you don't have to worry about other groups seeing who your group has moderated or what groups you are tracking.
 
-Scarlet does talk to a small number of outside services — VRChat and Discord because that is the job, plus a handful of **optional** features (avatar search, mobile push, update checks) that are listed individually in [SECURITY.md](SECURITY.md#1-network-connections) along with how to turn each one off. No optional feature is enabled by default. One of them — the mobile companion's off-network relay — does ship pointing at a maintainer-run host, and Scarlet will not contact it until you have paired a phone and accepted an on-screen notice naming that host and what it receives; you can decline and keep using the companion over your own network, or point it at a server you run. If a build behaves differently from that list, treat the list as the claim and the build as the thing to check.
+Scarlet does talk to outside services — VRChat and Discord because that is the job, plus features such as avatar search, translation providers, media lookup, and update checks listed in [SECURITY.md](SECURITY.md#1-network-connections). Defaults and triggers differ by feature; they are not all manual-only. **External avatar-database lookups are off until the owner grants permission in Avatar search providers → Manage.** After permission, selected databases may be queried automatically during avatar changes and missing-information rescans as well as manual searches. Uncheck permission or all providers to stop future lookups. The Android/mobile companion and every desktop mobile-delivery path have been removed from active Scarlet. If a build behaves differently from that list, treat the list as the claim and the build as the thing to check.
+
+**Avatar-query identification:** the provider User-Agent includes the running Scarlet version, public maintainer support contacts, the configured VRChat group ID and the signed-in primary VRChat account ID. It does not include login credentials. Group/account IDs are supplied automatically by the installation, not by a search target or avatar creator. This format uses a new permission (`avatar_search_identified_lookups_enabled`, default false), so existing owners must review the updated notice and opt in again before provider queries resume. Unrelated HTTP requests keep their existing non-identifying header.
 
 ---
 
@@ -34,8 +283,8 @@ Scarlet does talk to a small number of outside services — VRChat and Discord b
 
 - **Cross-platform.** Runs on Windows and Linux (this is the Linux-compatible fork). There is also an **experimental PowerPC edition** (`scarlet-<version>-ppc.jar`) for 32-bit PowerPC Linux; it is heavily untested and has so far only been run on a Nintendo Wii running Wii-Linux. The desktop app is Java/Swing; the VRChat-log features work when VRChat runs on the same machine, including under Proton/Wine on Linux.
 - **Near-instant moderation posts.** Moderation actions (Discord command, UI, or bulk-ban queue) and in-game warns/kicks/bans post to Discord within seconds via burst polling, then settle back to the idle interval.
-- **Watched users, groups, and avatars** with per-category advisories, spoken TTS callouts, native desktop notifications, and optional mobile push — each independently toggleable.
-- **Avatar statuses with or without VRChat's `[API]` launch options.** When the launch options aren't set, Scarlet reconstructs avatar/performance info through avatar-search databases plus current-avatar-image confirmation and the VRChat API, and tells you honestly when something can't be resolved.
+- **Watched users, groups, and avatars** with per-category advisories, spoken TTS callouts, and native desktop notifications — each independently toggleable.
+- **Avatar statuses with or without VRChat's `[API]` launch options.** When API-log information is missing and the owner permits external avatar-database lookups, Scarlet can attempt reconstruction through selected databases plus current-avatar-image confirmation and the VRChat API. Opting out leaves those external fallback lookups disabled; private, ambiguous or unindexed avatars may remain unresolved.
 - **Instance creation and management** for both group instances (Public/Group+/Members) and personal instances (Public/Friends+/Friends/Invite+/Invite), with queue/age-gate/content presets, invite-a-friend, and self-invite when VRChat is already running.
 - **Multi-language UI (English and Russian complete).** The whole desktop client — including spoken TTS callouts — follows your OS language or a chosen one; the Discord bot replies in each user's own Discord locale. Community translations drop into a `lang/` folder with no rebuild.
 - **Training mode.** A settings toggle enables an event simulator so a trainer can run realistic drills — including practicing the Discord tagging workflow — without anyone joining a bad group, fully isolated from live moderation (see **Training mode** below).
@@ -206,6 +455,9 @@ Subcommands of **`vrchat-group`** for operating the group itself.
 - **Desktop instance wizard**  
   Use **Create Instance** in Scarlet's top action bar, or **File -> Create VRChat group instance...**, to create a group instance from a world URL/id and optionally open it in the VRChat client in VR or Desktop mode.
 
+- **Privacy-safe feature usage report**  
+  Use **Feature Report** in the top action bar on Windows or Linux to save a local HTML inventory of Discord-output-capable features. Every row contains only the feature name and `Enabled` or `Disabled`; the report does not include channel, guild, role, webhook, account, group, user, path, token, endpoint, or other configuration values, and Scarlet does not upload it.
+
 #### Event Scheduling
 
 Subcommands of **`schedule`** manage recurring VRChat group events (each stored as a "spec" with an ID). Scarlet posts upcoming events ahead of time and can mirror them as Discord events.
@@ -258,9 +510,12 @@ Subcommands of **`schedule`** manage recurring VRChat group events (each stored 
   Generates a summary of moderation actions performed by a specific staff member (a per-actor accountability view).  
   Example: `/actor-moderation-summary "usr_00000000-0000-0000-0000-000000000000"`
 
-- **`moderation-summary [hours-back:int?]`** / **`outstanding-moderation [hours-back:int?]`**  
-  Generates a summary of moderation actions, or a list of outstanding (unresolved) ones, over the given window.  
+- **`moderation-summary <hours-back:int>`**  
+  Summarizes saved local moderation history in a background worker. The positive lookback window is not a guarantee of complete history.  
   Example: `/moderation-summary "48"`
+
+- **`outstanding-moderation [hours-back:int?]`**  
+  Uses VRChat audit queries to list outstanding (unresolved) moderation actions over the given window.
 
 - **`set-audit-channel <audit-event-type:string> [discord-text-channel:channel?]`**  
   Routes an audit event type to a text channel. Omit the channel to unset.  
@@ -270,9 +525,17 @@ Subcommands of **`schedule`** manage recurring VRChat group events (each stored 
   Routes an extended (Scarlet-derived) event type to a channel.  
   Example: `/set-audit-ex-channel "groupex.instance.vtk" <#log-instance-kicks>`
 
-- **`set-audit-secret-channel <audit-event-type:string> [discord-text-channel:channel?]`** / **`set-audit-secret-ex-channel <audit-ex-event-type:string> [discord-text-channel:channel?]`**  
-  Routes an audit or extended event type to a *secret* channel (for staff-only, sensitive events).  
+- **`set-audit-secret-channel <audit-event-type:string> [discord-text-channel:channel?]`** / **`set-audit-secret-ex-channel <secret-audit-ex-event-type:string> [discord-text-channel:channel?]`**  
+  Routes an audit event, or a supported extended event, to a *secret* channel (for staff-only, sensitive events). Extended secret destinations are supported for **Instance Monitor**, **Action Failure**, and **Live Player List**. Older unsupported extended assignments appear as **Clear legacy entry**; omit the channel to remove them. They are not counted as enabled in the feature-usage report.  
   Example: `/set-audit-secret-channel "group.instance.kick" <#log-instance-kicks-secret>`
+
+### Live Player List setup
+
+Select **Live Player List** (`groupex.instance.playerlist`) in `/set-audit-ex-channel` and assign its text channel. It posts directly in that channel; **Instance Monitor** and **User Switch Avatar** logging do not have to be enabled. To show the confidential roster, use `/set-audit-secret-ex-channel` with a separate channel whose access you have restricted appropriately. Scarlet does not change Discord channel permissions. If both routes use the same channel, the public filtering rules win.
+
+The list reflects players observed by the local VRChat client in the configured group's current instance, not every player in every group instance. After log catch-up, Scarlet rebuilds the current roster and resumes its saved message where possible. Players that cannot be observed in the client cannot be inferred by this feature. Leaving the instance, quitting the client, or disabling the route ends the corresponding observation. Long lists omit whole rows with a visible omitted-player count instead of cutting links mid-line.
+
+For native audit setup, select **Instance Warn** or **Instance Kick** from the suggestions. Free-typed `warns`, `kick`, and `live` are not separate event types. Unknown selections are rejected; they must never change an Instance Close assignment. Previously misassigned channels still need manual review because Scarlet cannot recover the user's original intent.
 
 - **`set-audit-aux-webhooks <audit-event-type:string>`**  
   Sets the auxiliary webhooks certain audit event types mirror to.  
@@ -457,6 +720,8 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
 Scarlet links to the official VRChat website whenever possible, including for user profiles, group posts, instances, and much more.  
 Scarlet can generate a link that will autopopulate the fields of the VRChat Help Desk report form based on custom tags assigned to moderation events, streamlining the reporting process and reducing mistakes from human error.
 
+The moderation **Report** button gives the requesting moderator a private reply with a copy-and-paste report, an **Autofilled report form (configured template)** link, and a **Simple report form (notes and tags)** link. The configured-template link and copyable text use the same report template; an empty template falls back to the event notes, tags, and footer. The configured template's optional footer setting is respected. If a report or URL is too long for Discord, its complete text is attached instead of losing information. Review the report, sign in to the VRChat Help Desk, and reopen the link if sign-in cleared the prefilled fields. Attach evidence when using the Help Desk user-report form; VRChat recommends in-app reporting for general reports. Scarlet prepares the report, and the moderator submits it manually.
+
 ---
 
 ### Localization
@@ -470,8 +735,8 @@ Scarlet can generate a link that will autopopulate the fields of the VRChat Help
 ### Training mode
 
 - Enable **Settings -> Training** to unlock an event simulator (Edit -> *Simulate event (training)...*, or the `simulate` CLI command) that fires realistic events on demand — so new moderators can learn on a screenshare instead of a live incident, and nobody has to actually join a bad group.
-- The simulator can also fire **moderator warn / kick / ban** events. Each produces a genuine moderation post and thread with the real **Edit tags**, **Edit description**, **Ban / Unban** and **Timed ban** buttons (and `/tag` works in its thread), so a trainer (or a maintainer testing a build) can exercise the whole Discord tagging workflow from a moderator's account without banning anyone. These posts go **only** to the training channel set with `set-training-channel` (nothing is posted if none is set), Ban / Unban / Timed ban on a training user run the real permission checks and then reply with a simulated result without calling VRChat, and drills never appear in moderation summaries (those are counted from VRChat's own audit log).
-- Simulated events run the **real** pipeline — the player-list row, TTS callout, desktop/mobile notification, and a genuine Discord post with its ban/unban buttons — so the whole workflow, including tagging in Discord, is practiceable.
+- The simulator can also fire **moderator warn / kick / ban** events. Each produces a genuine moderation post and thread with the real **Edit tags**, **Edit description**, **Ban / Unban** and **Timed ban** buttons (and `/tag` works in its thread), so a trainer (or a maintainer testing a build) can exercise the whole Discord tagging workflow from a moderator's account without banning anyone. These posts go **only** to the training channel set with `set-training-channel` (nothing is posted if none is set), Ban / Unban / Timed ban on a training user run the real permission checks and then reply with a simulated result without calling VRChat, and drills never appear in moderation summaries (training records are explicitly excluded from saved-history summaries).
+- Simulated events run the **real** pipeline — the player-list row, TTS callout, desktop notification, and a genuine Discord post with its ban/unban buttons — so the whole workflow, including tagging in Discord, is practiceable.
 - While training, Scarlet behaves as a **separate client**: the real instance is parked and kept updated in the background, actions on training players show real success feedback but make no VRChat call, and turning training off restores the live instance instantly. Everything training-related is marked `[TRAINING]` and, with `set-training-channel`, posts to its own channel — a drill can never be mistaken for a real record.
 
 ---
@@ -485,10 +750,10 @@ Scarlet can generate a link that will autopopulate the fields of the VRChat Help
 
 ---
 
-### Desktop and mobile notifications
+### Desktop notifications
 
 - Advisories can raise native desktop notifications (Windows Action Center, Linux `notify-send`, macOS `osascript` — PowerShell is never invoked), configured per category in **Settings -> Desktop Notifications**.
-- A mobile companion can push the same alerts to a phone; pair it from **Settings -> Mobile Companion**.
+- Scarlet no longer includes an Android/mobile companion, phone pairing, or any mobile alert-delivery feature.
 
 ---
 
@@ -517,11 +782,42 @@ You will need:
 - A VRChat group you (or a dedicated bot account) have permissions for.  
 - A Discord server (guild) in which you have permissions.  
 - A Discord bot account (application).  
-- A Windows or Linux PC with Java 8 (or newer) installed.
+- A Windows or Linux PC with Java 11 (or newer) installed; Java 21 is recommended.
 
 Scarlet runs on both Windows and Linux (this is the Linux-compatible fork). The Discord and VRChat-API features work anywhere; the VRChat-log features (instance monitoring, extended events, avatar statuses) require the VRChat client to be running on the same machine — natively on Windows, or under Proton/Wine on Linux.
 
-If you wish to not install Java for all users on the PC, if you would like to have several different Java installations, or if you would otherwise prefer to keep the Java installation to Scarlet only, see the instructions further below.
+If you prefer a portable Java installation, extract a Java 21 JDK and invoke
+its `bin/java` executable directly in the launch command below.
+
+#### Linux text-to-speech installation
+
+Scarlet can use an already installed eSpeak NG or Flite engine. To add voices,
+open **Settings -> Text-to-Speech -> Install Linux TTS voices**; Scarlet asks
+for confirmation before running the displayed package command.
+
+On **Bazzite and OSTree-based Fedora Atomic hosts**, Scarlet uses an existing
+Homebrew installation for TTS instead of trying the host's DNF/YUM wrappers.
+The default package is `espeak-ng`; Flite is also offered. Homebrew runs as the
+current user, without Scarlet elevating it to root. Both normal PATH entries and
+Homebrew's standard Linux prefix (`/home/linuxbrew/.linuxbrew/bin`) are checked,
+so engines can be found from desktop launches with a minimal PATH.
+
+For manual installation with an existing, writable Homebrew installation:
+
+```sh
+/home/linuxbrew/.linuxbrew/bin/brew install espeak-ng
+```
+
+If Homebrew is missing or is managed by another account, follow your distribution's
+setup instructions first: [Bazzite Homebrew guide](https://docs.bazzite.gg/Installing_and_Managing_Software/Homebrew/).
+Scarlet does not bootstrap Homebrew, create containers, layer OS packages, or
+restart the device. Package layering with `rpm-ostree` is a separate manual
+administration choice and normally requires a reboot before new commands are
+usable; it is not an automatic fallback for TTS. Ordinary mutable distributions
+keep their existing native package-manager selection, and Windows keeps SAPI.
+Restart Scarlet after installing extra engines if their voices do not yet appear.
+
+An installation video for the earlier desktop workflow is available below. Verify its steps against the current written instructions:
 
 Thanks to [@KozyBlake](https://github.com/KozyBlake) for making this video tutorial:
 
@@ -566,13 +862,18 @@ All such actions (e.g., kicking or banning a user) must be performed manually, b
 
 ### Installing the Scarlet Desktop Application
 
-1. Download the latest release (`zip` is recommended): https://github.com/KozyBlake/Scarlet/releases/latest  
-2. Copy or extract the files into the directory of your choosing.  
-3. If you have Java 8 (or newer) installed to the system PATH, skip this step.  
-    - Download and extract a Java 8 JDK, such as one from [Adoptium](https://adoptium.net/temurin/releases/?package=jdk&version=8) (pick your OS/arch — Windows or Linux).  
-    - Create (or overwrite) the file `scarlet.home.java` next to `run.bat`.  
-    - Copy-paste etc. the root path of the JDK to the **first line** of `scarlet.home.java` and save the file.  
-4. If you want Scarlet to store data in a specific folder:  
-    - Create (or overwrite) the file `scarlet.home` next to `run.bat`.  
-    - Copy-paste etc. path of the desired directory to the **first line** of `scarlet.home` and save the file.  
-5. Start Scarlet: on Windows run `run.bat`; on Linux run the included launch script (or start the jar directly with your Java 8+ runtime).
+1. Download the latest release: https://github.com/Hatson321/Scarlet/releases/latest  
+2. Copy or extract `scarlet-<version>.jar` into the directory of your choosing.  
+3. Install a Java 11 (or newer) runtime for your operating system and CPU architecture. Java 21 is recommended; [Adoptium Temurin](https://adoptium.net/temurin/releases/?package=jdk&version=21) is one suitable distribution.  
+4. From a terminal in that directory, start the same JAR on Windows or Linux:
+
+   ```sh
+   java -jar scarlet-<version>.jar
+   ```
+
+To keep Scarlet's data in a specific directory, set `SCARLET_HOME` in the
+environment or pass it as a JVM property before `-jar`, for example:
+
+```sh
+java -DSCARLET_HOME="/path/to/scarlet-data" -jar scarlet-<version>.jar
+```

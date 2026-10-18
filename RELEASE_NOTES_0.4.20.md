@@ -132,11 +132,11 @@ Both button handlers built their modal but never `.queue()`d it, so the modal wa
 
 ## Report flow updated for VRChat's reporting changes
 
-VRChat moved general reporting **in-app** and restricted the Help Desk form to **appeals and evidence-backed reports** (and it now requires signing in), so the old pre-filled Help Desk links mostly hit a login wall or get auto-closed. The `vrchat-report` button now outputs a **plain-text, copy-paste report block** — target, actor, reason, internal tags, group/audit IDs — for a signed-in moderator to paste straight into VRChat's in-app report. The Help Desk link is kept but labelled for its now-narrow use (appeals / evidence). Still no automated reporting under the bot account — a human files it.
+The `vrchat-report` button provides **both** a plain-text copy-and-paste report and an **autofilled VRChat Help Desk form using the configured report template**. The simpler notes-and-tags form link is also available. The template and copyable report share the same content and optional footer; when no template is configured, event details provide a useful fallback. Long reports or form URLs are attached in full as text files when they exceed Discord's display limits. Replies remain private to the requesting moderator. Sign in to the Help Desk and reopen the link if necessary, review the filled fields, and attach supporting evidence. VRChat recommends in-app reporting for general reports. Scarlet does not submit reports automatically.
 
 ## ARM/glibc Discord voice (DAVE) groundwork
 
-On a glibc arm64 box (e.g. a Raspberry Pi running the desktop jar) there's no native `libdave-jvm`, so Discord voice falls back to the JNA `DAudioDaveSession` path — which mis-handshakes and makes the bot thrash (join/leave) in voice. That fallback (only ever active on such platforms) is now heavily logged at each DAVE handshake step, with the MLS-init failure surfaced at error level, so the next ARM voice attempt pinpoints exactly where E2EE dies. Also fixed two casts the original author had flagged `// smells sus`. Termux/Android arm64 users should keep using **`-android.jar`**, which bundles the proper arm64 `libdave-jvm`.
+On a glibc arm64 box (e.g. a Raspberry Pi running the desktop jar) there's no native `libdave-jvm`, so Discord voice falls back to the JNA `DAudioDaveSession` path — which mis-handshakes and makes the bot thrash (join/leave) in voice. That fallback (only ever active on such platforms) is now heavily logged at each DAVE handshake step, with the MLS-init failure surfaced at error level, so the next ARM voice attempt pinpoints exactly where E2EE dies. Also fixed two casts the original author had flagged `// smells sus`. The former Termux/Android artifact mentioned by this historical release note has since been removed; no Android build is distributed or supported.
 
 
 ## Quieter logs: down or dead avatar-search providers
@@ -160,7 +160,7 @@ avtrDB was the only provider that answered "here's an avatar image, which avatar
 
 No new API key, no new dependency, and nothing that can quietly die on you the way `avtr.zip` did. Author-lookup state is tracked **separately** from text search, so if a provider doesn't support author lookup it backs off quietly for that mode without touching its text search. If the owner can't be resolved or no provider indexes them, it returns no match and falls back to name search — exactly as before.
 
-> **Correction:** An earlier version of these notes said avtrDB required an API key. That was a misunderstanding by KozyBlake and Claude. The avtrDB maintainer confirmed that datacenter IPs (and likely VPNs) were being blocked, and now lets requests identified as Scarlet through even from those networks.
+> **Correction:** An earlier version of these notes said avtrDB required an API key. That was a misunderstanding during earlier maintenance and AI-assisted review. The avtrDB maintainer confirmed that datacenter IPs (and likely VPNs) were being blocked, and now lets requests identified as Scarlet through even from those networks.
 >
 > **avtrDB is back as an avatar name-search provider** in this release, alongside the other five. It isn't used for "search by picture", which keeps the rebuilt method above. If you use the default provider list you don't need to do anything; if you set a custom list, tick avtrDB in the avatar search providers settings.
 
@@ -170,12 +170,11 @@ Worth stating plainly: Scarlet's whole avatar-search feature — text search, au
 
 To be precise about it: Scarlet **implements** that format — it doesn't bundle, fork, or import VRCX's code. Building to the shared convention is what keeps Scarlet interoperable with the same providers VRCX uses, and lets it benefit from (and contribute back to) that ecosystem.
 
-## First-launch notice (a "vibe-coded" disclosure)
+## First-launch maintainer and release-process notice
 
-Scarlet now greets first-time users with an honest heads-up: this fork is **maintained by KozyBlake and developed largely with AI assistance** — a "vibe-coded" project — with a **Continue** or **Close Scarlet** choice. If running AI-assisted software isn't for you, you can bow out right there, no questions asked.
+scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested.
 
-- Shown **once**, then remembered (`vibecoded_notice_acknowledged` in `settings.json`).
+- Shown **once**, then remembered in `settings.json`.
 - **Headless / scheduled** bots don't get a dialog they can't answer — they log the notice once and keep running.
 - The same note now sits at the top of the README.
 
-To be clear about accountability: KozyBlake maintains and stands behind the project; the AI is a tool in that process, not the maintainer.

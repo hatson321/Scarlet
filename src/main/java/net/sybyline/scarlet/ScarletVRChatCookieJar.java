@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -32,21 +33,48 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
 
     ScarletVRChatCookieJar(Scarlet scarlet, String domain, File cookieFile)
     {
-        this.scarlet = scarlet;
-        this.cookieStore = scarlet.settings.new RegistryStringEncrypted(domain+".cookieStore", true);
-        this.cookieStoreAlt = scarlet.settings.new RegistryJsonEncrypted<>(domain+".cookieStoreAlt", true, null, new TypeToken<Map<String, List<String>>>(){}.getType());
+        this(cookieFile, stores(scarlet, domain));
+    }
+
+    interface Stores
+    {
+        String primary();
+        void primary(String value);
+        Map<String, List<String>> alternates();
+        void alternates(Map<String, List<String>> value);
+        void removeLoginValue(String key);
+        boolean persistOnShutdown();
+    }
+
+    private static Stores stores(Scarlet scarlet, String domain)
+    {
+        ScarletSettings.RegistryStringEncrypted primary = scarlet.settings.new RegistryStringEncrypted(domain+".cookieStore", true);
+        ScarletSettings.RegistryJsonEncrypted<Map<String, List<String>>> alternates = scarlet.settings.new RegistryJsonEncrypted<>(
+            domain+".cookieStoreAlt", true, null, new TypeToken<Map<String, List<String>>>(){}.getType());
+        return new Stores() {
+            public String primary() { return primary.getOrNull(); }
+            public void primary(String value) { primary.set(value); }
+            public Map<String, List<String>> alternates() { return alternates.getOrNull(); }
+            public void alternates(Map<String, List<String>> value) { alternates.set(value); }
+            public void removeLoginValue(String key) { scarlet.settings.new RegistryStringEncrypted(key, true).clear(); }
+            public boolean persistOnShutdown() { return scarlet.shouldPersistOnShutdown(); }
+        };
+    }
+
+    ScarletVRChatCookieJar(File cookieFile, Stores stores)
+    {
+        this.stores = stores;
         this.cookieFile = cookieFile;
         this.list = new ArrayList<>();
         this.alternateLists = CollectionMap.listsConcurrent();
         this.url = HttpUrl.parse(Scarlet.API_URL_2);
     }
 
-    private final Scarlet scarlet;
-    private final ScarletSettings.RegistryStringEncrypted cookieStore;
-    private final ScarletSettings.RegistryJsonEncrypted<Map<String, List<String>>> cookieStoreAlt;
+    private final Stores stores;
     private final File cookieFile;
     private final List<Cookie> list;
     private final CollectionMap.OfLists<String, Cookie> alternateLists;
+    private final Set<String> removedAlternates = new HashSet<>();
     private HttpUrl url;
 
     static final ThreadLocal<String> _context = new ThreadLocal<>();
@@ -74,12 +102,17 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
     {
         public AltCredContext(String context)
         {
-            this.context = context;
-            this.previousContext = _set(context);
-            if (context == null)
-                _context2.set(this.list = new CopyOnWriteArrayList<>());
-            else
-                this.list = ScarletVRChatCookieJar.this.alternateLists.valuesGetOrCreate(context);
+            synchronized (ScarletVRChatCookieJar.this)
+            {
+                if (context != null && ScarletVRChatCookieJar.this.removedAlternates.contains(context))
+                    throw new IllegalStateException("Alternate credentials were removed");
+                this.context = context;
+                this.previousContext = _set(context);
+                if (context == null)
+                    _context2.set(this.list = new CopyOnWriteArrayList<>());
+                else
+                    this.list = ScarletVRChatCookieJar.this.alternateLists.valuesGetOrCreate(context);
+            }
             
         }
         private final String context, previousContext;
@@ -94,7 +127,14 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         }
         public boolean transferTo(String toContext)
         {
-            return this.context == null && toContext != null && ScarletVRChatCookieJar.this.alternateLists.valuesAddAll(toContext, this.list);
+            synchronized (ScarletVRChatCookieJar.this)
+            {
+                if (this.context != null || toContext == null)
+                    return false;
+                // Only an explicit new login may re-add a locally removed account.
+                ScarletVRChatCookieJar.this.removedAlternates.remove(toContext);
+                return ScarletVRChatCookieJar.this.alternateLists.valuesAddAll(toContext, this.list);
+            }
         }
         @Override
         public void close()
@@ -158,7 +198,7 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
             }
         }
         {
-            String store = this.cookieStore.getOrNull();
+            String store = this.stores.primary();
             if (store != null) try (BufferedReader in = new BufferedReader(new StringReader(store)))
             {
                 in.lines()
@@ -173,7 +213,7 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
             }
         }
         {
-            Map<String, List<String>> altStore = this.cookieStoreAlt.getOrNull();
+            Map<String, List<String>> altStore = this.stores.alternates();
             if (altStore != null && !altStore.isEmpty())
                 altStore.forEach((context, list) -> list.forEach(cookie -> this.addAlt(context, cookie)));
         }
@@ -188,13 +228,17 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         StringBuilder sb = new StringBuilder();
         for (Cookie cookie : removeStale(this.list))
             sb.append(cookie.toString()).append('\n');
-        this.cookieStore.set(sb.toString());
-        if (!this.alternateLists.isEmpty())
-        {
-            Map<String, List<String>> altStore = new HashMap<>();
-            this.alternateLists.forEach((context, list) -> altStore.put(context, list.stream().map(Cookie::toString).collect(Collectors.toList())));
-            this.cookieStoreAlt.set(altStore);
-        }
+        this.stores.primary(sb.toString());
+        this.saveAlternates();
+    }
+
+    private void saveAlternates()
+    {
+        Map<String, List<String>> altStore = new HashMap<>();
+        this.alternateLists.forEach((context, list) -> altStore.put(context, list.stream().map(Cookie::toString).collect(Collectors.toList())));
+        // Persist the empty map too: otherwise the final removed account returns
+        // at next startup from the previously nonempty encrypted value.
+        this.stores.alternates(altStore);
     }
 
     synchronized void setup(ApiClient client)
@@ -202,14 +246,38 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         this.url = HttpUrl.parse(String.format("https://%s/", HttpUrl.parse(client.getBasePath()).host()));
     }
 
-    boolean removeAlt(String alt)
+    synchronized boolean removeAlt(String alt)
     {
-        return this.alternateLists.remove(alt) != null;
+        Objects.requireNonNull(alt, "alt");
+        this.removedAlternates.add(alt);
+        boolean removed = this.alternateLists.remove(alt) != null;
+        // Clear every saved login handle even if no session cookie remains.
+        // On storage failure propagate to the UI, never report a successful deletion.
+        try
+        {
+            this.stores.removeLoginValue("alt:"+alt+":username");
+            this.stores.removeLoginValue("alt:"+alt+":password");
+            this.stores.removeLoginValue("alt:"+alt+":totpsecret");
+            this.saveAlternates();
+        }
+        catch (RuntimeException ex)
+        {
+            // Keep a disabled, cookie-free selection so the owner can retry local
+            // cleanup; do not silently hide an incompletely removed account.
+            this.alternateLists.valuesGetOrCreate(alt).clear();
+            throw ex;
+        }
+        return removed;
     }
 
-    Set<String> alts()
+    synchronized boolean isRemoved(String alt)
     {
-        return this.alternateLists.keySet();
+        return this.removedAlternates.contains(alt);
+    }
+
+    synchronized Set<String> alts()
+    {
+        return new HashSet<>(this.alternateLists.keySet());
     }
 
     synchronized List<Cookie> copy()
@@ -251,6 +319,8 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         if (added == null)
             return false;
         List<Cookie> list = this.getForRequest(true);
+        if (list == null)
+            return false;
         return addTo(list, added);
     }
     synchronized boolean add(List<Cookie> added)
@@ -258,6 +328,8 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         if (added == null || added.isEmpty())
             return false;
         List<Cookie> list = this.getForRequest(true);
+        if (list == null)
+            return false;
         boolean changed = false;
         for (Cookie cookie : added)
             changed |= addTo(list, cookie);
@@ -266,6 +338,8 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
 
     List<Cookie> getForRequest(boolean add)
     {
+        if (this.removedAlternates.contains(_context.get()))
+            return null;
         List<Cookie> list = _context2.get();
         if (list == null)
         {
@@ -299,13 +373,15 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
     public synchronized List<Cookie> loadForRequest(HttpUrl url)
     {
         // remove expired cookies and return only matching Cookies
-        return removeStale(this.getForRequest(false)).stream().filter(cookie -> cookie.matches(url)).collect(Collectors.toList());
+        List<Cookie> requested = this.getForRequest(false);
+        return requested == null ? java.util.Collections.emptyList()
+            : removeStale(requested).stream().filter(cookie -> cookie.matches(url)).collect(Collectors.toList());
     }
 
     @Override
     public void close() throws IOException
     {
-        if (this.scarlet.shouldPersistOnShutdown())
+        if (this.stores.persistOnShutdown())
             this.save();
         else
             ScarletVRChat.LOG.info("Skipping VRChat cookie save after migration bundle import");

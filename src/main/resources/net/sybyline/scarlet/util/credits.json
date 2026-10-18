@@ -20,6 +20,11 @@
     "role": "Contributor, provisional maintainer of Linux-compatible fork"
   },
   {
+    "name": "Hatson321",
+    "url": "https://github.com/Hatson321",
+    "role": "Maintainer of Scarlet Logger"
+  },
+  {
     "name": "kubectl",
     "url": "https://github.com/0xkubectl",
     "role": "Contributor, provisional maintainer of Linux-compatible fork, VRCX-compatible search provider"

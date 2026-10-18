@@ -31,6 +31,7 @@ public class ScarletModerationTags
     final File moderationTagsFile;
     private List<Tag> tags;
     private List<Command.Choice> choicesCache;
+    private boolean loadFailed;
 
     public static class Tag
     {
@@ -58,37 +59,52 @@ public class ScarletModerationTags
         List<Tag> tags = this.tags;
         if (tags != null)
             return tags;
-        if (!this.moderationTagsFile.exists())
+        try
         {
-            tags = new CopyOnWriteArrayList<>();
-        }
-        else try (Reader r = MiscUtils.reader(this.moderationTagsFile))
-        {
-            tags = new CopyOnWriteArrayList<>(Scarlet.GSON_PRETTY.fromJson(r, Tag.LISTOF));
+            if (!ScarletData.existingRecord(this.moderationTagsFile))
+            {
+                if (this.loadFailed) throw new java.io.IOException("Previously unreadable moderation tags must be restored or repaired before reload");
+                tags = new CopyOnWriteArrayList<>();
+            }
+            else try (Reader r = MiscUtils.reader(this.moderationTagsFile))
+            {
+                List<Tag> loaded = Scarlet.GSON_PRETTY.fromJson(r, Tag.LISTOF);
+                if (loaded == null || loaded.stream().anyMatch(tag -> tag == null || tag.value == null))
+                    throw new java.io.IOException("Existing moderation tags must contain a valid JSON array");
+                tags = new CopyOnWriteArrayList<>(loaded);
+            }
         }
         catch (Exception ex)
         {
+            this.loadFailed = true;
             LOG.error("Exception loading moderation tags", ex);
-            tags = new CopyOnWriteArrayList<>();
+            throw new java.io.UncheckedIOException("Moderation tags could not be read; the original file was preserved. Restore or repair it before retrying.",
+                ex instanceof java.io.IOException ? (java.io.IOException) ex : new java.io.IOException(ex));
         }
+        this.loadFailed = false;
         this.tags = tags;
         return tags;
     }
 
     synchronized void saveJson()
     {
+        if (this.loadFailed)
+            throw new java.io.UncheckedIOException(new java.io.IOException("Moderation tags save refused after a failed load"));
         List<Tag> tags = this.tags;
         if (tags == null)
             return;
         if (!this.moderationTagsFile.getParentFile().isDirectory())
             this.moderationTagsFile.getParentFile().mkdirs();
-        try (Writer w = FileBackups.writer(this.moderationTagsFile))
+        try (FileBackups.AtomicWriter w = FileBackups.writer(this.moderationTagsFile))
         {
             Scarlet.GSON_PRETTY.toJson(tags, Tag.LISTOF.getType(), w);
+            w.commit();
         }
         catch (Exception ex)
         {
             LOG.error("Exception saving moderation tags", ex);
+            throw new java.io.UncheckedIOException("Moderation tag changes were not saved; check local storage and retry.",
+                ex instanceof java.io.IOException ? (java.io.IOException) ex : new java.io.IOException(ex));
         }
     }
 

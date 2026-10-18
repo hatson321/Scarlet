@@ -2,6 +2,9 @@ package net.sybyline.scarlet;
 
 import java.io.Closeable;
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -11,6 +14,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -26,6 +30,11 @@ public class ScarletVRChatLogs implements Closeable
 {
 
     static final Logger LOG = LoggerFactory.getLogger("Scarlet/VRChat/Logs");
+
+    private static final String SPAWN_UUID = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+    private static final Pattern PROP_SPAWN = Pattern.compile(
+        "(?:\\[VRCProps\\] Prop|\\[VRCItems\\] Item) (prop_"+SPAWN_UUID+") spawned by (usr_"+SPAWN_UUID+")");
+    private static final Pattern AUTHENTICATED_USER = Pattern.compile("(.+) \\((usr_"+SPAWN_UUID+")\\)");
 
     public ScarletVRChatLogs(Listener listener)
     {
@@ -77,23 +86,67 @@ public class ScarletVRChatLogs implements Closeable
         return this.lastEntryMillis;
     }
 
+    /**
+     * Whether the current live parser has recently finished processing available log
+     * entries. Quiet logs remain healthy; stale, stopped or damaged tracking cannot
+     * authorize automatic client exit. An entry/parser failure invalidates that entire
+     * tail session instead of silently trusting a roster that may have missed events.
+     */
+    public boolean clientExitTrackingHealthy()
+    {
+        VRChatLogTail tail = this.currentTail;
+        if (!this.running || !this.trackingThreadAlive() || tail == null || this.currentTarget == null
+            || !tail.isRunning() || !tail.trackingValid || tail.isInPreamble || tail.completedLoopNanos == 0L)
+            return false;
+        long elapsed = this.trackingNowNanos() - tail.completedLoopNanos;
+        return elapsed >= 0L && elapsed <= TimeUnit.SECONDS.toNanos(2L)
+            && this.currentTail == tail && tail.trackingValid && tail.trackingCaughtUp();
+    }
+
+    long trackingNowNanos() { return System.nanoTime(); }
+    boolean trackingThreadAlive() { return this.tailThread.isAlive() && !this.tailThread.isInterrupted(); }
+
+    private void invalidateClientExitTracking()
+    {
+        VRChatLogTail tail = this.currentTail;
+        if (tail != null)
+            tail.invalidateTracking();
+    }
+
+    private boolean handleAuthentication(boolean preamble, LocalDateTime timestamp, String text)
+    {
+        boolean behaviour = text.startsWith("[Behaviour] ");
+        String body = behaviour ? text.substring(12) : text;
+        String payload;
+        if (body.startsWith("[User Authenticated: "))
+        {
+            if (!body.endsWith("]"))
+                throw new IllegalArgumentException("Malformed bracketed authentication log entry");
+            payload = body.substring(21, body.length() - 1);
+        }
+        else if (behaviour && body.startsWith("User Authenticated: "))
+            payload = body.substring(20);
+        else
+            return false;
+        Matcher authenticated = AUTHENTICATED_USER.matcher(payload);
+        if (!authenticated.matches() || authenticated.group(1).trim().isEmpty())
+            throw new IllegalArgumentException("Malformed authentication identity in log entry");
+        this.listener.log_userAuthenticated(preamble, timestamp, authenticated.group(1), authenticated.group(2));
+        return true;
+    }
+
     private void handleEntry(File file, boolean preamble, LocalDateTime timestamp, String level, String text, List<String> lines)
     {
         this.lastEntryMillis = System.currentTimeMillis();
         int cidx;
-        if (text.startsWith("[Behaviour] "))
+        Matcher propSpawn;
+        if (this.handleAuthentication(preamble, timestamp, text))
         {
-            if (text.startsWith("[User Authenticated: "))
-            {
-                int nameStart = 21,
-                    nameEnd = text.lastIndexOf(" ("),
-                    idStart = nameEnd + 2,
-                    idEnd = text.lastIndexOf(')');
-                String name = text.substring(nameStart, nameEnd),
-                       id = text.substring(idStart, idEnd);
-                this.listener.log_userAuthenticated(preamble, timestamp, name, id);
-            }
-            else if (text.startsWith("Joining ", 12) && !text.startsWith("or Creating Room: ", 20))
+            // Authentication is recognized before the generic Behaviour branch.
+        }
+        else if (text.startsWith("[Behaviour] "))
+        {
+            if (text.startsWith("Joining ", 12) && !text.startsWith("or Creating Room: ", 20))
             {
                 String location = text.substring(20);
                 this.listener.log_userJoined(preamble, timestamp, location);
@@ -171,10 +224,12 @@ public class ScarletVRChatLogs implements Closeable
                    stickerId = text.substring(cidx + 18);
             this.listener.log_playerSpawnSticker(preamble, timestamp, userDisplayName, userId, stickerId);
         }
-        else if (text.startsWith("[VRCProps] Prop ") && (cidx = text.lastIndexOf(" spawned by ")) != -1)
+        else if ((text.startsWith("[VRCProps] Prop ") || text.startsWith("[VRCItems] Item "))
+                && (propSpawn = PROP_SPAWN.matcher(text)).matches())
         {
-            String propId = text.substring(16, cidx),
-                   userId = text.substring(cidx + 12);
+            // Newer clients call props "items" in logs; both formats identify the same event.
+            String propId = propSpawn.group(1),
+                   userId = propSpawn.group(2);
             this.listener.log_playerSpawnProp(preamble, timestamp, userId, propId);
         }
         else if (text.startsWith("VRCApplication: HandleApplicationQuit at "))
@@ -210,8 +265,8 @@ public class ScarletVRChatLogs implements Closeable
     private final Thread tailThread;
     private volatile boolean running;
     private volatile int currentTargetIndex;
-    private File currentTarget;
-    private VRChatLogTail currentTail;
+    private volatile File currentTarget;
+    private volatile VRChatLogTail currentTail;
 
     public int currentTargetIndex()
     {
@@ -240,6 +295,7 @@ public class ScarletVRChatLogs implements Closeable
     public void close()
     {
         this.running = false;
+        this.invalidateClientExitTracking();
         if (this.tailThread.isAlive())
         {
             VRChatLogTail currentTail = this.currentTail;
@@ -284,6 +340,7 @@ public class ScarletVRChatLogs implements Closeable
             }
             while (this.running && !this.tailThread.isInterrupted())
             {
+                this.invalidateClientExitTracking();
                 this.currentTargetIndex++;
                 LOG.info("Tailing " + this.currentTarget.getName());
                 this.listener.log_init(this.currentTarget);
@@ -294,16 +351,19 @@ public class ScarletVRChatLogs implements Closeable
                 }
                 catch (Exception ex)
                 {
+                    this.invalidateClientExitTracking();
                     LOG.error("Exception whilst tailing " + this.currentTarget.getName(), ex);
                 }
             }
         }
         catch (Exception ex)
         {
+            this.invalidateClientExitTracking();
             LOG.error("Exception in tailer thread", ex);
         }
         finally
         {
+            this.invalidateClientExitTracking();
             this.running = false;
             this.currentTarget = null;
             this.currentTail = null;
@@ -322,6 +382,7 @@ public class ScarletVRChatLogs implements Closeable
         File nextTarget = this.locateTarget();
         if (Objects.equals(this.currentTarget, nextTarget))
             return false;
+        this.invalidateClientExitTracking();
         this.currentTarget = nextTarget;
         return true;
     }
@@ -346,17 +407,22 @@ public class ScarletVRChatLogs implements Closeable
         {
             super(target, StandardCharsets.UTF_8, 150L, false, false, 8192);
             this.buffer = new ArrayList<>();
-            this.lastPolled = System.currentTimeMillis();
+            this.lastPolled = ScarletVRChatLogs.this.trackingNowNanos();
             this.isInPreamble = true;
         }
         final List<String> buffer;
         long lastPolled;
-        boolean isInPreamble;
+        volatile boolean isInPreamble;
+        volatile boolean trackingValid = true;
+        volatile long completedLoopNanos;
+        volatile long completedReadPosition;
+        volatile boolean completeRead = true;
         LocalDateTime entryLdt;
         String entryLvl, entryTxt;
         @Override
         protected void on_line(boolean inPreamble, String line)
         {
+            this.completedLoopNanos = 0L;
             Matcher matcher = entry.matcher(line);
             if (matcher.find())
             {
@@ -381,13 +447,68 @@ public class ScarletVRChatLogs implements Closeable
         @Override
         protected void on_loop()
         {
-            long now = System.currentTimeMillis(),
+            long now = ScarletVRChatLogs.this.trackingNowNanos(),
                  diff = now - this.lastPolled;
-            if (diff < 10_000L)
-                return;
-            this.lastPolled = now;
-            if (ScarletVRChatLogs.this.pollTarget())
-                this.run = false;
+            if (diff < 0L || diff >= TimeUnit.SECONDS.toNanos(10L))
+            {
+                this.lastPolled = now;
+                if (ScarletVRChatLogs.this.pollTarget())
+                {
+                    this.invalidateTracking();
+                    this.run = false;
+                    return;
+                }
+            }
+            if (this.trackingValid && !this.isInPreamble && this.buffer.isEmpty() && this.isRunning() && this.trackingCaughtUp())
+                this.completedLoopNanos = now;
+        }
+
+        boolean trackingCaughtUp()
+        {
+            try
+            {
+                return this.completeRead && this.file.isFile() && this.file.length() == this.completedReadPosition;
+            }
+            catch (SecurityException ex)
+            {
+                this.invalidateTracking();
+                return false;
+            }
+        }
+
+        @Override
+        protected long readLines(long fileInitialLength, RandomAccessFile reader) throws IOException
+        {
+            this.completedLoopNanos = 0L;
+            this.completeRead = false;
+            try
+            {
+                long consumed = super.readLines(fileInitialLength, reader);
+                this.completedReadPosition = consumed;
+                this.completeRead = consumed == reader.length();
+                return consumed;
+            }
+            catch (IOException | RuntimeException ex)
+            {
+                this.invalidateTracking();
+                throw ex;
+            }
+        }
+
+        void invalidateTracking()
+        {
+            this.trackingValid = false;
+            this.completedLoopNanos = 0L;
+        }
+
+        @Override protected void on_fnf(FileNotFoundException ex) { this.invalidateTracking(); }
+        @Override protected void on_rotated() { this.invalidateTracking(); }
+        @Override protected void on_exception(Exception ex) { this.invalidateTracking(); }
+
+        @Override public void stop()
+        {
+            this.invalidateTracking();
+            super.stop();
         }
         @Override
         protected boolean isRunning()
@@ -399,15 +520,22 @@ public class ScarletVRChatLogs implements Closeable
         {
             if (!this.buffer.isEmpty()) try
             {
-                ScarletVRChatLogs.this.handleEntry(this.file, this.isInPreamble, this.entryLdt, this.entryLvl, this.entryTxt, this.buffer);
+                // Headers and continuation-only text are not parsed events. Clearing the
+                // entry after dispatch also prevents replaying it for later bare lines.
+                if (this.entryLdt != null && this.entryLvl != null && this.entryTxt != null)
+                    ScarletVRChatLogs.this.handleEntry(this.file, this.isInPreamble, this.entryLdt, this.entryLvl, this.entryTxt, this.buffer);
             }
             catch (Exception ex)
             {
+                this.invalidateTracking();
                 LOG.error("Error handling log line: " + this.entryTxt, ex);
             }
             finally
             {
                 this.buffer.clear();
+                this.entryLdt = null;
+                this.entryLvl = null;
+                this.entryTxt = null;
             }
         }
     }

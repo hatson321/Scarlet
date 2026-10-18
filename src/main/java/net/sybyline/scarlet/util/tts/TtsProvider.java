@@ -152,6 +152,10 @@ public interface TtsProvider extends Closeable
                 // User approved but installation failed
                 Scarlet.LOG.warn("Linux TTS engine installation failed, TTS will be disabled");
                 return new NullTtsProvider(dir);
+
+            case INSTALL_UNAVAILABLE:
+                Scarlet.LOG.warn("No supported automatic TTS installer is available; manual setup is needed");
+                return new NullTtsProvider(dir);
                 
             case INSTALL_DECLINED:
                 // User declined installation

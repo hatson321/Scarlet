@@ -12,11 +12,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.net.ConnectException;
-import java.net.InetAddress;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -66,10 +64,6 @@ import javax.net.ssl.SSLHandshakeException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.concentus.OpusApplication;
-import org.concentus.OpusEncoder;
-import org.concentus.OpusException;
-import org.concentus.OpusSignal;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -78,8 +72,11 @@ import io.github.vrchatapi.JSON;
 import io.github.vrchatapi.api.GroupsApi;
 import io.github.vrchatapi.model.Avatar;
 import io.github.vrchatapi.model.CreateInstanceRequest;
+import io.github.vrchatapi.model.CreateInstanceRequestRegion;
 import io.github.vrchatapi.model.GroupAccessType;
-import io.github.vrchatapi.model.GroupAuditLogEntry;
+import io.github.vrchatapi.model.GroupAuditLogEntryUnknown;
+import io.github.vrchatapi.model.Group;
+import io.github.vrchatapi.model.GroupMember;
 import io.github.vrchatapi.model.GroupMemberStatus;
 import io.github.vrchatapi.model.GroupPermissions;
 import io.github.vrchatapi.model.GroupRole;
@@ -135,6 +132,8 @@ import net.dv8tion.jda.api.events.guild.member.GuildMemberJoinEvent;
 import net.dv8tion.jda.api.events.guild.member.GuildMemberRoleAddEvent;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.events.session.ShutdownEvent;
+import net.dv8tion.jda.api.events.session.SessionResumeEvent;
+import net.dv8tion.jda.api.events.session.SessionRecreateEvent;
 import net.dv8tion.jda.api.exceptions.InvalidTokenException;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import net.dv8tion.jda.api.interactions.Interaction;
@@ -221,11 +220,20 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.selectEvidenceRoot = scarlet.settings.new FileValuedVoid("Evidence root folder", "Select", this::selectEvidenceRoot);
         this.evidenceFilePathFormat = scarlet.settings.new FileValuedStringPattern("evidence_file_path_format", "Evidence file path format", "", ".+", false);
         this.avatarSearchProvidersEnabled = scarlet.settings.new FileValuedBoolean("custom_avatar_search_providers_enabled", "Use custom avatar search providers", false);
+        this.avatarSearchExternalLookupsEnabled = scarlet.settings.new FileValuedConsentBoolean(AvatarSearch.IDENTIFIED_LOOKUP_CONSENT_KEY,
+            "Allow external avatar database lookups");
         this.avatarSearchProviders = scarlet.settings.new FileValuedStringArrayPattern("custom_avatar_search_providers", "VRCX-compatible avatar search providers", AvatarSearch.URL_ROOTS.clone(), "https?://.+", false);
         this.resetAvatarSearchProviders = scarlet.settings.new FileValuedVoid("Avatar search providers", "Manage...", this::manageAvatarSearchProviders);
         this.load();
+        // Stored denials must be readable before connecting a bot that can receive interactions.
+        this.perms = new DPerms(permsFile);
+        this.perms.registerOther(ScarletPermission.GROUPEX_BANS_MANAGE.id, ScarletPermission.GROUPEX_TAGS_EDIT.id);
+        this.perms.load();
+        this.interactions = new DInteractions(false, scarlet.exec);
+        this.interactions.setModalAuthorization(this::authorizeModalSession);
         if (Features.DAVE_ENABLED)
             LDaveSessionFactory.configureLoggingIfAvailable();
+        restShutdown = false;
         // Install our shutdown-aware failure handler before any RestAction can fire.
         // See handleRestFailure() for the rationale.  Set once, globally — JDA's
         // default is static and applies to every RestAction that doesn't pass its
@@ -289,16 +297,29 @@ public class ScarletDiscordJDA implements ScarletDiscord
         }
         this.jda = jda;
         this.livePlayerlist = new ScarletLivePlayerlist(scarlet);
-        this.perms = new DPerms(permsFile);
-        this.perms.registerOther(ScarletPermission.GROUPEX_BANS_MANAGE.id, ScarletPermission.GROUPEX_TAGS_EDIT.id);
-        this.perms.load();
-        this.interactions = new DInteractions(false, scarlet.exec);
         this.init();
     }
 
     @Override
     public void close() throws IOException
     {
+        this.closeClientLaunchWorker();
+        this.closeSummaryWorker();
+        ScarletAuditFollowupWorker followup;
+        synchronized (this)
+        {
+            this.auditFollowupClosed = true;
+            followup = this.auditFollowupWorker;
+        }
+        if (followup != null) try { followup.close(); }
+        catch (IOException ex)
+        {
+            LOG.error("Audit follow-up shutdown failed; offline migration was not started", ex);
+            throw ex;
+        }
+        if (this.livePlayerlist != null)
+            this.livePlayerlist.shutdown();
+        restShutdown = true;
         if (this.scarlet.shouldPersistOnShutdown())
             this.save();
         else
@@ -332,6 +353,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
     // ERROR with the stack trace) is preserved for real failures.  Captured once
     // at class-load time, before we overwrite the default via setDefaultFailure.
     private static final Consumer<? super Throwable> DEFAULT_REST_FAILURE_DELEGATE = RestAction.getDefaultFailure();
+    private static volatile boolean restShutdown;
 
     /**
      * Custom default failure handler installed via {@link RestAction#setDefaultFailure}.
@@ -342,25 +364,31 @@ public class ScarletDiscordJDA implements ScarletDiscord
      * That's expected behaviour, not an error — but the shipped default handler
      * logs it at ERROR with a full stack trace, which users interpret as a bug.
      * <p>
-     * Any throwable whose cause chain contains {@link InterruptedIOException}
-     * is logged at DEBUG instead.  Everything else is forwarded unchanged to
-     * JDA's original default handler so real failures are still surfaced.
+     * Interruptions are quiet only after shutdown has actually started. Ordinary
+     * socket timeouts still reach the normal failure handler.
      */
     private static void handleRestFailure(Throwable err)
     {
+        handleRestFailure(err, restShutdown, DEFAULT_REST_FAILURE_DELEGATE);
+    }
+
+    static void handleRestFailure(Throwable err, boolean shuttingDown, Consumer<? super Throwable> delegate)
+    {
+        java.util.Set<Throwable> visited = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         for (Throwable t = err; t != null; t = t.getCause())
         {
-            if (t instanceof InterruptedIOException)
+            if (!visited.add(t)) break;
+            if (shuttingDown && t instanceof InterruptedIOException)
             {
-                LOG.debug("JDA REST call interrupted (likely during shutdown): "+err);
+                LOG.debug("JDA REST call interrupted during confirmed shutdown");
                 return;
             }
             // Guard against pathological cause-chain cycles.
             if (t.getCause() == t) break;
         }
-        if (DEFAULT_REST_FAILURE_DELEGATE != null)
+        if (delegate != null)
         {
-            DEFAULT_REST_FAILURE_DELEGATE.accept(err);
+            delegate.accept(err);
         }
         else
         {
@@ -377,24 +405,6 @@ public class ScarletDiscordJDA implements ScarletDiscord
             fingerprintDiscordToken(token),
             System.getProperty("java.runtime.version"),
             System.getProperty("os.arch"));
-        if (net.sybyline.scarlet.util.Platform.isAndroid() || net.sybyline.scarlet.util.Platform.isTermux())
-        {
-            LOG.info("Discord startup environment: TERMUX_VERSION={}, PREFIX={}, TZ={}, nowUtc={}",
-                System.getenv("TERMUX_VERSION"),
-                System.getenv("PREFIX"),
-                System.getenv("TZ"),
-                OffsetDateTime.now(ZoneOffset.UTC));
-            try
-            {
-                InetAddress[] addrs = InetAddress.getAllByName("discord.com");
-                LOG.info("Discord DNS lookup succeeded: discord.com -> {}",
-                    Arrays.stream(addrs).map(InetAddress::getHostAddress).collect(Collectors.joining(", ")));
-            }
-            catch (Exception ex)
-            {
-                LOG.warn("Discord DNS lookup failed for discord.com: {}", ex.toString());
-            }
-        }
     }
 
     private static String summarizeDiscordStartupFailure(Throwable err)
@@ -464,13 +474,15 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
     final Scarlet scarlet;
     final File discordBotFile;
+    private boolean configLoadFailed;
     final JDAAudioSendingHandler audio;
     final JDA jda;
     /** Public accessor for ScarletLivePlayerlist which lives in the same package. */
     public JDA jda() { return this.jda; }
     final ScarletLivePlayerlist livePlayerlist;
     final ScarletSettings.RegistryStringEncrypted token;
-    String guildSf, audioChannelSf, discordActionLogChannelSf, opsAlertChannelSf, trainingChannelSf, evidenceRoot,
+    volatile String guildSf;
+    String audioChannelSf, discordActionLogChannelSf, opsAlertChannelSf, trainingChannelSf, evidenceRoot,
            ticketToolCategorySf, ticketToolChannelNameRegex, ticketToolNotifyRoleSf, ticketToolAgeVerificationMessage;
     boolean ticketToolAutoResponseEnabled;
     int discordAccountAgeAlertMinutes;
@@ -493,6 +505,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
                                      vrchatClient_launchOnInstanceCreate,
                                      evidenceEnabled,
                                      avatarSearchProvidersEnabled;
+    final ScarletSettings.FileValuedConsentBoolean avatarSearchExternalLookupsEnabled;
     final ScarletSettings.FileValued<Void> selectEvidenceRoot,
                                   resetAvatarSearchProviders;
     final ScarletSettings.FileValued<String[]> avatarSearchProviders;
@@ -589,7 +602,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             // registered it with Discord.
             this.updateCommandList();
         });
-        this.jda.getPresence().setPresence(OnlineStatus.ONLINE, Activity.playing(Scarlet.NAME+" \u2014 KozyBlake's Fork").withState(Scarlet.FORK_GITHUB_URL));
+        this.jda.getPresence().setPresence(OnlineStatus.ONLINE, Activity.playing(Scarlet.NAME+" \u2014 Hatson321").withState(Scarlet.FORK_GITHUB_URL));
         this.audio.init();
         this.scarlet.exec.scheduleAtFixedRate(this::clearDeadPagination, 30_000L, 30_000L, TimeUnit.MILLISECONDS);
     }
@@ -657,47 +670,288 @@ public class ScarletDiscordJDA implements ScarletDiscord
     }
     long pollQueuedAction_ban(Action queuedAction)
     {
-        long within1day = System.currentTimeMillis() - 86400_000L;
-        User sc = this.scarlet.vrc.getUser(queuedAction.targetId, within1day);
-        if (sc == null)
+        if (queuedAction.requesterDiscordId == null || queuedAction.actorId == null
+            || queuedAction.discordGuildId == null || queuedAction.vrchatGroupId == null
+            || !queuedAction.discordGuildId.equals(this.guildSf)
+            || !queuedAction.vrchatGroupId.equals(this.scarlet.vrc.groupId))
         {
-            this.emitActionFailure(this.scarlet, queuedAction, "Failed to ban `%s`: user does not appear to exist", queuedAction.targetId);
+            this.emitActionFailure(this.scarlet, queuedAction,
+                "Queued ban was refused because its original requester or group context cannot be verified. Submit a new request.");
             return 30L;
         }
-        GroupMemberStatus status = this.scarlet.vrc.getGroupMembershipStatus(this.scarlet.vrc.groupId, queuedAction.targetId);
-        if (status == GroupMemberStatus.BANNED)
-            return 30L;
-        if (this.scarlet.pendingModActions.addPending(GroupAuditType.USER_BAN, queuedAction.targetId, queuedAction.actorId) != null)
-            return 30L;
-        if (!this.scarlet.vrc.banFromGroup(queuedAction.targetId))
+        VRChatBanAttempt attempt = this.executeVRChatBan(queuedAction.requesterDiscordId, queuedAction.actorId,
+            queuedAction.targetId, DPerms.PermType.MODAL_SUBMIT, "vrchat-user-ban-multi");
+        if (!attempt.succeeded())
         {
-            this.scarlet.pendingModActions.pollPending(GroupAuditType.USER_BAN, queuedAction.targetId);
-            this.emitActionFailure(this.scarlet, queuedAction, "Failed to ban `%s`: request failed");
+            this.emitActionFailure(this.scarlet, queuedAction, "%s", attempt.message);
             return 30L;
         }
-        return 60L; // success
+        return 60L;
     }
+
+    /** Retrieve instead of trusting the Member captured when a command or modal was opened. */
+    Member retrieveBanRequester(String requesterDiscordId)
+    {
+        Guild guild = this.jda == null || this.guildSf == null ? null : this.jda.getGuildById(this.guildSf);
+        return guild == null || requesterDiscordId == null ? null
+            : guild.retrieveMemberById(requesterDiscordId).useCache(false).complete();
+    }
+
+    boolean authorizeModalSession(ModalInteractionEvent event, String operation)
+    {
+        // Discord supplies the submitting member's current roles in this interaction.
+        // Do not reuse the Member captured when the form was opened or an older guild cache entry.
+        Member member = event.getMember();
+        return member != null && event.getGuild() != null && Objects.equals(this.guildSf, event.getGuild().getId())
+            && Objects.equals(event.getUser().getId(), member.getId())
+            && Objects.equals(this.guildSf, member.getGuild().getId()) && this.perms.checkSlash(member, operation);
+    }
+
+    static final class VRChatBanAccess
+    {
+        final String actorId, message;
+        final boolean allowPermissionOverride;
+
+        VRChatBanAccess(String actorId, boolean allowPermissionOverride, String message)
+        {
+            this.actorId = actorId;
+            this.allowPermissionOverride = allowPermissionOverride;
+            this.message = message;
+        }
+
+        boolean allowed() { return this.message == null; }
+    }
+
+    VRChatBanAccess resolveVRChatBanRequester(String requesterDiscordId, String expectedActorId,
+        DPerms.PermType type, String operation)
+    {
+        try
+        {
+            Member requester = this.retrieveBanRequester(requesterDiscordId);
+            if (requester == null || !requester.getId().equals(requesterDiscordId)
+                || !this.guildSf.equals(requester.getGuild().getId()))
+                return new VRChatBanAccess(null, false, "Cannot verify the requesting Discord member; no moderation action was performed.");
+            boolean permitted = type == DPerms.PermType.SLASH_COMMAND
+                ? this.perms.checkSlash(requester, operation) : this.perms.checkOperation(requester, type, operation);
+            // A confirmation must not retain authority after its originating command is revoked.
+            if ("immediate-ban-confirm".equals(operation))
+                permitted &= this.perms.checkSlash(requester, "vrchat-user-ban");
+            if (type == DPerms.PermType.MODAL_SUBMIT && "vrchat-user-ban-multi".equals(operation))
+                permitted &= this.perms.checkSlash(requester, "vrchat-user-ban-multi");
+            if (type == DPerms.PermType.MODAL_SUBMIT && "vrchat-user-unban-multi".equals(operation))
+                permitted &= this.perms.checkSlash(requester, "vrchat-user-unban-multi");
+            if (type == DPerms.PermType.MODAL_SUBMIT && "timed-ban-custom".equals(operation))
+                permitted &= this.perms.checkOperation(requester, DPerms.PermType.BUTTON_PRESS, "timed-ban-custom");
+            if (!permitted)
+                return new VRChatBanAccess(null, false, "You no longer have access to this moderation command or interaction.");
+            String actorId = this.scarlet.data.globalMetadata_getSnowflakeId(requesterDiscordId);
+            if (actorId == null || (expectedActorId != null && !expectedActorId.equals(actorId)))
+                return new VRChatBanAccess(null, false, "Your linked VRChat account is missing or changed; submit a new moderation request.");
+            boolean override = this.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, requester, false);
+            return new VRChatBanAccess(actorId, override, null);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("Cannot refresh Discord ban-requester authorization; refusing the action");
+            return new VRChatBanAccess(null, false, "Current requester permissions could not be verified; no moderation action was performed.");
+        }
+    }
+
+    VRChatBanAccess checkVRChatBanAccess(String requesterDiscordId, String expectedActorId, String targetId,
+        DPerms.PermType type, String operation)
+    {
+        if (targetId == null || ScarletSimulation.isTrainingId(targetId))
+            return new VRChatBanAccess(null, false, "No real ban was performed: a valid non-training target is required.");
+        VRChatBanAccess access = this.resolveVRChatBanRequester(requesterDiscordId, expectedActorId, type, operation);
+        if (!access.allowed()) return access;
+        try
+        {
+            ScarletBanAuthorization.Decision decision = this.scarlet.vrc.checkBanAuthorization(
+                access.actorId, targetId, access.allowPermissionOverride);
+            return decision.allowed() ? access : new VRChatBanAccess(access.actorId, false, decision.message());
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("Cannot verify current VRChat ban authorization; refusing the action");
+            return new VRChatBanAccess(access.actorId, false, ScarletBanAuthorization.Decision.unverified().message());
+        }
+    }
+
+    static final class VRChatBanAttempt
+    {
+        final String actorId, message;
+        final ScarletVRChat.GroupModerationResult outcome;
+
+        VRChatBanAttempt(String actorId, ScarletVRChat.GroupModerationResult outcome, String message)
+        {
+            this.actorId = actorId;
+            this.outcome = outcome;
+            this.message = message;
+        }
+
+        boolean succeeded() { return this.outcome == ScarletVRChat.GroupModerationResult.SUCCEEDED; }
+    }
+
+    /** All Discord-originated real bans pass this gate again at actual execution. */
+    VRChatBanAttempt executeVRChatBan(String requesterDiscordId, String expectedActorId, String targetId,
+        DPerms.PermType type, String operation)
+    {
+        return this.executeVRChatBan(requesterDiscordId, expectedActorId, targetId, type, operation, 0L);
+    }
+
+    VRChatBanAttempt executeVRChatBan(String requesterDiscordId, String expectedActorId, String targetId,
+        DPerms.PermType type, String operation, long timedExpiry)
+    {
+        VRChatBanAccess access = this.checkVRChatBanAccess(requesterDiscordId, expectedActorId, targetId, type, operation);
+        if (!access.allowed()) return new VRChatBanAttempt(access.actorId, null, access.message);
+        String groupId = this.scarlet.vrc.groupId;
+        ScarletPendingModActions.PendingReservation reservation;
+        try
+        {
+            reservation = this.scarlet.pendingModActions.reservePending(GroupAuditType.USER_BAN, targetId, access.actorId, groupId);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("Cannot persist ban reservation; refusing to submit the ban", ex);
+            return new VRChatBanAttempt(access.actorId, null, "The moderation request could not be saved. No ban was submitted.");
+        }
+        if (reservation == null)
+            return new VRChatBanAttempt(access.actorId, null, "This VRChat user has moderation pending or an automatic-unban record requiring review. Resolve it before retrying.");
+        ScarletPendingModActions.TimedBan timer = null;
+        if (timedExpiry > 0L)
+        {
+            try { timer = this.scarlet.pendingModActions.prepareTimedBan(groupId, targetId, timedExpiry, access.actorId); }
+            catch (RuntimeException ex)
+            {
+                this.releaseBanReservation(reservation);
+                return new VRChatBanAttempt(access.actorId, null, "The automatic-unban intent could not be saved. No ban was submitted.");
+            }
+        }
+        ScarletVRChat.GroupBanResult result;
+        try
+        {
+            result = this.scarlet.vrc.banFromGroupAs(groupId, access.actorId, targetId, access.allowPermissionOverride);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("Ban request ended without a confirmed result; retaining its bounded pending reservation");
+            return new VRChatBanAttempt(access.actorId, ScarletVRChat.GroupModerationResult.UNKNOWN,
+                timer == null ? "The ban outcome is unknown. Check the group/audit log before retrying; the pending request will expire."
+                    : "The ban outcome is unknown. No automatic unban is confirmed; manually review the group ban and retained timer before retrying.");
+        }
+        if (!result.authorization.allowed())
+        {
+            String retainedIntent = this.discardUnsubmittedTimer(targetId, timer);
+            this.releaseBanReservation(reservation);
+            return new VRChatBanAttempt(access.actorId, null, result.authorization.message() + retainedIntent);
+        }
+        if (result.outcome == ScarletVRChat.GroupModerationResult.REJECTED)
+        {
+            String retainedIntent = this.discardUnsubmittedTimer(targetId, timer);
+            this.releaseBanReservation(reservation);
+            return new VRChatBanAttempt(access.actorId, result.outcome, "VRChat rejected the ban request." + retainedIntent);
+        }
+        if (result.outcome != ScarletVRChat.GroupModerationResult.SUCCEEDED)
+            return new VRChatBanAttempt(access.actorId, ScarletVRChat.GroupModerationResult.UNKNOWN,
+                timer == null ? "The ban outcome is unknown. Check the group/audit log before retrying; the pending request will expire."
+                    : "The ban outcome is unknown. No automatic unban is confirmed; manually review the group ban and retained timer before retrying.");
+        if (timer != null && !this.scarlet.pendingModActions.activateTimedBan(targetId, timer, result.serverBanAt, result.serverActorId))
+            return new VRChatBanAttempt(access.actorId, null,
+                "The ban succeeded, but automatic-unban activation could not be safely verified or saved. Manually review or lift the ban; no automatic unban is guaranteed.");
+        return new VRChatBanAttempt(access.actorId, result.outcome, null);
+    }
+
+    private void releaseBanReservation(ScarletPendingModActions.PendingReservation reservation)
+    {
+        try { this.scarlet.pendingModActions.releasePending(reservation); }
+        catch (RuntimeException ex) { LOG.warn("Completed ban reservation could not be cleared; retained for recovery", ex); }
+    }
+
+    private String discardUnsubmittedTimer(String targetId, ScarletPendingModActions.TimedBan timer)
+    {
+        if (timer == null) return "";
+        if (!java.util.Objects.equals(timer.groupId, this.scarlet.vrc.groupId))
+            return " The group changed; the original inactive automatic-unban intent was retained for manual review.";
+        if (!this.scarlet.pendingModActions.removeTimedBan(targetId, timer))
+        {
+            LOG.warn("Unsubmitted timed-ban intent could not be cleared; retained inactive for manual review");
+            return " The inactive automatic-unban intent could not be cleared; it was retained for retry or manual review.";
+        }
+        return "";
+    }
+
     long pollQueuedAction_unban(Action queuedAction)
     {
-        long within1day = System.currentTimeMillis() - 86400_000L;
-        User sc = this.scarlet.vrc.getUser(queuedAction.targetId, within1day);
-        if (sc == null)
+        if (!this.queuedUnbanContextMatches(queuedAction))
         {
-            this.emitActionFailure(this.scarlet, queuedAction, "Failed to unban `%s`: user does not appear to exist", queuedAction.targetId);
+            this.emitActionFailure(this.scarlet, queuedAction,
+                "Queued unban was refused because its original requester, linked account or group context cannot be verified. Legacy/unbound requests must be submitted again.");
             return 30L;
         }
-        GroupMemberStatus status = this.scarlet.vrc.getGroupMembershipStatus(this.scarlet.vrc.groupId, queuedAction.targetId);
-        if (status != GroupMemberStatus.BANNED)
-            return 30L;
-        if (this.scarlet.pendingModActions.addPending(GroupAuditType.USER_UNBAN, queuedAction.targetId, queuedAction.actorId) != null)
-            return 30L;
-        if (!this.scarlet.vrc.unbanFromGroup(queuedAction.targetId))
+        ScarletPendingModActions.PendingReservation reservation = null;
+        boolean submitted = false;
+        try
         {
-            this.scarlet.pendingModActions.pollPending(GroupAuditType.USER_UNBAN, queuedAction.targetId);
-            this.emitActionFailure(this.scarlet, queuedAction, "Failed to unban `%s`: request failed", queuedAction.targetId);
+            VRChatBanAccess access = this.resolveVRChatBanRequester(queuedAction.requesterDiscordId, queuedAction.actorId,
+                DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+            if (!access.allowed()) throw new IllegalStateException(access.message);
+            String groupId = queuedAction.vrchatGroupId, botId = this.scarlet.vrc.currentUserId;
+            Group group = ScarletBanSnapshot.group(this.scarlet.vrc.readBanGroup(groupId), groupId);
+            GroupMember actor = ScarletBanSnapshot.member(this.scarlet.vrc.readBanMember(groupId, queuedAction.actorId), groupId, queuedAction.actorId);
+            GroupMember bot = ScarletBanSnapshot.member(this.scarlet.vrc.readBanMember(groupId, botId), groupId, botId);
+            GroupMember target = ScarletBanSnapshot.member(this.scarlet.vrc.readBanMember(groupId, queuedAction.targetId), groupId, queuedAction.targetId);
+            // Refresh Discord again after the blocking VRChat reads. A revoked override cannot survive them.
+            access = this.resolveVRChatBanRequester(queuedAction.requesterDiscordId, queuedAction.actorId,
+                DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+            if (!access.allowed()) throw new IllegalStateException(access.message);
+            ScarletBanAuthorization.Decision decision = ScarletBanAuthorization.evaluateUnban(group,
+                queuedAction.actorId, botId, actor, bot, access.allowPermissionOverride);
+            if (!decision.allowed()) throw new IllegalStateException(decision.message());
+            if (target == null || target.getMembershipStatus() != GroupMemberStatus.BANNED)
+                throw new IllegalStateException("Queued unban was not sent: the target is not currently verified as banned.");
+            if (!this.queuedUnbanContextMatches(queuedAction) || !Objects.equals(botId, this.scarlet.vrc.currentUserId))
+                throw new IllegalStateException("Queued unban context changed during verification. Submit a new request.");
+            reservation = this.scarlet.pendingModActions.reservePending(GroupAuditType.USER_UNBAN,
+                queuedAction.targetId, queuedAction.actorId, groupId);
+            if (reservation == null)
+                throw new IllegalStateException("This user already has a pending moderation request. No unban was sent.");
+            access = this.resolveVRChatBanRequester(queuedAction.requesterDiscordId, queuedAction.actorId,
+                DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+            if (!access.allowed()) throw new IllegalStateException(access.message);
+            decision = ScarletBanAuthorization.evaluateUnban(group, queuedAction.actorId, botId, actor, bot,
+                access.allowPermissionOverride);
+            if (!decision.allowed()) throw new IllegalStateException(decision.message());
+            // Persistence can block too. Never send to a replacement group/account after it returns.
+            if (!this.queuedUnbanContextMatches(queuedAction) || !Objects.equals(botId, this.scarlet.vrc.currentUserId))
+                throw new IllegalStateException("Queued unban context changed before submission. Submit a new request.");
+            submitted = true;
+            ScarletVRChat.GroupModerationResult result = this.scarlet.vrc.unbanFromGroupDetailed(groupId, queuedAction.targetId);
+            if (result == ScarletVRChat.GroupModerationResult.SUCCEEDED) return 60L;
+            if (result == ScarletVRChat.GroupModerationResult.REJECTED)
+            {
+                submitted = false;
+                throw new IllegalStateException("VRChat rejected the queued unban request.");
+            }
+            throw new IllegalStateException("The queued unban outcome is unknown. Check the group/audit log before retrying; its pending reservation was retained.");
+        }
+        catch (Exception ex)
+        {
+            if (!submitted && reservation != null) this.releaseBanReservation(reservation);
+            String message = ex instanceof IllegalStateException ? ex.getMessage()
+                : submitted ? "The queued unban outcome is unknown; its pending reservation was retained for reconciliation."
+                    : "Current queued-unban authority could not be verified. No unban was sent; submit a new request when verification is available.";
+            this.emitActionFailure(this.scarlet, queuedAction, "%s", message);
             return 30L;
         }
-        return 60L; // success
+    }
+
+    private boolean queuedUnbanContextMatches(Action action)
+    {
+        return action != null && !MiscUtils.blank(action.requesterDiscordId) && !MiscUtils.blank(action.actorId)
+            && !MiscUtils.blank(action.discordGuildId) && !MiscUtils.blank(action.vrchatGroupId)
+            && !MiscUtils.blank(action.targetId) && !ScarletSimulation.isTrainingId(action.targetId)
+            && action.discordGuildId.equals(this.guildSf) && action.vrchatGroupId.equals(this.scarlet.vrc.groupId)
+            && action.actorId.equals(this.scarlet.data.globalMetadata_getSnowflakeId(action.requesterDiscordId));
     }
 
     String help_staffListAdd_mention = "`/staff-list add`";
@@ -772,11 +1026,20 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
         JPanel panel = new JPanel();
         panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
-        JLabel headerLabel = new JLabel("<html><body style='width: 440px'>Choose which avatar databases are used for avatar lookups. "
-            + "After saving, avatars still missing data are rescanned automatically; avatars that already show data are left "
-            + "alone to save network usage and rate limits.</body></html>");
+        JLabel headerLabel = new JLabel("<html><body style='width: 440px'>External avatar databases are off until you allow them. "
+            + "When enabled, manual searches and automatic avatar-change, image-match, missing-info and rescan lookups "
+            + "can send avatar names and creator/file IDs to the selected services. Services also see your IP address "
+            + "and Scarlet version. The User-Agent also includes the configured group ID, signed-in primary "
+            + "VRChat account ID and the maintainer's public support contact. Login credentials are not included. "
+            + "Explicit permission is required even if you enabled the earlier checkbox. "
+            + "Uncheck permission or every provider to stop future lookups (requests already in flight may finish). "
+            + "Only public Internet destinations are allowed. Saving may rescan missing avatar information.</body></html>");
         headerLabel.setAlignmentX(0.0F);
         panel.add(headerLabel);
+        panel.add(Box.createVerticalStrut(10));
+        JCheckBox allowLookups = new JCheckBox("Allow external avatar lookups and group/account identification", Boolean.TRUE.equals(this.avatarSearchExternalLookupsEnabled.get()));
+        allowLookups.setAlignmentX(0.0F);
+        panel.add(allowLookups);
         panel.add(Box.createVerticalStrut(10));
         JPanel checksPanel = new JPanel();
         checksPanel.setLayout(new BoxLayout(checksPanel, BoxLayout.Y_AXIS));
@@ -841,6 +1104,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 selected.add(url);
         });
         java.util.Set<String> defaults = new java.util.LinkedHashSet<>(java.util.Arrays.asList(AvatarSearch.URL_ROOTS));
+        // Keep requests disabled while committing the selected destinations, then apply permission last.
+        this.avatarSearchExternalLookupsEnabled.set(Boolean.FALSE, "manage-providers");
         boolean isDefaultSelection = selected.size() == defaults.size() && defaults.containsAll(selected);
         if (isDefaultSelection)
         {
@@ -852,6 +1117,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
             this.avatarSearchProviders.set(selected.toArray(new String[0]), "manage-providers");
             this.avatarSearchProvidersEnabled.set(Boolean.TRUE, "manage-providers");
         }
+        this.avatarSearchExternalLookupsEnabled.setWithConsent(Boolean.valueOf(allowLookups.isSelected()),
+            "manage-providers", net.sybyline.scarlet.ui.AvatarProviderConsentDialog::confirm);
         // A deliberate settings change: forget prior provider backoffs, then rescan
         // only the players whose avatars still lack data (per-provider caching means
         // unchanged providers answer from cache, so this costs almost nothing).
@@ -861,15 +1128,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
     String[] getAvatarSearchProviders()
     {
-        String[] providers = this.avatarSearchProvidersEnabled.get()
-            ? this.avatarSearchProviders.get()
-            : AvatarSearch.URL_ROOTS;
-        if (providers == null)
-            return new String[0];
-        return Stream.of(providers)
-            .filter(Objects::nonNull)
-            .filter(url -> !url.toLowerCase(Locale.ROOT).contains(BLOCKED_AVATAR_SEARCH_HOST))
-            .toArray(String[]::new);
+        return AvatarSearch.effectiveProviders(Features.AVATAR_SEARCH_ENABLED, this.avatarSearchExternalLookupsEnabled.get(),
+            this.avatarSearchProvidersEnabled.get(), this.avatarSearchProviders.get(), BLOCKED_AVATAR_SEARCH_HOST);
     }
 
     void selectEvidenceRoot()
@@ -919,8 +1179,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         }
         catch (Exception ex)
         {
-            LOG.error("Invalid Discord webhook URL for `"+scarletAuxWh+"`: `"+iwcUrl+"`, removing");
-            this.scarletAuxWh2webhookUrl.remove(scarletAuxWh);
+            LOG.error("Invalid Discord webhook configuration; credential value omitted. Destination is unavailable.");
         }
         return iwc;
     }
@@ -932,20 +1191,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
     }
 
     static final int BYTES_PER_20MS = 3840; // 20ms * (48000 frames/second) * (2 samples/frame) * (2 bytes/sample)
-    static final int SAMPLES_PER_20MS_PER_CHANNEL = 960;
     class JDAAudioSendingHandler implements AudioSendHandler
     {
-        JDAAudioSendingHandler()
-        {
-            this.provideOpusPackets = net.sybyline.scarlet.util.Platform.isAndroid()
-                || net.sybyline.scarlet.util.Platform.isTermux();
-            if (this.provideOpusPackets)
-            {
-                LOG.info("TTS Audio: Using built-in Java Opus encoder on {} to avoid JDA native Opus loading",
-                    net.sybyline.scarlet.util.Platform.describe());
-            }
-        }
-
         boolean submitAudio(File file)
         {
             AudioManager audioManager = this.audioManager;
@@ -982,7 +1229,6 @@ public class ScarletDiscordJDA implements ScarletDiscord
                         // FIX 2: Track how many bytes were actually read into each buffer so that
                         // the last (partial) chunk is zero-padded correctly instead of being
                         // submitted as a full buffer of uninitialized/garbage bytes.
-                        OpusEncoder opusEncoder = this.provideOpusPackets ? this.newOpusEncoder() : null;
                         while (true)
                         {
                             byte[] buffer = new byte[BYTES_PER_20MS];
@@ -996,9 +1242,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
                                 break; // true EOF - no more data
                             // If total < BYTES_PER_20MS, the buffer is already zero-padded (new byte[])
                             // so the partial last frame is safe to submit as-is.
-                            buffersToAdd.add(this.provideOpusPackets
-                                ? this.encodeOpusFrame(opusEncoder, buffer)
-                                : ByteBuffer.wrap(buffer));
+                            buffersToAdd.add(ByteBuffer.wrap(buffer));
                             if (total < BYTES_PER_20MS)
                                 break; // partial read means EOF was reached
                         }
@@ -1093,32 +1337,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
         AudioManager audioManager;
         AudioChannel audioChannel;
-        final boolean provideOpusPackets;
         final Queue<ByteBuffer> buffers = new ConcurrentLinkedQueue<>();
-
-        private OpusEncoder newOpusEncoder() throws OpusException
-        {
-            OpusEncoder encoder = new OpusEncoder(48_000, 2, OpusApplication.OPUS_APPLICATION_VOIP);
-            encoder.setSignalType(OpusSignal.OPUS_SIGNAL_VOICE);
-            encoder.setBitrate(64_000);
-            encoder.setUseVBR(true);
-            encoder.setUseConstrainedVBR(true);
-            return encoder;
-        }
-
-        private ByteBuffer encodeOpusFrame(OpusEncoder encoder, byte[] pcmBytes) throws OpusException
-        {
-            short[] pcm = new short[pcmBytes.length / 2];
-            ByteBuffer.wrap(pcmBytes)
-                // JDA's INPUT_FORMAT is 48 kHz, 16-bit, stereo, signed, big-endian.
-                // Decode with the same byte order before feeding Concentus.
-                .order(ByteOrder.BIG_ENDIAN)
-                .asShortBuffer()
-                .get(pcm);
-            byte[] opus = new byte[4096];
-            int encoded = encoder.encode(pcm, 0, SAMPLES_PER_20MS_PER_CHANNEL, opus, 0, opus.length);
-            return ByteBuffer.wrap(Arrays.copyOf(opus, encoded));
-        }
 
         @Override
         public boolean canProvide()
@@ -1135,7 +1354,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         @Override
         public boolean isOpus()
         {
-            return this.provideOpusPackets;
+            return false;
         }
 
     }
@@ -1195,7 +1414,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         if (discordConfigFile == null || !discordConfigFile.isFile())
             return;
         JDASettingsSpec spec;
-        try (java.io.FileReader fr = new java.io.FileReader(discordConfigFile))
+        try (java.io.Reader fr = java.nio.file.Files.newBufferedReader(discordConfigFile.toPath(), java.nio.charset.StandardCharsets.UTF_8))
         {
             spec = Scarlet.GSON_PRETTY.fromJson(fr, JDASettingsSpec.class);
         }
@@ -1207,9 +1426,9 @@ public class ScarletDiscordJDA implements ScarletDiscord
         if (spec == null)
             return;
         spec.scrubChannels();
-        try (java.io.FileWriter fw = new java.io.FileWriter(discordConfigFile))
+        try
         {
-            Scarlet.GSON_PRETTY.toJson(spec, JDASettingsSpec.class, fw);
+            FileBackups.write(discordConfigFile, fw -> Scarlet.GSON_PRETTY.toJson(spec, JDASettingsSpec.class, fw));
         }
         catch (Exception ex)
         {
@@ -1217,21 +1436,26 @@ public class ScarletDiscordJDA implements ScarletDiscord
         }
     }
 
-    public void load()
+    public synchronized void load()
     {
-        JDASettingsSpec spec = null;
-        if (this.discordBotFile.isFile())
-        try (FileReader fr = new FileReader(this.discordBotFile))
+        JDASettingsSpec spec;
+        try
         {
-            spec = Scarlet.GSON_PRETTY.fromJson(fr, JDASettingsSpec.class);
+            if (ScarletData.existingRecord(this.discordBotFile))
+                spec = readDiscordSettings(this.discordBotFile);
+            else
+            {
+                if (this.configLoadFailed)
+                    throw new IOException("A previously unreadable Discord config must be restored before loading again");
+                spec = new JDASettingsSpec();
+            }
         }
         catch (Exception ex)
         {
-            LOG.error("Exception loading discord bot settings", ex);
+            this.configLoadFailed = true;
+            throw new IllegalStateException("Discord configuration could not be read. The existing file was preserved; restore or repair it before restarting Discord.", ex);
         }
-        
-        if (spec == null)
-            spec = new JDASettingsSpec();
+        this.configLoadFailed = false;
         
         boolean save = false;
         
@@ -1319,8 +1543,9 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.auditType2color = auditType2color;
         this.queuedActions = Collections.synchronizedList(spec.queuedActions == null ? new LinkedList<>() : new LinkedList<>(spec.queuedActions));
     }
-    public void save()
+    public synchronized void save()
     {
+        this.requireWritableConfig();
         this.perms.save();
         JDASettingsSpec spec = new JDASettingsSpec();
 //        spec.token = this.token;
@@ -1350,15 +1575,44 @@ public class ScarletDiscordJDA implements ScarletDiscord
         spec.queuedActions = new ArrayList<>(this.queuedActions);
         this.save(spec);
     }
-    void save(JDASettingsSpec spec)
+    synchronized void save(JDASettingsSpec spec)
     {
-        try (java.io.Writer fw = FileBackups.writer(this.discordBotFile))
+        this.requireWritableConfig();
+        try
         {
-            Scarlet.GSON_PRETTY.toJson(spec, JDASettingsSpec.class, fw);
+            FileBackups.write(this.discordBotFile, fw -> Scarlet.GSON_PRETTY.toJson(spec, JDASettingsSpec.class, fw));
         }
         catch (Exception ex)
         {
             LOG.error("Exception saving discord bot settings", ex);
+            throw new IllegalStateException("Discord configuration could not be saved. The previous file was preserved; check storage and retry.", ex);
+        }
+    }
+
+    private void requireWritableConfig()
+    {
+        if (this.configLoadFailed)
+            throw new IllegalStateException("Discord configuration is unreadable; refusing to overwrite it with defaults. Restore or repair the original file first.");
+    }
+
+    static JDASettingsSpec readDiscordSettings(File file) throws IOException
+    {
+        try (java.io.Reader input = java.nio.file.Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8);
+            com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(input))
+        {
+            reader.setStrictness(com.google.gson.Strictness.STRICT);
+            JsonElement json = new com.google.gson.Gson().getAdapter(JsonElement.class).read(reader);
+            if (json == null || !json.isJsonObject() || reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT)
+                throw new IOException("Discord configuration must contain exactly one JSON object");
+            JDASettingsSpec spec = Scarlet.GSON_PRETTY.fromJson(json, JDASettingsSpec.class);
+            for (Map<?, ?> map : new Map<?, ?>[]{spec.scarletPermission2roleSf, spec.scarletAuxWh2webhookUrl,
+                spec.auditType2channelSf, spec.auditExType2channelSf, spec.auditType2scarletAuxWh,
+                spec.auditType2secretChannelSf, spec.auditExType2secretChannelSf, spec.auditType2color})
+                if (map != null && (map.containsKey(null) || map.containsValue(null)))
+                    throw new IOException("Discord configuration contains an invalid null routing entry");
+            if (spec.queuedActions != null && spec.queuedActions.contains(null))
+                throw new IOException("Discord configuration contains an invalid null queued action");
+            return spec;
         }
     }
 
@@ -1477,7 +1731,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             cir.setWorldId(this.worldId);
             cir.setOwnerId(this.groupId);
             cir.setType(InstanceType.GROUP);
-            cir.setRegion(this.region);
+            cir.setRegion(CreateInstanceRequestRegion.fromValue(this.region.getValue()));
             if (this.groupAccessType == GroupAccessType.MEMBERS && this.roleIds != null) cir.setRoleIds(this.roleIds);
             cir.setGroupAccessType(this.groupAccessType);
             cir.setClosedAt(this.closedAt);
@@ -1551,6 +1805,20 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 ScarletDiscordJDA.this.scarlet.stop();
                 LOG.error("You must enable the `Message Content` intent in the `Privileged Gateway Intents` are of your application's `Bot` tab.");
             }
+        }
+
+        @Override
+        public void onSessionResume(SessionResumeEvent event)
+        {
+            if (ScarletDiscordJDA.this.livePlayerlist != null)
+                ScarletDiscordJDA.this.livePlayerlist.reconcile();
+        }
+
+        @Override
+        public void onSessionRecreate(SessionRecreateEvent event)
+        {
+            if (ScarletDiscordJDA.this.livePlayerlist != null)
+                ScarletDiscordJDA.this.livePlayerlist.reconcile();
         }
 
         @Override
@@ -1714,13 +1982,140 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public boolean isEmitting(GroupAuditTypeEx auditTypeEx)
     {
-        return this.jda != null && auditTypeEx != null && this.auditExType2channelSf.get(auditTypeEx.id) != null;
+        return this.jda != null && auditTypeEx != null
+            && (this.auditExType2channelSf.get(auditTypeEx.id) != null
+                || (auditTypeEx == GroupAuditTypeEx.LIVE_PLAYERLIST
+                    && this.auditExType2secretChannelSf.get(auditTypeEx.id) != null));
+    }
+
+    @Override
+    public void updateLivePlayerList(String location, List<ScarletLivePlayerlist.PlayerSnapshot> roster)
+    {
+        this.livePlayerlist.reconcile(location, roster);
+    }
+
+    @Override
+    public void endLivePlayerList(String location)
+    {
+        this.livePlayerlist.onLocalSessionEnded(location);
     }
     
     boolean shouldRedact(String infoId, String requesterSf)
     {
         return ScarletDiscordJDA.this.scarlet.secretStaffList.isSecretStaffId(infoId)
            && !ScarletDiscordJDA.this.scarlet.secretStaffList.isSecretStaffId(ScarletDiscordJDA.this.scarlet.data.globalMetadata_getSnowflakeId(requesterSf));
+    }
+
+    boolean auditVisibleTo(AuditEntryMetadata metadata, String requesterSf)
+    {
+        if (requesterSf == null) return false;
+        boolean secretAudience = this.scarlet.secretStaffList.isSecretStaffId(
+            this.scarlet.data.globalMetadata_getSnowflakeId(requesterSf));
+        return ScarletAuditPrivacy.visible(metadata, this.scarlet.secretStaffList::isSecretStaffId, secretAudience);
+    }
+
+    String auditHistoryLine(GroupAuditLogEntryUnknown entry, AuditEntryMetadata metadata, String requesterSf)
+    {
+        boolean secretAudience = requesterSf != null && this.scarlet.secretStaffList.isSecretStaffId(
+            this.scarlet.data.globalMetadata_getSnowflakeId(requesterSf));
+        return ScarletAuditPrivacy.historyLine(entry, metadata, this.scarlet.secretStaffList::isSecretStaffId, secretAudience);
+    }
+
+    String approvedAuditChannel(AuditEntryMetadata metadata)
+    {
+        if (metadata == null || metadata.entry == null || metadata.entryRedacted)
+            return null;
+        boolean confidential = ScarletAuditPrivacy.confidential(metadata, this.scarlet.secretStaffList::isSecretStaffId);
+        boolean training = metadata.entry.getId() != null && metadata.entry.getId().startsWith(ScarletSimulation.TRAINING_AUDIT_ID_PREFIX);
+        // The training channel is not a separately approved confidential destination.
+        return training ? (confidential ? null : this.trainingChannelSf)
+            : (confidential ? this.auditType2secretChannelSf : this.auditType2channelSf).get(metadata.entry.getEventType());
+    }
+
+    String auditThreadProblem(AuditEntryMetadata metadata, Message message, String requesterSf)
+    {
+        if (message == null || !message.isFromGuild() || this.jda == null
+            || !ScarletAuditPrivacy.recordedMessage(metadata, this.guildSf, this.approvedAuditChannel(metadata),
+                this.jda.getSelfUser().getId(), message.getAuthor().getId(), message.isWebhookMessage(),
+                message.getGuild().getId(), message.getChannel().getId(), message.getId()))
+            return "The original Scarlet audit message or its approved destination cannot be verified";
+        String accessProblem = this.auditThreadRequesterProblem(metadata, message.getGuild(), message.getGuildChannel(), requesterSf);
+        if (accessProblem != null) return accessProblem;
+        if (metadata.threadSnowflake != null && !metadata.messageSnowflake.equals(metadata.threadSnowflake))
+            return "The saved thread is not attached to the original audit message";
+        ThreadChannel started = message.getStartedThread();
+        return started == null ? null : this.auditThreadDestinationProblem(metadata, started);
+    }
+
+    String auditThreadRequesterProblem(AuditEntryMetadata metadata, Guild guild,
+        net.dv8tion.jda.api.entities.channel.middleman.GuildChannel channel, String requesterSf)
+    {
+        // Automatic delivery has no human requester. Repairs must retain the current command,
+        // channel and confidential-audit permissions when queued work is actually performed.
+        if (requesterSf == null)
+        {
+            if (ScarletAuditOutbox.isFollowup(metadata)
+                && (!this.auditFollowupGroupCurrent(metadata)
+                    || !sameAuditFollowupContext(metadata, this.scarlet.data.auditEntryMetadata(metadata.entry.getId()))))
+                return "The recorded audit event changed while its follow-up was queued";
+            return null;
+        }
+        AuditEntryMetadata current = metadata == null || metadata.entry == null ? null
+            : this.scarlet.data.auditEntryMetadata(metadata.entry.getId());
+        if (!ScarletAuditPrivacy.sameRecordedAudit(metadata, current))
+            return "The recorded audit event changed; submit a new repair request";
+        Member requester = guild == null ? null : guild.getMemberById(requesterSf);
+        return requester != null && this.perms != null
+            && this.perms.checkOperation(requester, DPerms.PermType.MESSAGE_COMMAND, "fix-audit-thread")
+            && channel != null && requester.hasPermission(channel, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY)
+            && this.auditVisibleTo(metadata, requesterSf)
+            ? null : "The requester is no longer authorized for this audit event or destination";
+    }
+
+    String auditThreadDestinationProblem(AuditEntryMetadata metadata, ThreadChannel thread)
+    {
+        return thread != null && ScarletAuditPrivacy.recordedThread(metadata, this.guildSf, this.approvedAuditChannel(metadata),
+            thread.getGuild().getId(), thread.getParentChannel().getId(), thread.getId())
+            ? null : "The thread is not attached to the original audit message in its currently approved channel";
+    }
+
+    String auditThreadAccessProblem(AuditEntryMetadata metadata, ThreadChannel thread, String requesterSf)
+    {
+        String problem = this.auditThreadDestinationProblem(metadata, thread);
+        return problem != null ? problem : this.auditThreadRequesterProblem(metadata, thread.getGuild(), thread, requesterSf);
+    }
+
+    static final class PendingDiscordModeration
+    {
+        final String owner, target, reason;
+        final net.dv8tion.jda.api.Permission permission;
+        final long expiresAt = System.currentTimeMillis() + 5 * 60_000L;
+        PendingDiscordModeration(String owner, String target, String reason, net.dv8tion.jda.api.Permission permission)
+        {
+            this.owner = owner;
+            this.target = target;
+            this.reason = reason;
+            this.permission = permission;
+        }
+    }
+
+    private final Map<String, PendingDiscordModeration> pendingDiscordModeration = new java.util.concurrent.ConcurrentHashMap<>();
+
+    String prepareDiscordModeration(String owner, String target, String reason, net.dv8tion.jda.api.Permission permission)
+    {
+        this.pendingDiscordModeration.values().removeIf(p -> p.expiresAt < System.currentTimeMillis());
+        String token = java.util.UUID.randomUUID().toString();
+        this.pendingDiscordModeration.put(token, new PendingDiscordModeration(owner, target, reason, permission));
+        return token;
+    }
+
+    PendingDiscordModeration consumeDiscordModeration(String token, String owner, net.dv8tion.jda.api.Permission permission)
+    {
+        PendingDiscordModeration pending = this.pendingDiscordModeration.get(token);
+        if (pending == null || !pending.owner.equals(owner) || pending.permission != permission
+            || pending.expiresAt < System.currentTimeMillis())
+            return null;
+        return this.pendingDiscordModeration.remove(token, pending) ? pending : null;
     }
 
     public void setAuditChannel(GroupAuditType auditType, Channel channel)
@@ -1751,6 +2146,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
             LOG.info(String.format("Unsetting audit channel for %s (%s)", auditExType.title, auditExType.id));
         }
         this.save();
+        if (auditExType == GroupAuditTypeEx.LIVE_PLAYERLIST && this.livePlayerlist != null)
+            this.livePlayerlist.reconcile();
     }
 
     public void setAuditSecretChannel(GroupAuditType auditType, Channel channel)
@@ -1770,6 +2167,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
     public void setAuditExSecretChannel(GroupAuditTypeEx auditExType, Channel channel)
     {
+        if (channel != null && !auditExType.supportsSecretRouting())
+            throw new IllegalArgumentException("This extended event does not support a secret channel destination");
         if (channel != null)
         {
             this.auditExType2secretChannelSf.put(auditExType.id, channel.getId());
@@ -1781,6 +2180,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
             LOG.info(String.format("Unsetting audit secret channel for %s (%s)", auditExType.title, auditExType.id));
         }
         this.save();
+        if (auditExType == GroupAuditTypeEx.LIVE_PLAYERLIST && this.livePlayerlist != null)
+            this.livePlayerlist.reconcile();
     }
 
     public void setDiscordActionLogChannel(Channel channel)
@@ -2461,8 +2862,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @FunctionalInterface interface CondEmit { Message emit(String channelSf, Guild guild, GuildMessageChannel channel); }
     boolean condEmit(ScarletData.AuditEntryMetadata entryMeta, CondEmit condEmit)
     {
-        if (this.jda == null)
-            return false;
+        if (entryMeta.hasMessage()) return true; // A retry must not duplicate an acknowledged primary send.
         boolean isSecretStaff = this.scarlet.secretStaffList.isSecretStaffId(entryMeta.entry.getActorId())
                 || this.scarlet.secretStaffList.isSecretStaffId(entryMeta.auxActorId);
         // Simulated (training) moderation entries go ONLY to the dedicated training channel, never
@@ -2473,17 +2873,21 @@ public class ScarletDiscordJDA implements ScarletDiscord
                                          : this.auditType2channelSf.get(entryMeta.entry.getEventType());
         if (channelSf == null || channelSf.trim().isEmpty())
             return false;
+        if (this.jda == null)
+            throw new IllegalStateException("Discord is not connected; configured audit delivery remains pending");
         Guild guild = this.jda.getGuildById(this.guildSf);
         if (guild == null)
-            return false;
+            throw new IllegalStateException("Configured audit guild is unavailable");
         TextChannel channel = guild.getTextChannelById(channelSf);
         if (channel == null)
-            return false;
+            throw new IllegalStateException("Configured audit channel is unavailable");
         
         entryMeta.guildSnowflake = this.guildSf;
         entryMeta.channelSnowflake = channelSf;
         Message message = condEmit.emit(channelSf, guild, channel);
         entryMeta.messageSnowflake = message.getId();
+        entryMeta.setAuxData("deliveryAcknowledged", true);
+        this.saveAuditDeliveryProgress(this.scarlet, entryMeta);
         return true;
     }
     void condEmitEx(GroupAuditTypeEx auditExType, boolean log, boolean isSecretStaff, String location, CondEmit condEmit)
@@ -2545,11 +2949,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
     }
     EmbedBuilder embed(ScarletData.AuditEntryMetadata entryMeta, boolean addTargetIdField)
     {
-        EmbedBuilder embed = new EmbedBuilder()
-            .setDescription(entryMeta.entry.getDescription())
+        EmbedBuilder embed = new AuditEmbedBuilder()
+            .setDescription(AuditEmbedBuilder.clip(entryMeta.entry.getDescription(), 3000))
             .setColor(GroupAuditType.color(this.auditType2color, entryMeta.entry.getEventType()))
             .setTimestamp(entryMeta.entry.getCreatedAt())
-            .setAuthor(entryMeta.hasAuxActor() ? entryMeta.auxActorDisplayName : entryMeta.entry.getActorDisplayName(), "https://vrchat.com/home/user/"+(entryMeta.hasAuxActor() ? entryMeta.auxActorId : entryMeta.entry.getActorId()))
+            .setAuthor(AuditEmbedBuilder.clip(entryMeta.hasAuxActor() ? entryMeta.auxActorDisplayName : entryMeta.entry.getActorDisplayName(), 256), "https://vrchat.com/home/user/"+(entryMeta.hasAuxActor() ? entryMeta.auxActorId : entryMeta.entry.getActorId()))
             .setFooter(ScarletDiscord.FOOTER_PREFIX + entryMeta.entry.getId())
         ;
         if (addTargetIdField)
@@ -2600,65 +3004,268 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
     void emitAuxWh(AuditEntryMetadata entryMeta, Function<IncomingWebhookClient, AbstractWebhookMessageAction<?, ?>> function)
     {
-        this.emitAuxWh(entryMeta.entry.getEventType(), function);
-    }
-    void emitAuxWh(String type, Function<IncomingWebhookClient, AbstractWebhookMessageAction<?, ?>> function)
-    {
-        this.emitAuxWh(type, null, (client, state) -> function.apply(client));
+        this.emitAuxWh(entryMeta, null, (client, state) -> function.apply(client));
     }
     <State> void emitAuxWh(AuditEntryMetadata entryMeta, Supplier<State> state, BiFunction<IncomingWebhookClient, State, AbstractWebhookMessageAction<?, ?>> bifunction)
     {
-        this.emitAuxWh(entryMeta.entry.getEventType(), state, bifunction);
-    }
-    <State> void emitAuxWh(String type, Supplier<State> state, BiFunction<IncomingWebhookClient, State, AbstractWebhookMessageAction<?, ?>> bifunction)
-    {
         if (!Features.AUX_WEBHOOKS_ENABLED)
             return;
+        if (!ScarletAuditPrivacy.auxiliaryAllowed(entryMeta, this.scarlet.secretStaffList::isSecretStaffId))
+            return;
+        String type = entryMeta.entry.getEventType();
         UniqueStrings scarletAuxWhs = this.auditType2scarletAuxWh.get(type);
         if (scarletAuxWhs == null || scarletAuxWhs.isEmpty())
             return;
-        List<IncomingWebhookClient> clients = new ArrayList<>();
+        State payload = null;
+        boolean prepared = false;
         for (String scarletAuxWh : scarletAuxWhs.toArray())
         {
+            String acknowledgement = "deliveryAux:" + scarletAuxWh;
+            if (entryMeta.getAuxData(acknowledgement, false, e -> e.getAsBoolean())) continue;
             IncomingWebhookClient client = this.getOrCreateIWC(scarletAuxWh);
             if (client == null)
             {
-                LOG.warn("Aux webhook `"+scarletAuxWh+"` referenced by audit event type "+type+" does not exist, removing");
-                scarletAuxWhs.remove(scarletAuxWh);
-                if (scarletAuxWhs.isEmpty())
-                {
-                    this.auditType2scarletAuxWh.remove(type);
-                }
+                throw new IllegalStateException("Configured auxiliary audit destination is unavailable");
             }
-            else
+            if (!prepared)
             {
-                clients.add(client);
+                payload = state == null ? null : state.get();
+                prepared = true;
+            }
+            AbstractWebhookMessageAction<?, ?> action = bifunction.apply(client, payload);
+            if (action != null)
+            {
+                // Await acknowledgement so the outbox can retry failed destinations after restart.
+                action.completeAfter(3_000L, TimeUnit.MILLISECONDS);
+                entryMeta.setAuxData(acknowledgement, true);
+                entryMeta.setAuxData("deliveryAcknowledged", true);
+                this.saveAuditDeliveryProgress(this.scarlet, entryMeta);
             }
         }
-        if (clients.isEmpty())
-            return;
-        this.scarlet.exec.submit(() ->
-        {
-            State state0 = state == null ? null : state.get();
-            for (IncomingWebhookClient client : clients) try
-            {
-                AbstractWebhookMessageAction<?, ?> action = bifunction.apply(client, state0);
-                if (action != null)
-                {
-                    action.completeAfter(3_000L, TimeUnit.MILLISECONDS);
-                }
-            }
-            catch (Exception ex)
-            {
-                LOG.error("Exception emitting aux embed for "+type, ex);
-            }
-        });
     }
 
     final Pacer userModerationLimiter = new Pacer(3_000L);
+    private ScarletAuditFollowupWorker auditFollowupWorker;
+    private boolean auditFollowupClosed;
+
+    @Override public boolean requiresAuditFollowup(AuditEntryMetadata metadata)
+    {
+        GroupAuditType type = GroupAuditType.of(metadata.entry.getEventType());
+        return (type == GroupAuditType.INSTANCE_WARN || type == GroupAuditType.INSTANCE_KICK
+            || type == GroupAuditType.MEMBER_REMOVE || type == GroupAuditType.USER_BAN || type == GroupAuditType.USER_UNBAN)
+            && metadata.hasMessage() && !metadata.hasParentEvent()
+            && !metadata.getAuxData("deliveryModerationThread", false, e -> e.getAsBoolean());
+    }
+
+    @Override public synchronized void scheduleAuditFollowup(Scarlet scarlet, String id)
+    {
+        if (this.auditFollowupClosed) return;
+        if (this.auditFollowupWorker == null)
+            this.auditFollowupWorker = new ScarletAuditFollowupWorker(this::runAuditWork);
+        this.auditFollowupWorker.submit(id);
+    }
+
+    void runAuditWork(String id)
+    {
+        try
+        {
+            AuditEntryMetadata receipt;
+            synchronized (this)
+            {
+                ScarletAuditOutbox outbox = new ScarletAuditOutbox(this.scarlet.data.dir);
+                if (!outbox.exists(id)) return;
+                receipt = outbox.read(id);
+            }
+            // A queued wakeup carries no destination or mutable payload. The ordinary
+            // serialized path rereads the receipt, current policy and backoff before sending.
+            if (ScarletAuditOutbox.isDependency(receipt)) this.process(this.scarlet, receipt.entry);
+            else this.runAuditFollowup(id);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.error("Unable to dispatch queued audit {} ({}); durable receipt retained", id, ex.getClass().getSimpleName());
+        }
+    }
+
+    // Thread ids can advance after an acknowledged create; the event identity, audience and
+    // original parent must not change. User edits are read separately at every short commit.
+    static boolean sameAuditFollowupContext(AuditEntryMetadata queued, AuditEntryMetadata current)
+    {
+        if (queued == null || current == null) return false;
+        if (queued.entry == null || current.entry == null
+            || !Objects.equals(queued.entry.getGroupId(), current.entry.getGroupId())) return false;
+        if (queued.threadSnowflake != null && !Objects.equals(queued.threadSnowflake, queued.messageSnowflake)) return false;
+        if (current.threadSnowflake != null && !Objects.equals(current.threadSnowflake, queued.messageSnowflake)) return false;
+        AuditEntryMetadata comparison = Scarlet.GSON.fromJson(Scarlet.GSON.toJson(queued), AuditEntryMetadata.class);
+        comparison.threadSnowflake = current.threadSnowflake;
+        return ScarletAuditPrivacy.sameRecordedAudit(comparison, current);
+    }
+
+    boolean auditFollowupGroupCurrent(AuditEntryMetadata metadata)
+    {
+        return metadata != null && metadata.entry != null && this.scarlet.vrc != null
+            && metadata.entry.getGroupId() != null
+            && Objects.equals(metadata.entry.getGroupId(), this.scarlet.vrc.groupId);
+    }
+
+    void runAuditFollowup(String id)
+    {
+        ScarletAuditOutbox outbox = new ScarletAuditOutbox(this.scarlet.data.dir);
+        try
+        {
+            AuditEntryMetadata receipt;
+            synchronized (this)
+            {
+                if (!outbox.exists(id)) return;
+                receipt = outbox.read(id);
+                if (!ScarletAuditOutbox.isFollowup(receipt) || !ScarletAuditOutbox.due(receipt, System.currentTimeMillis())) return;
+                // A disk failure during foreground hand-off may leave only the durable receipt.
+                if (!this.scarlet.data.auditEntryMetadataExists(id)) this.scarlet.data.auditEntryMetadata(id, receipt);
+            }
+            AuditEntryMetadata metadata = this.scarlet.data.auditEntryMetadata(id);
+            if (!this.auditFollowupGroupCurrent(metadata) || !sameAuditFollowupContext(receipt, metadata))
+                throw new IllegalStateException("Audit follow-up security context changed");
+            metadata.setAuxData("deliveryState", "followup_pending");
+            if (metadata.threadSnowflake == null && receipt.threadSnowflake != null) metadata.threadSnowflake = receipt.threadSnowflake;
+            if (metadata.auxMessageSnowflake == null && receipt.auxMessageSnowflake != null) metadata.auxMessageSnowflake = receipt.auxMessageSnowflake;
+            Guild guild = this.jda == null ? null : this.jda.getGuildById(metadata.guildSnowflake);
+            TextChannel channel = guild == null ? null : guild.getTextChannelById(metadata.channelSnowflake);
+            if (channel == null) throw new IllegalStateException("Moderation thread destination is unavailable");
+            Message message = channel.retrieveMessageById(metadata.messageSnowflake).complete();
+            String actorId = metadata.hasAuxActor() ? metadata.auxActorId : metadata.entry.getActorId();
+            this.emitUserModeration_thread(this.scarlet, metadata, actorId, message);
+            // The per-event operation may have adopted a manual repair's newer receipt while
+            // waiting. Complete that committed record, never the older outer snapshot.
+            metadata = this.scarlet.data.auditEntryMetadata(id);
+            if (metadata == null) throw new IllegalStateException("Moderation follow-up record disappeared");
+            metadata.setAuxData("deliveryState", "followup_pending");
+            metadata.setAuxData("deliveryModerationThread", true);
+            this.persistModerationProgress(metadata, true);
+        }
+        catch (Exception ex)
+        {
+            synchronized (this)
+            {
+                if (outbox.exists(id))
+                {
+                    AuditEntryMetadata pending = outbox.read(id);
+                    if (!ScarletAuditOutbox.complete(pending))
+                    {
+                        int attempts = pending.getAuxData("deliveryAttempts", 0, e -> e.getAsInt()) + 1;
+                        pending.setAuxData("deliveryAttempts", attempts);
+                        pending.setAuxData("deliveryRetryAt", System.currentTimeMillis() + ScarletAuditOutbox.retryDelay(attempts));
+                        outbox.save(pending);
+                        if (attempts == 1 || (attempts & (attempts - 1)) == 0)
+                            this.emitOpsAlert("Audit thread delivery pending", "An audit embed was delivered, but its moderation thread could not be completed. Scarlet retained the follow-up and will retry. Check local logs and thread permissions.", 0xFEE75C);
+                    }
+                }
+            }
+            LOG.warn("Moderation thread follow-up remains pending for {} ({}); the parent embed is already delivered", id, ex.getClass().getSimpleName());
+        }
+    }
+
+    void persistModerationProgress(AuditEntryMetadata metadata, boolean complete)
+    {
+        if (!ScarletAuditOutbox.isFollowup(metadata))
+        {
+            this.saveAuditDeliveryProgress(this.scarlet, metadata);
+            this.scarlet.data.auditEntryMetadata(metadata.entry.getId(), metadata);
+            if (metadata.threadSnowflake != null)
+                this.wakeAuditDependents(this.scarlet, metadata.entry.getId());
+            return;
+        }
+        ScarletAuditOutbox outbox = new ScarletAuditOutbox(this.scarlet.data.dir);
+        // Serialize only local receipt transitions with polling, never the network operations.
+        // In particular, a poll must not replay an intermediate terminal receipt while it is
+        // being committed and removed by this worker.
+        synchronized (this)
+        {
+        this.scarlet.data.auditEntryMetadata(metadata.entry.getId(), current -> {
+            if (!sameAuditFollowupContext(metadata, current)
+                || !this.auditFollowupGroupCurrent(current)
+                || !Objects.equals(current.guildSnowflake, this.guildSf)
+                || !Objects.equals(current.channelSnowflake, this.approvedAuditChannel(current)))
+                throw new IllegalStateException("Audit follow-up context changed before saving");
+            if (current.auxMessageSnowflake != null && metadata.auxMessageSnowflake != null
+                && !Objects.equals(current.auxMessageSnowflake, metadata.auxMessageSnowflake))
+                throw new IllegalStateException("A newer moderation-button acknowledgement must not be overwritten");
+            if (metadata.threadSnowflake != null) current.threadSnowflake = metadata.threadSnowflake;
+            if (metadata.auxMessageSnowflake != null) current.auxMessageSnowflake = metadata.auxMessageSnowflake;
+            current.setAuxData("deliveryState", complete ? "delivered" : "followup_pending");
+            if (complete) current.setAuxData("deliveryModerationThread", true);
+            if (complete) outbox.finish(this.scarlet, current);
+            else outbox.save(current);
+            return current;
+        });
+        if (metadata.threadSnowflake != null)
+            this.wakeAuditDependents(this.scarlet, metadata.entry.getId());
+        }
+    }
+
+    AuditEntryMetadata currentBundledBan(AuditEntryMetadata kick, AuditEntryMetadata candidate)
+    {
+        String dependency = ScarletAuditOutbox.dependency(kick);
+        String id = dependency != null ? dependency : candidate == null || candidate.entry == null ? null : candidate.entry.getId();
+        if (id == null) return null;
+        AuditEntryMetadata current = this.scarlet.data.auditEntryMetadata(id);
+        if (current == null || current.entry == null || kick.entry == null
+            || current.entryRedacted || kick.entryRedacted || current.hasParentEvent()
+            || !"group.user.ban".equals(current.entry.getEventType()) || !"group.instance.kick".equals(kick.entry.getEventType())
+            || !this.auditFollowupGroupCurrent(current)
+            || !Objects.equals(kick.entry.getGroupId(), current.entry.getGroupId())
+            || !Objects.equals(kick.entry.getActorId(), current.entry.getActorId())
+            || !Objects.equals(kick.entry.getTargetId(), current.entry.getTargetId())
+            || (kick.entry.getId() != null && kick.entry.getId().startsWith(ScarletSimulation.TRAINING_AUDIT_ID_PREFIX))
+                != (current.entry.getId() != null && current.entry.getId().startsWith(ScarletSimulation.TRAINING_AUDIT_ID_PREFIX))
+            || current.entry.getCreatedAt() == null || kick.entry.getCreatedAt() == null
+            || !kick.entry.getCreatedAt().minusMinutes(5L).isBefore(current.entry.getCreatedAt())
+            || current.entry.getCreatedAt().isAfter(kick.entry.getCreatedAt())
+            || ScarletAuditPrivacy.confidential(current, this.scarlet.secretStaffList::isSecretStaffId)
+                != ScarletAuditPrivacy.confidential(kick, this.scarlet.secretStaffList::isSecretStaffId))
+            throw new IllegalStateException("The associated ban or its current approved audience cannot be verified");
+        // A deliberately unconfigured ban must not prevent its separately configured kick
+        // from posting. This fallback is only for a first attempt, never a recorded parent.
+        if (dependency == null && !current.hasMessage()) return null;
+        if (this.approvedAuditChannel(current) == null
+            || !Objects.equals(this.guildSf, current.guildSnowflake)
+            || !Objects.equals(this.approvedAuditChannel(current), current.channelSnowflake))
+            throw new IllegalStateException("The associated ban or its current approved audience cannot be verified");
+        return current;
+    }
+
+    AuditEntryMetadata preparedBundledBan(AuditEntryMetadata kick, AuditEntryMetadata candidate)
+    {
+        AuditEntryMetadata parent = this.currentBundledBan(kick, candidate);
+        if (parent == null || parent.threadSnowflake != null) return parent;
+        ScarletAuditOutbox pendingThreads = new ScarletAuditOutbox(this.scarlet.data.dir);
+        if (pendingThreads.exists(parent.entry.getId())
+            && ScarletAuditOutbox.isFollowup(pendingThreads.read(parent.entry.getId())))
+            throw new ScarletAuditDependencyPending(parent.entry.getId());
+        if (ScarletAuditOutbox.dependency(kick) != null)
+            throw new IllegalStateException("The associated ban has no acknowledged moderation thread");
+        // Older completed/suppressed records can have no thread. Preserve the independent
+        // kick route only when this kick has never been bound to a pending/bundled parent.
+        return null;
+    }
+
+    void captureModerationBanInfo(AuditEntryMetadata metadata)
+    {
+        if (!"group.user.ban".equals(metadata.entry.getEventType())
+            || metadata.getAuxData("deliveryBanInfoCaptured", false, e -> e.getAsBoolean())) return;
+        ScarletPendingModActions.BanInfo pending = this.scarlet.pendingModActions.pollBanInfo(metadata.entry.getTargetId());
+        if (pending != null)
+        {
+            if (pending.tags != null) metadata.entryTags.addAll(pending.tags);
+            if (pending.description != null && !pending.description.trim().isEmpty()) metadata.entryDescription = pending.description;
+        }
+        metadata.setAuxData("deliveryBanInfoCaptured", true);
+        this.saveAuditDeliveryProgress(this.scarlet, metadata);
+    }
+
     @Override
     public void emitUserModeration(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, User actor, User target, ScarletData.UserMetadata actorMeta, ScarletData.UserMetadata targetMeta, String history, String recent, ScarletData.AuditEntryMetadata parentEntryMeta, boolean reactiveKickFromBan)
     {
+        long moderationStarted = System.nanoTime();
         if (net.sybyline.scarlet.Debug.ENABLED)
             net.sybyline.scarlet.Debug.emit(debugEventSummary("MODERATION", entryMeta, GroupAuditType.of(entryMeta.entry.getEventType()) != null ? GroupAuditType.of(entryMeta.entry.getEventType()).title : null));
         this.condEmit(entryMeta, (channelSf, guild, channel) ->
@@ -2676,24 +3283,37 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     entryMeta.setAuxData("targetJoined", targetJoined.toEpochSecond());
                 }
             }
+            if (ScarletAuditOutbox.dependency(entryMeta) != null && !this.bundleModerations_instanceKick2userBan.get())
+                throw new IllegalStateException("Bundling was disabled while this kick was awaiting its recorded ban thread");
+            // Re-read the parent instead of routing a queued kick using stale history metadata.
+            AuditEntryMetadata bundledParent = this.bundleModerations_instanceKick2userBan.get()
+                && (reactiveKickFromBan || ScarletAuditOutbox.dependency(entryMeta) != null)
+                ? this.preparedBundledBan(entryMeta, parentEntryMeta) : null;
             this.userModerationLimiter.await();
             
-            if (reactiveKickFromBan && this.bundleModerations_instanceKick2userBan.get() && parentEntryMeta.threadSnowflake != null)
+            if (bundledParent != null)
             {
-                ThreadChannel threadChannel = guild.getThreadChannelById(parentEntryMeta.threadSnowflake);
+                // The pacing wait can overlap policy edits or a manual thread repair.
+                bundledParent = this.currentBundledBan(entryMeta, bundledParent);
+                ThreadChannel threadChannel = guild.getThreadChannelById(bundledParent.threadSnowflake);
+                if (threadChannel == null)
+                    throw new IllegalStateException("The associated ban thread is currently unavailable");
+                String problem = this.auditThreadAccessProblem(bundledParent, threadChannel, null);
+                if (problem != null) throw new IllegalStateException(problem);
                 if (threadChannel != null)
                 {
-                    entryMeta.parentEventId = parentEntryMeta.entry.getId();
-                    entryMeta.auxActorId = parentEntryMeta.auxActorId;
-                    entryMeta.auxActorDisplayName = parentEntryMeta.auxActorDisplayName;
-                    entryMeta.guildSnowflake = parentEntryMeta.guildSnowflake;
-                    entryMeta.channelSnowflake = parentEntryMeta.channelSnowflake;
-                    entryMeta.threadSnowflake = parentEntryMeta.threadSnowflake;
+                    entryMeta.setAuxData("deliveryDependencyEvent", bundledParent.entry.getId());
+                    entryMeta.parentEventId = bundledParent.entry.getId();
+                    entryMeta.auxActorId = bundledParent.auxActorId;
+                    entryMeta.auxActorDisplayName = bundledParent.auxActorDisplayName;
+                    entryMeta.guildSnowflake = bundledParent.guildSnowflake;
+                    entryMeta.channelSnowflake = bundledParent.channelSnowflake;
+                    entryMeta.threadSnowflake = bundledParent.threadSnowflake;
                     Message message = threadChannel
                         .sendMessageEmbeds(this.embed(entryMeta, true)
                             .setTitle(MarkdownSanitizer.escape(targetName), targetId != null ? "https://vrchat.com/home/user/"+targetId : null)
                             .build())
-                        .setMessageReference(parentEntryMeta.messageSnowflake)
+                        .setMessageReference(bundledParent.messageSnowflake)
                         .failOnInvalidReply(false)
                         .mentionRepliedUser(false)
                         .complete();
@@ -2762,10 +3382,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 .sendMessageEmbeds(embed.build())
                 .complete();
             
-            this.scarlet.exec.execute(() -> this.emitUserModeration_thread(scarlet, entryMeta, actor != null ? actor.getId() : entryMeta.entry.getActorId(), message));
-            
             return message;
         });
+        if (entryMeta.hasMessage()) LOG.info("Moderation parent embed acknowledged for {} after {} ms in the embed stage",
+            entryMeta.entry.getId(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - moderationStarted));
+        this.captureModerationBanInfo(entryMeta);
         if (target != null)
         switch (entryMeta.entry.getEventType())
         {
@@ -2775,7 +3396,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         case "group.instance.warn":
             this.tryEmitExtendedWatchedModeration(scarlet, target);
         }
-        this.scarlet.mobile.notifyModeration(entryMeta, actor, target);
+        this.scarlet.desktopNotifications.notifyModeration(entryMeta, actor, target);
     }
     // Maps a moderation thread's snowflake to its audit entry id, so a moderator's message in the
     // thread can be captured as that entry's reason (making it count as a logged moderation). Bounded
@@ -2790,8 +3411,39 @@ public class ScarletDiscordJDA implements ScarletDiscord
             return this.size() > 5000;
         }
     });
+    private static final Object[] MODERATION_THREAD_LOCKS = java.util.stream.IntStream.range(0, 256)
+        .mapToObj(index -> new Object()).toArray(Object[]::new);
+
     ThreadChannel emitUserModeration_thread(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, String actorId, Message message)
     {
+        return this.emitUserModeration_thread(scarlet, entryMeta, actorId, message, null);
+    }
+    ThreadChannel emitUserModeration_thread(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, String actorId, Message message, String requesterSf)
+    {
+        String id = entryMeta == null || entryMeta.entry == null ? "" : entryMeta.entry.getId();
+        Object lock = MODERATION_THREAD_LOCKS[(Objects.hashCode(id) & Integer.MAX_VALUE) % MODERATION_THREAD_LOCKS.length];
+        synchronized (lock)
+        {
+            // A manual repair may have finished while this automatic job waited. Reuse its
+            // acknowledged thread/buttons and current user edits, never the queued snapshot.
+            if (requesterSf == null && entryMeta != null && ScarletAuditOutbox.isFollowup(entryMeta))
+            {
+                AuditEntryMetadata latest = scarlet.data.auditEntryMetadata(id);
+                if (!sameAuditFollowupContext(entryMeta, latest))
+                    throw new IllegalStateException("Audit follow-up changed while waiting for its event lock");
+                if (latest.threadSnowflake == null) latest.threadSnowflake = entryMeta.threadSnowflake;
+                if (latest.auxMessageSnowflake == null) latest.auxMessageSnowflake = entryMeta.auxMessageSnowflake;
+                latest.setAuxData("deliveryState", "followup_pending");
+                entryMeta = latest;
+            }
+            return this.emitUserModerationThreadLocked(scarlet, entryMeta, actorId, message, requesterSf);
+        }
+    }
+
+    private ThreadChannel emitUserModerationThreadLocked(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, String actorId, Message message, String requesterSf)
+    {
+        String problem = this.auditThreadProblem(entryMeta, message, requesterSf);
+        if (problem != null) throw new IllegalStateException(problem);
         ThreadChannel threadChannel = message.getStartedThread();
         if (threadChannel == null)
         {
@@ -2803,29 +3455,41 @@ public class ScarletDiscordJDA implements ScarletDiscord
             }
             if (threadChannel == null)
             {
+                problem = this.auditThreadProblem(entryMeta, message, requesterSf);
+                if (problem != null) throw new IllegalStateException(problem);
                 threadChannel = message
                     .getChannel()
                     .asTextChannel()
                     .createThreadChannel(entryMeta.entry.getDescription(), message.getId())
                     .setAutoArchiveDuration(ThreadChannel.AutoArchiveDuration.TIME_1_HOUR)
-                    .completeAfter(1500L, TimeUnit.MILLISECONDS);
+                    .complete();
             }
         }
-        
+
+        problem = this.auditThreadProblem(entryMeta, message, requesterSf);
+        if (problem == null) problem = this.auditThreadAccessProblem(entryMeta, threadChannel, requesterSf);
+        if (problem != null) throw new IllegalStateException(problem);
+
+        this.emitUserModeration_auxMessage(scarlet, entryMeta, actorId, threadChannel, requesterSf);
+
+        problem = this.auditThreadProblem(entryMeta, message, requesterSf);
+        if (problem == null) problem = this.auditThreadAccessProblem(entryMeta, threadChannel, requesterSf);
+        if (problem != null) throw new IllegalStateException(problem);
         entryMeta.threadSnowflake = threadChannel.getId();
+        this.persistModerationProgress(entryMeta, false);
         this.moderationThreadSf2auditId.put(threadChannel.getId(), entryMeta.entry.getId());
-        scarlet.data.auditEntryMetadata(entryMeta.entry.getId(), entryMeta);
-        
-        ThreadChannel threadChannel0 = threadChannel;
-        this.scarlet.exec.execute(() -> this.emitUserModeration_auxMessage(scarlet, entryMeta, actorId, threadChannel0));
         
         return threadChannel;
     }
-    Message emitUserModeration_auxMessage(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, String actorId, ThreadChannel threadChannel)
+    Message emitUserModeration_auxMessage(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, String actorId, ThreadChannel threadChannel, String requesterSf)
     {
+        String problem = this.auditThreadAccessProblem(entryMeta, threadChannel, requesterSf);
+        if (problem != null) throw new IllegalStateException(problem);
         if (entryMeta.auxMessageSnowflake != null)
         {
             Message auxMessage = threadChannel.retrieveMessageById(entryMeta.auxMessageSnowflake).complete();
+            problem = this.auditThreadAccessProblem(entryMeta, threadChannel, requesterSf);
+            if (problem != null) throw new IllegalStateException(problem);
             if (auxMessage != null)
                 return auxMessage;
         }
@@ -2838,19 +3502,17 @@ public class ScarletDiscordJDA implements ScarletDiscord
         case INSTANCE_KICK: mention = this.pingOnModeration_instanceKick.get(); break;
         case MEMBER_REMOVE: mention = this.pingOnModeration_memberRemove.get(); break;
         case USER_BAN:      mention = this.pingOnModeration_userBan     .get();
-        ScarletPendingModActions.BanInfo pendingBan = this.scarlet.pendingModActions.pollBanInfo(entryMeta.entry.getTargetId());
-        if (pendingBan != null)
+        this.captureModerationBanInfo(entryMeta);
+        if (entryMeta.hasTags() || entryMeta.hasDescription())
         {
             contentExtra = "";
-            if (pendingBan.tags != null && pendingBan.tags.length > 0)
+            if (entryMeta.hasTags())
             {
-                entryMeta.entryTags.addAll(pendingBan.tags);
-                contentExtra = contentExtra + "\n### Tags:\n" + Stream.of(pendingBan.tags).map(this.scarlet.moderationTags::getTagLabel).collect(Collectors.joining(", "));
+                contentExtra = contentExtra + "\n### Tags:\n" + entryMeta.entryTags.strings().stream().map(this.scarlet.moderationTags::getTagLabel).collect(Collectors.joining(", "));
             }
-            if (pendingBan.description != null && !pendingBan.description.trim().isEmpty())
+            if (entryMeta.hasDescription())
             {
-                entryMeta.entryDescription = pendingBan.description;
-                contentExtra = contentExtra + "\n### Description:\n" + pendingBan.description;
+                contentExtra = contentExtra + "\n### Description:\n" + entryMeta.entryDescription;
             }
         }
         break;
@@ -2894,10 +3556,15 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 Button.secondary("timed-ban:168:"+entryMeta.entry.getTargetId(), "Timed ban 7d"),
                 Button.secondary("timed-ban-custom:"+entryMeta.entry.getTargetId(), "Timed ban…")
             ));
-        Message auxMessage = auxAction.completeAfter(1500L, TimeUnit.MILLISECONDS);
-        
+        // Recheck after payload construction: staff confidentiality or routing may have changed.
+        problem = this.auditThreadAccessProblem(entryMeta, threadChannel, requesterSf);
+        if (problem != null) throw new IllegalStateException(problem);
+        Message auxMessage = auxAction.complete();
+
+        problem = this.auditThreadAccessProblem(entryMeta, threadChannel, requesterSf);
+        if (problem != null) throw new IllegalStateException(problem);
         entryMeta.auxMessageSnowflake = auxMessage.getId();
-        scarlet.data.auditEntryMetadata(entryMeta.entry.getId(), entryMeta);
+        this.persistModerationProgress(entryMeta, false);
         
         return auxMessage;
     }
@@ -2945,7 +3612,15 @@ public class ScarletDiscordJDA implements ScarletDiscord
         Location locationModel = Location.of(location);
         
         scarlet.data.liveInstancesMetadata_setLocationAudit(location, entryMeta.entry.getId());
-        this.condEmitEx(GroupAuditTypeEx.INSTANCE_MONITOR, false, false, null, (channelSf, guild, channel) ->
+        boolean confidential = ScarletAuditPrivacy.confidential(entryMeta, scarlet.secretStaffList::isSecretStaffId);
+        String monitorChannel = (confidential ? this.auditExType2secretChannelSf : this.auditExType2channelSf).get(GroupAuditTypeEx.INSTANCE_MONITOR.id);
+        if (monitorChannel != null && !monitorChannel.trim().isEmpty()
+            && (this.jda == null || this.jda.getGuildById(this.guildSf) == null
+                || this.jda.getGuildById(this.guildSf).getTextChannelById(monitorChannel) == null))
+            throw new IllegalStateException("Configured instance monitor destination is unavailable");
+        if (!entryMeta.getAuxData("deliveryInstanceMonitor", false, e -> e.getAsBoolean()))
+        this.condEmitEx(GroupAuditTypeEx.INSTANCE_MONITOR, false,
+            ScarletAuditPrivacy.confidential(entryMeta, scarlet.secretStaffList::isSecretStaffId), null, (channelSf, guild, channel) ->
         {
             String title = MarkdownSanitizer.escape(worldName)+" ("+MarkdownSanitizer.escape(locationModel.name)+")";
             EmbedBuilder embed = new EmbedBuilder()
@@ -2954,18 +3629,27 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 .setColor(GroupAuditTypeEx.INSTANCE_MONITOR.color)
                 .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
                 .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC));
-            Message message = channel
-                .sendMessageEmbeds(embed.build())
-                .complete();
-            ThreadChannel threadChannel = ((TextChannel)channel).createThreadChannel(title, message.getId())
-                .setAutoArchiveDuration(ThreadChannel.AutoArchiveDuration.TIME_1_HOUR)
-                .completeAfter(1_000L, TimeUnit.MILLISECONDS);
-            Message auxMessage = threadChannel.sendMessage("### Instance log").completeAfter(1_000L, TimeUnit.MILLISECONDS);
+            String previousMessage = entryMeta.getAuxData("deliveryInstanceMonitorMessage", (String)null, e -> e.getAsString());
+            Message message = previousMessage == null ? channel.sendMessageEmbeds(embed.build()).complete()
+                : channel.retrieveMessageById(previousMessage).complete();
+            entryMeta.setAuxData("deliveryInstanceMonitorMessage", message.getId());
+            entryMeta.setAuxData("deliveryAcknowledged", true);
+            this.saveAuditDeliveryProgress(scarlet, entryMeta);
+            String previousThread = entryMeta.getAuxData("deliveryInstanceMonitorThread", (String)null, e -> e.getAsString());
+            ThreadChannel threadChannel = previousThread == null ? message.getStartedThread() : guild.getThreadChannelById(previousThread);
+            if (threadChannel == null)
+                threadChannel = ((TextChannel)channel).createThreadChannel(title, message.getId())
+                    .setAutoArchiveDuration(ThreadChannel.AutoArchiveDuration.TIME_1_HOUR).completeAfter(1_000L, TimeUnit.MILLISECONDS);
+            entryMeta.setAuxData("deliveryInstanceMonitorThread", threadChannel.getId());
+            this.saveAuditDeliveryProgress(scarlet, entryMeta);
+            String previousAux = entryMeta.getAuxData("deliveryInstanceMonitorAux", (String)null, e -> e.getAsString());
+            Message auxMessage = previousAux == null ? threadChannel.sendMessage("### Instance log").completeAfter(1_000L, TimeUnit.MILLISECONDS)
+                : threadChannel.retrieveMessageById(previousAux).complete();
+            entryMeta.setAuxData("deliveryInstanceMonitorAux", auxMessage.getId());
+            this.saveAuditDeliveryProgress(scarlet, entryMeta);
             scarlet.data.liveInstancesMetadata_setLocationInstanceEmbedMessage(location, guild.getId(), channelSf, message.getId(), threadChannel.getId(), auxMessage.getId(), entryMeta.entry.getCreatedAt());
-            // Create the live player list message in the instance thread
-            ScarletData.InstanceEmbedMessage iem = scarlet.data.liveInstancesMetadata_getLocationInstanceEmbedMessage(location, false);
-            if (iem != null)
-                scarlet.exec.execute(() -> this.livePlayerlist.onInstanceCreate(location, guild.getId(), threadChannel.getId(), iem));
+            entryMeta.setAuxData("deliveryInstanceMonitor", true);
+            this.saveAuditDeliveryProgress(scarlet, entryMeta);
             return message;
         });
         this.condEmitEmbed(entryMeta, true, "Instance Open", "https://vrchat.com/home/launch?worldId="+location.replaceFirst(":", "&instanceId="), null, embed ->
@@ -2980,6 +3664,19 @@ public class ScarletDiscordJDA implements ScarletDiscord
     // created instance is only cold-booted into once even when both paths observe it.
     private final java.util.Map<String, Long> recentlyLaunchedLocations = new java.util.concurrent.ConcurrentHashMap<>();
     static final long RELAUNCH_SUPPRESS_MILLIS = 5L * 60L * 1000L;
+    private ScarletClientLaunchWorker clientLaunchWorker;
+    private volatile boolean clientLaunchClosed;
+
+    private void closeClientLaunchWorker() throws IOException
+    {
+        ScarletClientLaunchWorker worker;
+        synchronized (this)
+        {
+            this.clientLaunchClosed = true;
+            worker = this.clientLaunchWorker;
+        }
+        if (worker != null) worker.close();
+    }
 
     @Override
     public boolean isLaunchOnInstanceCreateEnabled()
@@ -2988,15 +3685,28 @@ public class ScarletDiscordJDA implements ScarletDiscord
     }
 
     @Override
-    public void launchClientIntoInstanceIfEnabled(String location)
+    public synchronized void launchClientIntoInstanceIfEnabled(String location)
     {
-        if (location == null || !this.vrchatClient_launchOnInstanceCreate.get())
+        if (location == null || this.clientLaunchClosed || !this.vrchatClient_launchOnInstanceCreate.get())
             return;
         long now = System.currentTimeMillis();
-        Long prev = this.recentlyLaunchedLocations.put(location, now);
+        Long prev = this.recentlyLaunchedLocations.get(location);
         this.recentlyLaunchedLocations.values().removeIf(t -> now - t.longValue() > RELAUNCH_SUPPRESS_MILLIS);
         if (prev != null && now - prev.longValue() < RELAUNCH_SUPPRESS_MILLIS)
             return; // already cold-booted into this instance very recently
+        if (this.clientLaunchWorker == null)
+            this.clientLaunchWorker = new ScarletClientLaunchWorker();
+        ScarletClientLaunchWorker.Submission result = this.clientLaunchWorker.submit(() -> this.runClientLaunch(location));
+        if (result == ScarletClientLaunchWorker.Submission.ACCEPTED)
+            this.recentlyLaunchedLocations.put(location, now);
+        else
+            LOG.info("VRChat auto-launch skipped: launch worker is {} (no launch queued)", result);
+    }
+
+    private void runClientLaunch(String location)
+    {
+        if (this.clientLaunchClosed || Thread.currentThread().isInterrupted() || !this.vrchatClient_launchOnInstanceCreate.get())
+            return;
         try
         {
             // Resolve the instance's short/secure name so non-public (group,
@@ -3029,11 +3739,18 @@ public class ScarletDiscordJDA implements ScarletDiscord
             {
                 LOG.warn("Could not resolve instance secure name for auto-launch of {}: {}", location, ex.getMessage());
             }
+            if (this.clientLaunchClosed || Thread.currentThread().isInterrupted() || !this.vrchatClient_launchOnInstanceCreate.get())
+                return;
             VrcLaunch.launch(this.scarlet.vrc.currentUserId, location, shortName, VrcLaunch.LaunchMode.DESKTOP);
+        }
+        catch (InterruptedException ex)
+        {
+            Thread.currentThread().interrupt();
+            LOG.info("VRChat auto-launch cancelled during shutdown");
         }
         catch (Exception ex)
         {
-            LOG.error("Exception auto-launching VRChat", ex);
+            LOG.warn("VRChat auto-launch did not complete: {}", ex.getMessage());
         }
     }
 
@@ -3043,16 +3760,14 @@ public class ScarletDiscordJDA implements ScarletDiscord
         String worldImageUrl = this.getLocationImage(location);
         
         String prevAuditEntryId = scarlet.data.liveInstancesMetadata_getLocationAudit(location, false);
-        AuditEntryMetadata prevEntryMeta = prevAuditEntryId == null ? null : scarlet.data.auditEntryMetadata(prevAuditEntryId);
+        AuditEntryMetadata previous = prevAuditEntryId == null ? null : scarlet.data.auditEntryMetadata(prevAuditEntryId);
+        AuditEntryMetadata prevEntryMeta = ScarletAuditPrivacy.visible(previous, scarlet.secretStaffList::isSecretStaffId,
+            ScarletAuditPrivacy.confidential(entryMeta, scarlet.secretStaffList::isSecretStaffId)) ? previous : null;
         ScarletData.InstanceEmbedMessage instanceEmbedMessage = scarlet.data.liveInstancesMetadata_getLocationInstanceEmbedMessage(location, false);
         if (instanceEmbedMessage != null)
         {
             instanceEmbedMessage.closedAt = entryMeta.entry.getCreatedAt();
         }
-        // Finalise the live player list
-        final String loc = location;
-        scarlet.exec.execute(() -> this.livePlayerlist.onInstanceClose(loc));
-        
         this.condEmit(entryMeta, (channelSf, guild, channel) ->
         {
             boolean hasPrev = prevEntryMeta != null && prevEntryMeta.hasMessage();
@@ -3100,7 +3815,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             null,
             embed -> {
                 embed
-                    .setDescription(announcement.message)
+                    .setDescription(AuditEmbedBuilder.clip(announcement.message, 3000))
                     .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC));
             }
         );
@@ -3112,7 +3827,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.condEmitEmbed(entryMeta, false, MarkdownSanitizer.escape(post.title), "https://vrchat.com/home/group/"+entryMeta.entry.getGroupId()+"/posts", null, embed ->
         {
             embed.setDescription(null) // override description
-                .setDescription(post.text)
+                .setDescription(AuditEmbedBuilder.clip(post.text, 3000))
                 .setImage(MiscUtils.latestContentUrlOrNull(post.imageId));
             this.emitAuxWh(entryMeta, embed::build, IncomingWebhookClient::sendMessageEmbeds);
         });
@@ -3311,12 +4026,6 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public void emitExtendedUserJoin(Scarlet scarlet, LocalDateTime timestamp, String location, String userId, String displayName)
     {
-        // Update live player list
-        OffsetDateTime joinedAt = timestamp == null ? OffsetDateTime.now(ZoneOffset.UTC)
-            : timestamp.atOffset(ZoneOffset.UTC);
-        if (!ScarletSimulation.isTrainingId(userId)) // training users never enter the live instance roster
-            this.livePlayerlist.onPlayerJoin(location, userId, displayName, joinedAt);
-
         this.condEmitEx(ScarletSimulation.isTrainingId(userId), GroupAuditTypeEx.USER_JOIN, false, false, location, (channelSf, guild, channel) ->
         {
             return channel.sendMessageEmbeds(new EmbedBuilder()
@@ -3340,10 +4049,6 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public void emitExtendedUserLeave(Scarlet scarlet, LocalDateTime timestamp, String location, String userId, String displayName)
     {
-        // Update live player list
-        if (!ScarletSimulation.isTrainingId(userId))
-            this.livePlayerlist.onPlayerLeave(location, userId, displayName);
-
         this.condEmitEx(ScarletSimulation.isTrainingId(userId), GroupAuditTypeEx.USER_LEAVE, false, false, location, (channelSf, guild, channel) ->
         {
             return channel.sendMessageEmbeds(new EmbedBuilder()
@@ -3367,11 +4072,6 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public void emitExtendedUserAvatar(Scarlet scarlet, LocalDateTime timestamp, String location, String userId, String displayName, String avatarDisplayName, String[] potentialIds0)
     {
-        // Update live player list — pass first resolved ID if available
-        String firstId = (potentialIds0 != null && potentialIds0.length > 0) ? potentialIds0[0] : null;
-        if (!ScarletSimulation.isTrainingId(userId))
-            this.livePlayerlist.onPlayerAvatar(location, userId, avatarDisplayName, firstId);
-
         this.condEmitEx(ScarletSimulation.isTrainingId(userId), GroupAuditTypeEx.USER_AVATAR, false, false, location, (channelSf, guild, channel) ->
         {
             String[] potentialIds = potentialIds0;
@@ -3596,24 +4296,39 @@ public class ScarletDiscordJDA implements ScarletDiscord
     {
         this.condEmitEx(GroupAuditTypeEx.SPAWN_PROP, false, false, location, (channelSf, guild, channel) ->
         {
-            return channel.sendMessageEmbeds(new EmbedBuilder()
-                .setTitle(MarkdownSanitizer.escape(displayName)+" spawned a prop", "https://vrchat.com/home/user/"+userId)
-                .addField("User ID", "`"+userId+"`", false)
-                .addField("Location", "`"+location+"`", false)
-                .addField("Prop Author", MarkdownUtil.maskedLink(MarkdownSanitizer.escape(prop.getAuthorName()), "https://vrchat.com/home/user/"+prop.getAuthorId()), false)
-                .addField("Prop ID", "`"+propId+"`", false)
-                .addField("Report prop", MarkdownUtil.maskedLink("link", VRChatHelpDeskURLs.newModerationRequest_account_other(this.requestingEmail.get(), prop.getAuthorId(), "Prop", propId)), false)
-                .setImage(MiscUtils.nonBlankOrNull(prop.getThumbnailImageUrl(), prop.getImageUrl()))
-                .setColor(GroupAuditTypeEx.SPAWN_PROP.color)
-                .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
-                .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC))
-                .build())
+            return channel.sendMessageEmbeds(propSpawnEmbed(location, userId, displayName, propId, prop, this.requestingEmail.get()).build())
             .addComponents(ActionRow.of(
                 Button.danger("vrchat-user-ban:"+userId, "Ban user"),
                 Button.success("vrchat-user-unban:"+userId, "Unban user")
             ))
             .complete();
         });
+    }
+
+    static EmbedBuilder propSpawnEmbed(String location, String userId, String displayName, String propId, Prop prop, String reportEmail)
+    {
+        EmbedBuilder embed = new AuditEmbedBuilder()
+            .setTitle(AuditEmbedBuilder.clip(MarkdownSanitizer.escape(displayName)+" spawned a prop", 256), "https://vrchat.com/home/user/"+userId)
+            .addField("User ID", "`"+userId+"`", false)
+            .addField("Location", "`"+location+"`", false)
+            .addField("Prop ID", "`"+propId+"`", false)
+            .setColor(GroupAuditTypeEx.SPAWN_PROP.color)
+            .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
+            .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC));
+        // A logged spawn remains valid when optional content metadata is private or unavailable.
+        String authorId = prop == null ? null : prop.getAuthorId();
+        if (authorId != null && !authorId.isBlank())
+        {
+            String authorName = prop.getAuthorName();
+            if (authorName == null || authorName.isBlank()) authorName = authorId;
+            embed.addField("Prop Author", MarkdownUtil.maskedLink(MarkdownSanitizer.escape(authorName), "https://vrchat.com/home/user/"+authorId), false);
+            embed.addField("Report prop", MarkdownUtil.maskedLink("link", VRChatHelpDeskURLs.newModerationRequest_account_other(reportEmail, authorId, "Prop", propId)), false);
+        }
+        else
+            embed.addField("Prop Author", "Unavailable; content author could not be verified.", false);
+        if (prop != null)
+            embed.setImage(MiscUtils.nonBlankOrNull(prop.getThumbnailImageUrl(), prop.getImageUrl()));
+        return embed;
     }
 
     String[] filterAvatarIdsByBundleOwner(ModelFile modelFile, String[] potentialIds)
@@ -3731,91 +4446,210 @@ public class ScarletDiscordJDA implements ScarletDiscord
         });
     }
 
+    private final Object summaryWorkerLock = new Object();
+    private ScarletSummaryWorker summaryWorker;
+    private volatile boolean summaryWorkerClosed;
+    private volatile long summaryPrivacyRevision;
+    private int summaryPrivacyMutations;
+
+    synchronized void invalidateLocalSummaryPrivacy()
+    {
+        this.summaryPrivacyRevision++;
+    }
+
+    synchronized void beginLocalSummaryPrivacyChange()
+    {
+        this.summaryPrivacyMutations++;
+        this.summaryPrivacyRevision++;
+    }
+
+    synchronized void endLocalSummaryPrivacyChange()
+    {
+        if (this.summaryPrivacyMutations <= 0)
+            throw new IllegalStateException("No local summary privacy change is active");
+        this.summaryPrivacyMutations--;
+        this.summaryPrivacyRevision++;
+    }
+
+    private synchronized long currentSummaryPrivacyRevision()
+    {
+        if (this.summaryPrivacyMutations != 0)
+            throw new IllegalStateException("A local history privacy change is still being saved");
+        if (this.scarlet.data.hasPendingAuditMetadataWrites())
+            throw new IllegalStateException("Saved audit history has uncommitted changes; retry after persistence recovers");
+        return this.summaryPrivacyRevision;
+    }
+
+    private ScarletSummaryWorker.Submission submitSummary(Runnable task)
+    {
+        synchronized (this.summaryWorkerLock)
+        {
+            if (this.summaryWorkerClosed) return ScarletSummaryWorker.Submission.CLOSED;
+            if (this.summaryWorker == null) this.summaryWorker = new ScarletSummaryWorker();
+            return this.summaryWorker.submit(task);
+        }
+    }
+
+    void closeSummaryWorker() throws IOException
+    {
+        ScarletSummaryWorker worker;
+        synchronized (this.summaryWorkerLock)
+        {
+            this.summaryWorkerClosed = true;
+            worker = this.summaryWorker;
+        }
+        if (worker != null) worker.close();
+    }
+
     @Override
     public void emitModSummary(Scarlet scarlet, OffsetDateTime endOfDay)
     {
-        this.condEmitEx(GroupAuditTypeEx.MOD_SUMMARY, true, false, null, (channelSf, guild, channel) -> this.emitModSummary(scarlet, endOfDay, this.scarlet.settings.heuristicPeriodDays.get() * 24L, channel::sendMessageEmbeds));
+        String group = scarlet.vrc.groupId, guildId = this.guildSf;
+        ScarletSummaryWorker.Submission result = this.submitSummary(() -> {
+            try
+            {
+                this.requireSummaryContext(group, guildId);
+                this.condEmitEx(GroupAuditTypeEx.MOD_SUMMARY, true, false, null,
+                    (channelSf, guild, channel) -> this.emitModSummary(scarlet, endOfDay,
+                        scarlet.settings.heuristicPeriodDays.get() * 24L, channel::sendMessageEmbeds, group, guildId));
+            }
+            catch (RuntimeException ex) { LOG.warn("Scheduled local moderation summary did not complete ({})", ex.getClass().getSimpleName()); }
+        });
+        if (result != ScarletSummaryWorker.Submission.ACCEPTED)
+            LOG.info("Scheduled moderation summary not started: {}", result);
+    }
 
+    <MCR extends MessageCreateRequest<MCR> & FluentRestAction<Message, MCR>> ScarletSummaryWorker.Submission
+        requestModSummary(OffsetDateTime end, long hours, Function<MessageEmbed, MCR> send, Consumer<String> status)
+    {
+        if (hours <= 0L) throw new IllegalArgumentException("hours-back must be greater than zero");
+        String group = this.scarlet.vrc.groupId, guild = this.guildSf;
+        return this.submitSummary(() -> {
+            try
+            {
+                this.requireSummaryContext(group, guild);
+                status.accept("Generating a summary from saved local history in the background. Scarlet's normal logging remains active.");
+                this.emitModSummary(this.scarlet, end, hours, send, group, guild);
+            }
+            catch (RuntimeException ex)
+            {
+                LOG.warn("Local moderation summary did not complete ({})", ex.getClass().getSimpleName());
+                if (!this.summaryWorkerClosed && !Thread.currentThread().isInterrupted()
+                    && Objects.equals(group, this.scarlet.vrc.groupId) && Objects.equals(guild, this.guildSf))
+                    status.accept("The local summary could not finish. No further totals will be sent. Check Scarlet's local log; no VRChat history download was started.");
+            }
+        });
+    }
+
+    private void requireSummaryContext(String group, String guild)
+    {
+        if (Thread.currentThread().isInterrupted() || this.summaryWorkerClosed
+            || this.scarlet.vrc == null || group == null || group.trim().isEmpty()
+            || !Objects.equals(group, this.scarlet.vrc.groupId) || !Objects.equals(guild, this.guildSf))
+            throw new IllegalStateException("Local summary cancelled or its group/server context changed");
     }
     <MCR extends MessageCreateRequest<MCR> & FluentRestAction<Message, MCR>> Message emitModSummary(Scarlet scarlet, OffsetDateTime endOfDay, long hoursBack, Function<MessageEmbed, MCR> mca)
     {
+        return this.emitModSummary(scarlet, endOfDay, hoursBack, mca, scarlet.vrc.groupId, this.guildSf);
+    }
+
+    private <MCR extends MessageCreateRequest<MCR> & FluentRestAction<Message, MCR>> Message emitModSummary(
+        Scarlet scarlet, OffsetDateTime endOfDay, long hoursBack, Function<MessageEmbed, MCR> mca,
+        final String summaryGroup, final String summaryGuild)
+    {
+        if (hoursBack <= 0L) throw new IllegalArgumentException("hours-back must be greater than zero");
         OffsetDateTime startOfDay = endOfDay.minusHours(hoursBack);
+        this.requireSummaryContext(summaryGroup, summaryGuild);
+        final long privacyRevision = this.currentSummaryPrivacyRevision();
+        final Set<String> secretIds = new HashSet<>(Arrays.asList(scarlet.secretStaffList.getSecretStaffIds()));
+        Runnable checkPublication = () -> {
+            this.requireSummaryContext(summaryGroup, summaryGuild);
+            if (privacyRevision != this.currentSummaryPrivacyRevision()
+                || !secretIds.equals(new HashSet<>(Arrays.asList(scarlet.secretStaffList.getSecretStaffIds()))))
+                throw new IllegalStateException("Summary privacy settings changed; request a fresh summary");
+        };
+        Function<MessageEmbed, MCR> checkedSend = embed -> {
+            checkPublication.run();
+            return mca.apply(embed).setCheck(() -> {
+                checkPublication.run();
+                return true;
+            });
+        };
         
         String epochStart = Long.toUnsignedString(startOfDay.toEpochSecond()),
                epochEnd = Long.toUnsignedString(endOfDay.toEpochSecond());
         
-        List<GroupAuditLogEntry> entries = this.scarlet.vrc.auditQuery(startOfDay, endOfDay, null, "group.instance.kick,group.instance.warn,group.user.ban,group.invite.create", null);
+        ScarletLocalAuditHistory.Result local = ScarletLocalAuditHistory.read(scarlet.data.dir, summaryGroup,
+            startOfDay, endOfDay, new HashSet<>(Arrays.asList("group.instance.kick", "group.instance.warn",
+                "group.user.ban", "group.invite.create", "group.member.join", "group.member.leave", "group.member.remove")));
         
-        if (entries == null)
+        if (local.hasFatalProblems)
         {
-            return mca.apply(new EmbedBuilder()
-                    .setTitle("Moderation Summary")
-                    .setDescription("Spanning <t:"+epochStart+":f> through <t:"+epochEnd+":f>\nFailed to generate mod summary: could not query audit events")
+            LOG.warn("Local moderation summary withheld: unsafe/incomplete scan or conflicting privacy metadata after {} directory entries", local.filesScanned);
+            return checkedSend.apply(new EmbedBuilder()
+                    .setTitle("Moderation Summary (incomplete)")
+                    .setDescription("Spanning <t:"+epochStart+":f> through <t:"+epochEnd+":f>\nThe local scan could not finish safely, reached its resource limit, or found conflicting privacy metadata. No totals are shown. Check Scarlet's local logs for details. No VRChat history download was started.")
                     .setColor(GroupAuditTypeEx.MOD_SUMMARY.color)
                     .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
                     .setTimestamp(endOfDay)
                     .build()).complete();
         }
         
-        String[] exJoinEventIds = this.scarlet.data.customEvent_filter(GroupAuditTypeEx.STAFF_JOIN, startOfDay, endOfDay);
-
-        
         Map<String, List<GroupAuditType>> map = new HashMap<>();
         Map<String, String> displayNames = new HashMap<>();
         Map<String, int[]> staffJoins = new HashMap<>();
-        for (GroupAuditLogEntry entry : entries)
+        List<GroupAuditLogEntryUnknown> visibleEntries = new ArrayList<>();
+        for (ScarletData.AuditEntryMetadata entryMeta : local.records)
         {
-            ScarletData.AuditEntryMetadata entryMeta = this.scarlet.data.auditEntryMetadata(entry.getId());
-            String actorId = entryMeta != null && entryMeta.hasAuxActor() ? entryMeta.auxActorId : entry.getActorId();
-            String displayName = entryMeta != null && entryMeta.hasAuxActor() ? entryMeta.auxActorDisplayName : entry.getActorDisplayName();
+            if (!ScarletAuditPrivacy.visible(entryMeta, secretIds::contains, false))
+                continue;
+            GroupAuditLogEntryUnknown entry = entryMeta.entry;
+            visibleEntries.add(entry);
+            String actorId = entryMeta.hasAuxActor() ? entryMeta.auxActorId : entry.getActorId();
+            String displayName = entryMeta.hasAuxActor() ? entryMeta.auxActorDisplayName : entry.getActorDisplayName();
             map.computeIfAbsent(actorId, $ -> new ArrayList<>()).add(GroupAuditType.of(entry.getEventType()));
             if (displayName != null)
                 displayNames.put(actorId, displayName);
         }
-        if (exJoinEventIds != null)
+        long instanceJoins = 0L;
+        for (ScarletData.CustomEvent exJoinEvent : local.customEvents)
         {
-            for (String exJoinEventId : exJoinEventIds)
+            if (secretIds.contains(exJoinEvent.actorId)) continue;
+            if (GroupAuditTypeEx.USER_JOIN.id.equals(exJoinEvent.typeEx)) instanceJoins++;
+            if (GroupAuditTypeEx.STAFF_JOIN.id.equals(exJoinEvent.typeEx))
             {
-                ScarletData.CustomEvent exJoinEvent = this.scarlet.data.customEvent(exJoinEventId);
-                if (exJoinEvent != null)
-                {
-                    staffJoins.computeIfAbsent(exJoinEvent.actorId, $->new int[1])[0]++;
-                }
+                staffJoins.computeIfAbsent(exJoinEvent.actorId, $->new int[1])[0]++;
+                if (exJoinEvent.actorDisplayName != null)
+                    displayNames.putIfAbsent(exJoinEvent.actorId, exJoinEvent.actorDisplayName);
             }
         }
         
         
         StringBuilder sb = new StringBuilder();
         {
-            List<GroupAuditLogEntry> entries2 = this.scarlet.vrc.auditQuery(startOfDay, endOfDay, null, "group.member.join,group.member.leave,group.member.remove", null);
-            if (entries2 != null)
+            long gjoins = 0L,
+                 gleaves = 0L,
+                 gremoves = 0L,
+                 ginvites = 0L;
+            for (GroupAuditLogEntryUnknown entry : visibleEntries) switch (entry.getEventType())
             {
-                long gjoins = 0L,
-                     gleaves = 0L,
-                     gremoves = 0L,
-                     ginvites = 0L;
-                for (GroupAuditLogEntry entry : entries2) switch (entry.getEventType())
-                {
-                case "group.member.join": {
-                    gjoins++;
-                } break;
-                case "group.member.leave": {
-                    gleaves++;
-                } break;
-                case "group.member.remove": {
-                    gremoves++;
-                } break;
-                case "group.invite.create": {
-                    ginvites++;
-                } break;
-                }
-                sb.append("### "+Long.toUnsignedString(gjoins)+"/"+Long.toUnsignedString(gleaves)+"/"+Long.toUnsignedString(gremoves)+"/"+Long.toUnsignedString(ginvites)+" group joins/leaves/kicks/invites\n");
+            case "group.member.join": {
+                gjoins++;
+            } break;
+            case "group.member.leave": {
+                gleaves++;
+            } break;
+            case "group.member.remove": {
+                gremoves++;
+            } break;
+            case "group.invite.create": {
+                ginvites++;
+            } break;
             }
+            sb.append("### "+Long.toUnsignedString(gjoins)+"/"+Long.toUnsignedString(gleaves)+"/"+Long.toUnsignedString(gremoves)+"/"+Long.toUnsignedString(ginvites)+" group joins/leaves/kicks/invites\n");
         }
         {
-            String[] exUJoinEventIds = this.scarlet.data.customEvent_filter(GroupAuditTypeEx.USER_JOIN, startOfDay, endOfDay);
-            if (exUJoinEventIds != null)
-                sb.append("### "+Integer.toUnsignedString(exUJoinEventIds.length)+" instance joins\n");
+            sb.append("### "+Long.toUnsignedString(instanceJoins)+" recorded instance joins\n");
         }
         List<GroupAuditType> vtkEntries = map.get("vrc_admin");
         if (vtkEntries != null)
@@ -3836,6 +4670,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         int skippedForInactivity = 0;
         for (String staffUserId : this.scarlet.staffList.getStaffIds())
         {
+            if (secretIds.contains(staffUserId)) continue;
             List<GroupAuditType> staffEntries = map.get(staffUserId);
             int[] staffJoin = staffJoins.get(staffUserId);
             long warns = 0L,
@@ -3868,10 +4703,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 String displayName = displayNames.get(staffUserId);
                 if (displayName == null)
                 {
-                    User actor = this.scarlet.vrc.getUser(staffUserId);
-                    displayName = actor != null ? actor.getDisplayName() : staffUserId;
+                    displayName = this.scarlet.staffList.getStaffName(null, staffUserId);
                 }
-                sb.append(String.format("[%s](https://vrchat.com/home/user/%s): %d / %d / %d / %d / %d\n", displayName, staffUserId, warns, kicks, bans, invites, joins));
+                sb.append(String.format("[%s](https://vrchat.com/home/user/%s): %d / %d / %d / %d / %d\n",
+                    net.dv8tion.jda.api.utils.MarkdownSanitizer.escape(displayName == null ? staffUserId : displayName),
+                    staffUserId, warns, kicks, bans, invites, joins));
             }
         }
         if (onlyActivity)
@@ -3879,10 +4715,18 @@ public class ScarletDiscordJDA implements ScarletDiscord
             sb.append(String.format("(skipped %d for inactivity)\n", skippedForInactivity));
         }
         sb.append(String.format("Staff totals: %d / %d / %d / %d / %d\n", twarns, tkicks, tbans, tinvites, tjoins));
+        if (local.unreadableFileCount > 0)
+        {
+            sb.append(String.format("\n%d file%s could not be read and %s excluded from these totals. Check Scarlet's local logs for details.\n",
+                local.unreadableFileCount, local.unreadableFileCount == 1 ? "" : "s", local.unreadableFileCount == 1 ? "was" : "were"));
+        }
         
-        Message message = mca.apply(new EmbedBuilder()
-            .setTitle("Moderation Summary")
-            .setDescription("Spanning <t:"+epochStart+":f> through <t:"+epochEnd+":f>")
+        Message message = checkedSend.apply(new EmbedBuilder()
+            .setTitle(local.unreadableFileCount > 0 ? "Moderation Summary (partial saved local history)" : "Moderation Summary (saved local history)")
+            .setDescription("Spanning <t:"+epochStart+":f> through <t:"+epochEnd+":f>\nBased only on locally saved, visible records for this group. Missing, deleted, not-yet-processed or never-collected events are not included; coverage of the entire period cannot be guaranteed. No VRChat history download was used."
+                + (local.unreadableFileCount > 0 ? "\nFiles that could not be read are excluded from all moderation counts. See the final notice for their file count." : "")
+                + (local.hasUnprocessedEvents ? "\nSome saved events are still awaiting processing and are not counted yet." : "")
+                + (visibleEntries.isEmpty() && instanceJoins == 0L && staffJoins.isEmpty() ? "\nNo usable visible records were found for this period; zero totals do not prove that no activity occurred." : ""))
             .setColor(GroupAuditTypeEx.MOD_SUMMARY.color)
             .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
             .setTimestamp(endOfDay)
@@ -3890,7 +4734,13 @@ public class ScarletDiscordJDA implements ScarletDiscord
         List<String> pages = MiscUtils.paginateOnLines(sb, 4096);
         for (String page : pages)
         {
-            mca.apply(new EmbedBuilder().setDescription(page).build()).completeAfter(1000L, TimeUnit.MILLISECONDS);
+            try { Thread.sleep(1000L); }
+            catch (InterruptedException ex)
+            {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Local summary publication cancelled", ex);
+            }
+            checkedSend.apply(new EmbedBuilder().setDescription(page).build()).complete();
         }
         return message;
     }
@@ -3915,7 +4765,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         String epochStart = Long.toUnsignedString(startOfDay.toEpochSecond()),
                epochEnd = Long.toUnsignedString(endOfDay.toEpochSecond());
         
-        List<GroupAuditLogEntry> entries = this.scarlet.vrc.auditQuery(startOfDay, endOfDay, null, list.stream().collect(Collectors.joining(",")), null);
+        List<GroupAuditLogEntryUnknown> entries = this.scarlet.vrc.auditQuery(startOfDay, endOfDay, null, list.stream().collect(Collectors.joining(",")), null);
         
         if (entries == null)
             return null;
@@ -3932,7 +4782,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         {
             Map<String, List<ScarletData.AuditEntryMetadata>> map = new HashMap<>();
             Map<String, String> displayNames = new HashMap<>();
-            for (GroupAuditLogEntry entry : entries)
+            for (GroupAuditLogEntryUnknown entry : entries)
             {
                 if (this.scarlet.secretStaffList.isSecretStaffId(entry.getActorId()))
                     continue;
@@ -3997,11 +4847,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
             kickThreshold = this.scarlet.settings.heuristicKickCount.get();
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC),
                        before = now.minusDays(periodDays);
-        List<GroupAuditLogEntry> entries = this.scarlet.vrc.auditQuery(before, now, null, "group.instance.kick", target.getId());
+        List<GroupAuditLogEntryUnknown> entries = this.scarlet.vrc.auditQuery(before, now, null, "group.instance.kick", target.getId());
         if (entries == null)
             return;
         int kicks = 0;
-        for (GroupAuditLogEntry entry : entries)
+        for (GroupAuditLogEntryUnknown entry : entries)
         {
             ScarletData.AuditEntryMetadata entryMeta = this.scarlet.data.auditEntryMetadata(entry.getId());
             if (entryMeta == null || !entryMeta.entryRedacted)

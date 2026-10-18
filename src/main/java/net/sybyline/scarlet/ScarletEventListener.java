@@ -4,6 +4,7 @@ import java.awt.Color;
 import net.sybyline.scarlet.util.I18n;
 import java.io.File;
 import java.time.LocalDate;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -12,12 +13,14 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -35,6 +38,9 @@ import io.github.vrchatapi.model.User;
 
 import net.sybyline.scarlet.ext.AvatarBundleInfo;
 import net.sybyline.scarlet.ext.AvatarSearch;
+import net.sybyline.scarlet.ext.ManagedVrcClient;
+import net.sybyline.scarlet.ext.VrcLaunch;
+import net.sybyline.scarlet.util.Location;
 import net.sybyline.scarlet.util.CollectionMap;
 import net.sybyline.scarlet.util.MiscUtils;
 import net.sybyline.scarlet.util.Pacer;
@@ -50,6 +56,46 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     public ScarletEventListener(Scarlet scarlet)
     {
         this.scarlet = scarlet;
+        this.livePlayerListSession = new LivePlayerListSession(() -> this.scarlet.discord);
+        this.clientExitMonitor = new ScarletClientExitMonitor(
+            () -> this.scarlet.running && !this.scarlet.staffMode && !this.scarlet.trainingMode.get()
+                && this.scarlet.exitVrchatOnClosedEmptyInstance.get(),
+            () -> this.scarlet.vrc.groupId,
+            () -> this.scarlet.logs.clientExitTrackingHealthy(),
+            new ScarletClientExitMonitor.Processes()
+            {
+                public ManagedVrcClient.Client current() { return VrcLaunch.managedClient(); }
+                public ManagedVrcClient.CloseResult close(ManagedVrcClient.Client expected, java.util.function.BooleanSupplier valid)
+                { return VrcLaunch.closeManagedClient(expected, valid); }
+            },
+            location -> {
+                Location parsed = Location.of(location);
+                return this.scarlet.vrc.getInstance(parsed.world, parsed.instance);
+            },
+            result -> {
+                if (result == ManagedVrcClient.CloseResult.REQUESTED)
+                    Scarlet.LOG.info("Requested normal exit of Scarlet-launched VRChat client: monitored instance confirmed closed and no other players remain");
+                else
+                    Scarlet.LOG.warn("Automatic VRChat exit was not requested ({}); no force-close fallback will be used", result);
+            }, Instant::now, System::nanoTime);
+        this.idleInstanceClose = new ScarletIdleInstanceClose(
+            () -> this.scarlet.running && !this.scarlet.staffMode && !this.scarlet.trainingMode.get(),
+            () -> this.scarlet.autoCloseBotInstanceMinutes.get(),
+            () -> this.scarlet.vrc.groupId, () -> this.scarlet.vrc.currentUserId,
+            net.sybyline.scarlet.ext.ExtendedUserAgent::currentAuthenticationGeneration,
+            () -> this.scarlet.logs.clientExitTrackingHealthy(),
+            new ScarletIdleInstanceClose.Transport()
+            {
+                public com.google.gson.JsonElement read(String location, java.util.function.BooleanSupplier allowed)
+                { return ScarletEventListener.this.scarlet.vrc.readIdleInstance(location, allowed); }
+                public boolean softClose(String location, java.util.function.BooleanSupplier allowed)
+                { return ScarletEventListener.this.scarlet.vrc.softCloseIdleInstance(location, allowed); }
+            }, location -> {
+                Scarlet.LOG.info("Soft-closed idle instance after current-session and fresh server occupancy checks: {}", location);
+                try { this.scarlet.discord.emitExtendedInstanceEnforcement(this.scarlet, location,
+                    Location.of(location).world, "Soft-closed: idle, with fresh bot-only occupancy confirmation"); }
+                catch (Exception ex) { Scarlet.LOG.warn("Auto-close: failed to emit close notice", ex); }
+            }, Instant::now, System::nanoTime);
         
         this.clientUserDisplayName = null;
         this.clientUserId = null;
@@ -96,6 +142,95 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     }
 
     final Scarlet scarlet;
+    final LivePlayerListSession livePlayerListSession;
+    final ScarletClientExitMonitor clientExitMonitor;
+    final ScarletIdleInstanceClose idleInstanceClose;
+
+    /**
+     * A log-ordered, present-only snapshot independent of the UI and avatar providers.
+     * Catch-up can traverse several old worlds; only its final current world is published.
+     * All destination calls receive a copied snapshot before asynchronous delivery begins.
+     */
+    static final class LivePlayerListSession
+    {
+        final Supplier<ScarletDiscord> discord;
+        final Map<String, ScarletLivePlayerlist.PlayerSnapshot> players = new LinkedHashMap<>();
+        final Map<String, String> pendingAvatars = new LinkedHashMap<>();
+        final Set<String> knownNames = new HashSet<>();
+        String location;
+        boolean ready;
+
+        LivePlayerListSession(Supplier<ScarletDiscord> discord) { this.discord = discord; }
+
+        synchronized void reset()
+        {
+            if (this.ready && this.location != null && this.discord.get() != null)
+                this.discord.get().endLivePlayerList(this.location);
+            this.location = null;
+            this.ready = false;
+            this.players.clear();
+            this.pendingAvatars.clear();
+            this.knownNames.clear();
+        }
+
+        synchronized void joined(String location, boolean groupInstance, boolean preamble)
+        {
+            this.reset();
+            this.location = groupInstance ? location : null;
+            this.ready = !preamble;
+            this.publish();
+        }
+
+        synchronized void caughtUp()
+        {
+            this.ready = true;
+            this.publish();
+        }
+
+        synchronized void playerJoined(boolean preamble, LocalDateTime timestamp, String userId, String displayName)
+        {
+            if (this.location == null || userId == null || ScarletSimulation.isTrainingId(userId))
+                return;
+            this.knownNames.add(displayName);
+            this.players.put(userId, new ScarletLivePlayerlist.PlayerSnapshot(userId, displayName,
+                MiscUtils.odt2utc(timestamp), this.pendingAvatars.remove(displayName)));
+            if (!preamble) this.publish();
+        }
+
+        synchronized void playerLeft(boolean preamble, String userId)
+        {
+            this.players.remove(userId);
+            if (!preamble) this.publish();
+        }
+
+        synchronized void avatar(boolean preamble, String displayName, String avatarName)
+        {
+            if (this.location == null || displayName == null) return;
+            boolean present = false;
+            for (Map.Entry<String, ScarletLivePlayerlist.PlayerSnapshot> entry : this.players.entrySet())
+            {
+                ScarletLivePlayerlist.PlayerSnapshot player = entry.getValue();
+                if (!Objects.equals(player.displayName, displayName)) continue;
+                entry.setValue(new ScarletLivePlayerlist.PlayerSnapshot(player.userId, player.displayName,
+                    player.joinedAt, avatarName));
+                present = true;
+            }
+            // Switching lines sometimes precede the join. Never update a known departed player.
+            if (!present && !this.knownNames.contains(displayName))
+                this.pendingAvatars.put(displayName, avatarName);
+            if (!preamble && present) this.publish();
+        }
+
+        private void publish()
+        {
+            ScarletDiscord destination = this.discord.get();
+            // A caught-up log with no matching group instance is a known-empty observation,
+            // unlike startup before catch-up, when a saved message may still need recovery.
+            if (this.ready && destination != null)
+                destination.updateLivePlayerList(this.location,
+                    Collections.unmodifiableList(new ArrayList<>(this.players.values())));
+        }
+    }
 
     String clientUserDisplayName,
            clientUserId,
@@ -146,6 +281,10 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
 
     void settingsLoaded()
     {
+        this.scarlet.autoCloseBotInstanceMinutes.listeners.register("idle-instance-close", 0, true,
+            (previous, next, valid, source) -> { if (valid) this.idleInstanceClose.configurationChanged(); });
+        this.scarlet.trainingMode.listeners.register("idle-instance-close", 0, true,
+            (previous, next, valid, source) -> { if (valid) this.idleInstanceClose.configurationChanged(); });
         this.scarlet.exec.scheduleAtFixedRate(() ->
         {
             String voiceName = this.ttsVoiceName.get();
@@ -228,6 +367,9 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_init(File file)
     {
+        this.clientExitMonitor.newLog();
+        if (this.idleInstanceClose != null) this.idleInstanceClose.newLog();
+        this.livePlayerListSession.reset();
         this.isTailerLive = false;
         // New VRChat log file = new VRChat session: re-evaluate whether this
         // session was launched with API debug logging (see log_playerSwitchAvatar).
@@ -260,11 +402,19 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
         // was set, so those queued rows were dropped and players already in the instance
         // never appeared in the table until they produced a fresh live event.
         this.roster.flush(ex -> Scarlet.LOG.warn("Exception running pending update", ex));
+        this.livePlayerListSession.caughtUp();
+        if (file != null)
+        {
+            this.clientExitMonitor.caughtUp();
+            if (this.idleInstanceClose != null) this.idleInstanceClose.caughtUp();
+        }
     }
 
     @Override
     public void log_userAuthenticated(boolean preamble, LocalDateTime timestamp, String userDisplayName, String userId)
     {
+        this.clientExitMonitor.authenticated(userId);
+        if (this.idleInstanceClose != null) this.idleInstanceClose.authenticated(userId);
         this.clientUserDisplayName = userDisplayName;
         this.clientUserId = userId;
     }
@@ -272,6 +422,9 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_userQuit(boolean preamble, LocalDateTime timestamp, double lifetimeSeconds)
     {
+        this.clientExitMonitor.newLog();
+        if (this.idleInstanceClose != null) this.idleInstanceClose.newLog();
+        this.livePlayerListSession.reset();
         // The VRChat session ended: drop all per-instance avatar state so nothing
         // (catch-up sweeps, provider-list rescans) can look up avatars for people
         // from a session that no longer exists.
@@ -283,6 +436,8 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_userJoined(boolean preamble, LocalDateTime timestamp, String location)
     {
+        this.clientExitMonitor.joined(location, MiscUtils.odt2utc(timestamp).toInstant(), preamble);
+        if (this.idleInstanceClose != null) this.idleInstanceClose.joined(location, MiscUtils.odt2utc(timestamp).toInstant(), preamble);
         if (preamble)
         {
             this.scarlet.splash.splashText("Preamble...");
@@ -297,6 +452,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
         }
         this.clientLocation = location;
         this.isInGroupInstance = location.contains("~group("+this.scarlet.vrc.groupId+")");
+        this.livePlayerListSession.joined(location, this.isInGroupInstance, preamble);
         this.isSameAsPreviousInstance = Objects.equals(this.clientLocationPrev, location);
         // Always clear the instance table when joining any world — this covers both
         // moving to a new instance and rejoining the same one. The clientLocationPrev_userIds
@@ -318,6 +474,9 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_userLeft(boolean preamble, LocalDateTime timestamp)
     {
+        this.clientExitMonitor.left();
+        if (this.idleInstanceClose != null) this.idleInstanceClose.left();
+        this.livePlayerListSession.reset();
         this.clientLocationPrev_userIds.clear();
         this.clientLocationPrev_userIds.addAll(this.roster.presentUserIds());
         this.clientLocationPrev = this.clientLocation;
@@ -341,6 +500,9 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_playerJoined(boolean preamble, LocalDateTime timestamp, String userDisplayName, String userId)
     {
+        this.clientExitMonitor.playerJoined(userId);
+        if (this.idleInstanceClose != null) this.idleInstanceClose.playerJoined(userId);
+        this.livePlayerListSession.playerJoined(preamble, timestamp, userId, userDisplayName);
         String avatarDisplayName = this.clientLocation_userDisplayName2avatarDisplayName.get(userDisplayName);
         OffsetDateTime odt = MiscUtils.odt2utc(timestamp);
         this.clientLocation_userIdsJoinOrder.add(userId);
@@ -388,7 +550,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             {
                 this.scarlet.discord.emitExtendedStaffJoin(this.scarlet, timestamp, this.clientLocation, userId, userDisplayName);
                 this.scarlet.data.customEvent_new(GroupAuditTypeEx.STAFF_JOIN, odt, userId, userDisplayName, this.clientLocation, null);
-                this.scarlet.mobile.notifyStaffJoined(userDisplayName, userId, this.clientLocation);
+                this.scarlet.desktopNotifications.notifyStaffJoined(userDisplayName, userId, this.clientLocation);
             }
             if (avatarDisplayName != null)
             {
@@ -401,6 +563,9 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_playerLeft(boolean preamble, LocalDateTime timestamp, String userDisplayName, String userId)
     {
+        this.clientExitMonitor.playerLeft(userId);
+        if (this.idleInstanceClose != null) this.idleInstanceClose.playerLeft(userId);
+        this.livePlayerListSession.playerLeft(preamble, userId);
         this.clientLocation_userIdsJoinOrder.remove(userId);
         if (userId != null)
             this.clientLocation_leftUserIds.add(userId);
@@ -428,7 +593,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             {
                 this.scarlet.discord.emitExtendedStaffLeave(this.scarlet, timestamp, this.clientLocation, userId, userDisplayName);
                 this.scarlet.data.customEvent_new(GroupAuditTypeEx.STAFF_LEAVE, odt, userId, userDisplayName, this.clientLocation, null);
-                this.scarlet.mobile.notifyStaffLeft(userDisplayName, userId, this.clientLocation);
+                this.scarlet.desktopNotifications.notifyStaffLeft(userDisplayName, userId, this.clientLocation);
             }
         }
     }
@@ -447,6 +612,8 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
     @Override
     public void log_playerSwitchAvatar(boolean preamble, LocalDateTime timestamp, String userDisplayName, String avatarDisplayName)
     {
+        // The list needs only the observed name, not an avatar-provider query or USER_AVATAR logging.
+        this.livePlayerListSession.avatar(preamble, userDisplayName, avatarDisplayName);
         // Avatar statuses (bundle/perf info) are built from "[API] ... analysis/file_..."
         // log lines, which VRChat only writes when launched with the debug logging
         // launch options (Scarlet's own launcher passes them). If avatars keep switching
@@ -458,7 +625,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             this.warnedMissingApiLogging = true;
             Scarlet.LOG.warn("VRChat is not logging API requests this session; avatar statuses are using the API fallback "
                 + "(avatar-database name lookup), which can miss private or ambiguous avatars. For exact statuses, launch "
-                + "VRChat through KozyBlake/Scarlet or add these Steam launch options: "
+                + "VRChat through Hatson321/Scarlet Logger or add these Steam launch options: "
                 + VRCHAT_API_LOGGING_FLAGS + " " + VRCHAT_API_LOGGING_LEVELS);
             this.scarlet.splash.queueFeedbackPopup(null, 10_000L,
                 I18n.tr("adv.avatarFallbackTitle"),
@@ -625,7 +792,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
 
     void maybeHydrateAvatarInfo(String userDisplayName, String userId, String avatarDisplayName)
     {
-        if (!Features.AVATAR_SEARCH_ENABLED || userId == null || avatarDisplayName == null)
+        if (this.avatarSearchProviders().length == 0 || userId == null || avatarDisplayName == null)
             return;
         // Only players actually present in the current, live instance get looked up.
         if (!this.isPlayerPresent(userId))
@@ -642,6 +809,9 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             this.scarlet.ui.playerUpdate(!this.isTailerLive, userId, $ -> { if ($.avatarInfo == null) $.avatarInfoNote = I18n.tr("adv.lookingUpAvatar", userDisplayName); });
         this.scarlet.exec.schedule(() ->
         {
+            String[] selectedProviders = this.avatarSearchProviders();
+            if (selectedProviders.length == 0)
+                return; // consent/provider selection may have changed during the grace period
             if (!this.isPlayerPresent(userId))
                 return; // left during the grace period: stop tracking them
             if (this.clientLocation_userDisplayName2avatarBundleInfo.containsKey(userDisplayName))
@@ -662,7 +832,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             {
                 ModelFile imageFile = this.scarlet.vrc.getModelFile(imageFileId);
                 String imageAuthorId = imageFile == null ? null : imageFile.getOwnerId();
-                AvatarSearch.ByImage.vrcxSearchAllCachedByImage(imageFileId, imageAuthorId)
+                AvatarSearch.ByImage.vrcxSearchAllCachedByImage(selectedProviders, imageFileId, imageAuthorId)
                     .filter(Objects::nonNull)
                     .map(AvatarSearch.VrcxAvatar::id)
                     .filter(Objects::nonNull)
@@ -741,7 +911,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                 // saw worn (including private ones) and often carry performance
                 // ratings, so surface at least the rating, like the nameplate shows.
                 AvatarSearch.VrcxAvatar record = AvatarSearch
-                    .vrcxSearchAllCached(((ScarletDiscordJDA)this.scarlet.discord).getAvatarSearchProviders(), avatarDisplayName)
+                    .vrcxSearchAllCached(this.avatarSearchProviders(), avatarDisplayName)
                     .filter(Objects::nonNull)
                     .filter($ -> avatarDisplayName.equals($.name))
                     .filter($ -> $.performance != null && ($.performance.pcRating != null || $.performance.androidRating != null))
@@ -811,7 +981,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
         if (!Features.AVATAR_SEARCH_ENABLED)
             return new String[0];
         return AvatarSearch
-        .vrcxSearchAllCached(((ScarletDiscordJDA)this.scarlet.discord).getAvatarSearchProviders(), avatarDisplayName)
+        .vrcxSearchAllCached(this.avatarSearchProviders(), avatarDisplayName)
         .filter(Objects::nonNull)
         .filter($$ -> avatarDisplayName.equals($$.name))
         .map(AvatarSearch.VrcxAvatar::id)
@@ -819,6 +989,12 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
         .distinct()
         .toArray(String[]::new)
         ;
+    }
+
+    private String[] avatarSearchProviders()
+    {
+        return Features.AVATAR_SEARCH_ENABLED && this.scarlet.discord instanceof ScarletDiscordJDA
+            ? ((ScarletDiscordJDA)this.scarlet.discord).getAvatarSearchProviders() : new String[0];
     }
     void switchPlayerAvatar(boolean preamble, OffsetDateTime odt, LocalDateTime timestamp, String userDisplayName, String userId, String avatarDisplayName)
     {
@@ -832,15 +1008,16 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                           && avatarAdvisoryWanted
                           && this.announceWatchedAvatars.get();
         boolean discordWanted = this.scarlet.discord.isEmitting(GroupAuditTypeEx.USER_AVATAR);
-        boolean mobileWanted = Features.WATCHED_AVATARS_ENABLED
-                            && !preamble
-                            && this.scarlet.mobile.wants(ScarletMobile.NotificationType.WATCHED_AVATAR, ScarletMobile.Severity.CRITICAL);
-        if (!avatarAdvisoryWanted && !ttsWanted && !discordWanted && !mobileWanted)
+        boolean desktopNotificationWanted = Features.WATCHED_AVATARS_ENABLED
+                                         && !preamble
+                                         && this.scarlet.desktopNotifications.wants(ScarletDesktopNotifications.NotificationType.WATCHED_AVATAR);
+        if (!avatarAdvisoryWanted && !ttsWanted && !discordWanted && !desktopNotificationWanted)
             return;
 
         String[] potentialIds = null;
 
-        if (Features.AVATAR_SEARCH_ENABLED && this.attemptAvatarImageMatch.get())
+        String[] selectedProviders = this.avatarSearchProviders();
+        if (selectedProviders.length > 0 && this.attemptAvatarImageMatch.get())
         {
             User user = this.scarlet.vrc.getUser(userId);
             // Skip image matching for VRC+ users with a profile picture/icon
@@ -851,7 +1028,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             {
                 ModelFile uaFile = this.scarlet.vrc.getModelFile(uafid);
                 String uaAuthorId = uaFile == null ? null : uaFile.getOwnerId();
-                potentialIds = AvatarSearch.ByImage.vrcxSearchAllByImage(uafid, uaAuthorId).map(AvatarSearch.VrcxAvatar::id).toArray(String[]::new);
+                potentialIds = AvatarSearch.ByImage.vrcxSearchAllByImage(selectedProviders, uafid, uaAuthorId).map(AvatarSearch.VrcxAvatar::id).toArray(String[]::new);
             }
         }
         
@@ -888,10 +1065,10 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             this.scarlet.getTtsService().submit("wa-"+Long.toUnsignedString(System.nanoTime()), sb.toString());
         }
 
-        if (mobileWanted && watchedAvatar != null)
+        if (desktopNotificationWanted && watchedAvatar != null)
         {
             final String[] ids = potentialIds;
-            this.scarlet.mobile.notifyWatchedAvatar(userDisplayName, userId, avatarDisplayName, ids, watchedAvatar, this.clientLocation);
+            this.scarlet.desktopNotifications.notifyWatchedAvatar(userDisplayName, userId, avatarDisplayName, ids, watchedAvatar, this.clientLocation);
         }
 
         // ── Discord emission ───────────────────────────────────────────────────
@@ -955,7 +1132,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                 this.scarlet.getTtsService().submitMixedCharacterNameJoinAlert(
                     "mix-"+Long.toUnsignedString(System.nanoTime()));
             if (!preamble)
-                this.scarlet.mobile.notifyMixedCharacterName(userDisplayName, userId, this.clientLocation);
+                this.scarlet.desktopNotifications.notifyMixedCharacterName(userDisplayName, userId, this.clientLocation);
         }
         
         // check user
@@ -968,7 +1145,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             if (!preamble && watchedUserAdvisoryWanted && this.announceWatchedUsers.get() && watchedUser.message != null && !watchedUser.message.trim().isEmpty())
                 ttsParts.add(endDot(watchedUser.message));
             if (!preamble)
-                this.scarlet.mobile.notifyWatchedUserJoined(userDisplayName, userId, watchedUser, this.clientLocation);
+                this.scarlet.desktopNotifications.notifyWatchedUserJoined(userDisplayName, userId, watchedUser, this.clientLocation);
         }
         
         User user = this.scarlet.vrc.getUser(userId);
@@ -1008,7 +1185,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                     ttsParts.add(endDot(clause));
                 }
                 if (!preamble)
-                    this.scarlet.mobile.notifyWatchedGroupJoined(userDisplayName, userId, wg, this.clientLocation);
+                    this.scarlet.desktopNotifications.notifyWatchedGroupJoined(userDisplayName, userId, wg, this.clientLocation);
                 priority[0] = wg.priority;
             }
             if (this.advisoryShowWatchedGroups.get())
@@ -1026,8 +1203,8 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
         // check new user
         boolean newPlayerAdvisoryWanted = this.advisoryShowNewPlayers.get();
         boolean newPlayerTtsWanted = newPlayerAdvisoryWanted && this.announceNewPlayers.get();
-        boolean newPlayerMobileWanted = this.scarlet.mobile.wants(ScarletMobile.NotificationType.NEW_PLAYER, ScarletMobile.Severity.WATCH);
-        if (user != null && user.getDateJoined() != null && (newPlayerAdvisoryWanted || (!preamble && (newPlayerTtsWanted || newPlayerMobileWanted))))
+        boolean newPlayerDesktopNotificationWanted = this.scarlet.desktopNotifications.wants(ScarletDesktopNotifications.NotificationType.NEW_PLAYER);
+        if (user != null && user.getDateJoined() != null && (newPlayerAdvisoryWanted || (!preamble && (newPlayerTtsWanted || newPlayerDesktopNotificationWanted))))
         {
             long acctAgeDays = LocalDate.now().toEpochDay() - user.getDateJoined().toEpochDay();
             if (acctAgeDays <= this.announcePlayersNewerThan.get().longValue())
@@ -1036,8 +1213,8 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                     addAdvisory(advisories, I18n.tr("adv.newAccountDays", acctAgeDays, I18n.tr(acctAgeDays == 1L ? "adv.day" : "adv.days")));
                 if (!preamble && newPlayerTtsWanted)
                     ttsParts.add(I18n.tr("adv.ttsNewDays", acctAgeDays, I18n.tr(acctAgeDays == 1L ? "adv.day" : "adv.days")));
-                if (!preamble && newPlayerMobileWanted)
-                    this.scarlet.mobile.notifyNewPlayerJoined(userDisplayName, userId, acctAgeDays, this.clientLocation);
+                if (!preamble && newPlayerDesktopNotificationWanted)
+                    this.scarlet.desktopNotifications.notifyNewPlayerJoined(userDisplayName, userId, acctAgeDays, this.clientLocation);
             }
         }
 
@@ -1055,7 +1232,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                 {
                     if (pronounAdvisoryWanted && this.announceSuspiciousPronouns.get())
                         ttsParts.add(I18n.tr("adv.suspiciousPronounsLabel") + ": " + endDot(pronouns));
-                    this.scarlet.mobile.notifySuspiciousPronouns(userDisplayName, userId, pronouns, flagReason, this.clientLocation);
+                    this.scarlet.desktopNotifications.notifySuspiciousPronouns(userDisplayName, userId, pronouns, flagReason, this.clientLocation);
                 }
             }
         }
@@ -1177,7 +1354,7 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
                 }
                 OffsetDateTime odt = MiscUtils.odt2utc(timestamp);
                 this.scarlet.data.customEvent_new(GroupAuditTypeEx.VTK_START, odt, actorId, nullable_actorDisplayName, userId, targetDisplayName);
-                this.scarlet.mobile.notifyVoteToKick(targetDisplayName, userId, nullable_actorDisplayName, actorId, this.clientLocation);
+                this.scarlet.desktopNotifications.notifyVoteToKick(targetDisplayName, userId, nullable_actorDisplayName, actorId, this.clientLocation);
             }
         }
     }

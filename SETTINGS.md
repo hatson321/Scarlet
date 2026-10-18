@@ -1,12 +1,16 @@
 
 # Settings
 
-All settings files for KozyBlake/Scarlet can be found in the directory `%LOCALAPPDATA%\KozyBlake\Scarlet`.
-When upgrading from the upstream default folder, KozyBlake/Scarlet asks before copying existing data into the KozyBlake/Scarlet folder and leaves the legacy folder in place for rollback.
+All settings files for Hatson321/Scarlet Logger can be found in `%LOCALAPPDATA%\Hatson321\Scarlet Logger` on Windows or the corresponding XDG data directory on Linux.
+When upgrading from an earlier Scarlet data folder, Hatson321/Scarlet Logger asks before copying existing data into the maintained folder and leaves the earlier folder unchanged for rollback.
 Some internal volatile data can be found in the Windows registry.
 These registry entries exist because of the use of classes in the [`java.util.prefs`](https://docs.oracle.com/javase/8/docs/api/java/util/prefs/package-summary.html) package.
 
 If it isn't obvious, all nominally sensitive values listed are ficticious.
+
+The illustrated objects below use JSON with full-line `//` comments for explanation.
+Remove those comment lines before using a strict JSON editor or validator. Do not
+copy the sample account IDs, tokens, or paths into a live configuration.
 
 ## file `logs/scarlet_log_0000-00-00_00-00-00.txt`
 
@@ -72,7 +76,7 @@ Settings for the Discord bot account
     },
     
     // Map of auxiliary webhook internal ids to Discord webhook urls
-    "scarletAuxWh2webhookUrl ": {
+    "scarletAuxWh2webhookUrl": {
         "External Webhook One": "https://discord.com/api/webhooks/123456789123456789/IdzL4t3KvfQQ_CKYWd8Q2NM6Z7IaSOppoTTL4LS1Da_aMZ-eK1MbML-3ILnLjotWcDkp",
         "External Webhook Two": "https://discord.com/api/webhooks/123456789123456789/irNaGekj1zzccv__Uy4oC7d2GczNDbilnfBtcc5qL41bZ0Ikw1SXoYc7-bJST-yPdUQB"
     },
@@ -113,7 +117,7 @@ Settings for the Discord bot account
         "group.instance.kick": "FF7F00",
         "group.user.ban": "FF0000",
         "group.instance.create": "00FF00"
-    }
+    },
     
     // Array of queued actions
     "queuedActions": [
@@ -159,8 +163,7 @@ For slash command arguments, it is the full command name of its parent, as above
                 "<PermissionName>": false
             }
         }
-    },
-    ...
+    }
 }
 ```
 
@@ -267,7 +270,7 @@ Specification for scheduled events
                 }
             }
         }
-    }
+    },
     
     // An alternate Discord server snowflake id in which to post the Discord events
     "alternateGuildSf": "123456789123456789"
@@ -377,7 +380,7 @@ General settings for Scarlet:
     // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
     
     // Optional. The TOTP secret used to two-factor authenticate with VRChat
-    "vrc_secret": "abcd efgh ijkl mnop qrst uvxx yz23 4567",
+    "vrc_secret": "YOUR_TOTP_SECRET",
     // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
     
     // The VRChat groupId of the relevant group
@@ -398,10 +401,7 @@ General settings for Scarlet:
     "auto_invite_group_id": "grp_00000000-0000-0000-0000-000000000000",
     
     // Whether the generated report link appends a footer containing the Group ID, Audit ID, and Scarlet version
-    "vrchat_report_template_footer": "username@example.com",
-    
-    // Whether to announce watched groups with TTS
-    "tts_announce_watched_groups": true,
+    "vrchat_report_template_footer": true,
     
     // The voice in which TTS speaks.
     // On Linux, command-line engines are prefixed, e.g. "flite/slt", "pico2wave/en-US", "festival/default", or "espeak-ng/en".
@@ -455,7 +455,7 @@ General settings for Scarlet:
     "tts_announce_mixed_character_names": true,
 
     // Master switch for suspicious-pronoun detection. When false, Scarlet does not flag pronoun fields
-    // at all: no Advisory entry, no TTS announcement, no mobile alert, and no player-list highlight
+    // at all: no Advisory entry, no TTS announcement, and no player-list highlight
     "tts_flag_suspicious_pronouns": true,
 
     // Whether to speak a TTS line when a pronoun field is flagged
@@ -509,6 +509,14 @@ General settings for Scarlet:
     // Whether evidence submission is enabled
     "evidence_enabled": false,
     
+    // Explicit permission for identifying external avatar lookups (off until opted in).
+    // Enabling allows automatic avatar-change/hydration/rescan requests as well as
+    // manual searches; selected services receive lookup data plus the configured
+    // group ID and signed-in primary account ID in the User-Agent, with public support contacts.
+    // Older avatar_search_external_lookups_enabled permission is not reused:
+    // owners must opt in again after reviewing the updated provider notice.
+    "avatar_search_identified_lookups_enabled": false,
+
     // Whether to use custom VRCX-compatible avatar search providers
     "custom_avatar_search_providers_enabled": false,
     
@@ -535,7 +543,7 @@ DEPRECATED: this value is read, but is no longer written. This value now persist
 Saved cookies for authentication with VRChat, one cookie per line:
 ```txt
 auth=authcookie_00000000-0000-0000-0000-000000000000; expires=Sun, 31 Feb 2069 12:34:56 GMT; path=/; httponly
-twoFactorAuth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ2RjhPd3NDRVRvIiwibWFjQWRkcmVzcyI6IjU2OjUyOjQzOjY4OjYxOjc0IiwidGltZXN0YW1wIjozMTI5NTYxMjk2MDAwLCJ2ZXJzaW9uIjoxLCJpYXQiOjMxMjk1NjEyOTYsImV4cCI6MzEyOTU2MTI5NiwiYXVkIjoiVlJDaGF0VHdvRmFjdG9yQXV0aCIsImlzcyI6IlZSQ2hhdCJ9.fdmmkOhjs0fas7DjizP_374ZNRuUpZcTPLVnx2vbfAk; expires=Sun, 31 Feb 2069 12:34:56 GMT; path=/; httponly
+twoFactorAuth=REPLACE_WITH_YOUR_TWO_FACTOR_AUTH_COOKIE; expires=Sun, 31 Feb 2069 12:34:56 GMT; path=/; httponly
 ```
 
 ## file `data/global.json`
@@ -653,7 +661,7 @@ Group audit log event information:
     "auxActorDisplayName": "Somebody",
     
     // Audit entry id of the event that directly and necessarily caused this event
-    "parentEventId": "gaud_00000000-0000-0000-0000-000000000000",
+    "parentEventId": "gaud_00000000-0000-0000-0000-000000000000"
 }
 ```
 

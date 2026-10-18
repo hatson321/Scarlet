@@ -185,7 +185,7 @@ public class Swing
             if (!settingsFile.isFile())
                 return null;
             String json;
-            try (java.io.FileReader fr = new java.io.FileReader(settingsFile))
+            try (java.io.FileReader fr = new java.io.FileReader(settingsFile, java.nio.charset.StandardCharsets.UTF_8))
             {
                 StringBuilder sb = new StringBuilder();
                 char[] buf = new char[4096];
@@ -938,12 +938,10 @@ public class Swing
      * @return {@code baseFont} if adequate, otherwise the best fallback
      */
     /**
-     * Wraps a plain-text dialog message so it renders with Unicode font fallback,
-     * but only when needed. If the dialog font already covers every character the
-     * original {@code message} String is returned unchanged (so ordinary ASCII
-     * dialogs are untouched); otherwise a {@link JLabel} is returned with the text
-     * HTML-escaped (newlines become {@code <br>}) and a glyph-covering font applied,
-     * so display names with fancy glyphs don't show as missing-glyph squares.
+     * Keeps short plain-text messages unchanged when the dialog font covers every
+     * character. Short messages needing font fallback use an HTML-escaped label.
+     * Long messages use bounded, scrollable plain text with the appropriate font,
+     * so wrapping cannot push the dialog's button row out of view.
      */
     public static Object dialogMessage(String message)
     {
@@ -967,20 +965,24 @@ public class Swing
         }
         if (allCovered)
             return fitLongMessage(message, base);
+        Font fallback = fontForText(message, base);
+        Object longMessage = fitLongMessage(message, fallback);
+        if (longMessage instanceof JScrollPane)
+            return longMessage;
         String html = "<html>" + message
             .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace("\r\n", "<br>").replace("\n", "<br>") + "</html>";
         JLabel label = new JLabel(html);
-        label.setFont(fontForText(message, base));
+        label.setFont(fallback);
         return fitToScreen(label);
     }
 
     /**
      * Plain-text dialog content sizing. Short, few-line messages are returned unchanged (as a
      * String) so ordinary dialogs keep JOptionPane's native rendering. Long or many-line messages
-     * become a read-only, word-wrapped text area capped to the screen with a scrollbar via
-     * {@link #fitToScreen}, so the auto-generated button row can never be pushed off the bottom
-     * of the screen (the bug where a tall warning hid the Transfer/OK buttons).
+     * always use a bounded scrolling text area, leaving the JOptionPane button row outside
+     * the scrollable content. Wrapped text must be measured at its intended width: measuring
+     * a zero-width JTextArea can underestimate the height before the dialog is packed.
      */
     private static Object fitLongMessage(String message, Font base)
     {
@@ -992,6 +994,27 @@ public class Swing
                 lines++;
         if (message.length() < 600 && lines <= 12)
             return message;
+
+        Dimension available;
+        try
+        {
+            java.awt.GraphicsConfiguration configuration = java.awt.GraphicsEnvironment
+                .getLocalGraphicsEnvironment().getDefaultScreenDevice().getDefaultConfiguration();
+            java.awt.Rectangle bounds = configuration.getBounds();
+            java.awt.Insets insets = Toolkit.getDefaultToolkit().getScreenInsets(configuration);
+            available = new Dimension(Math.max(1, bounds.width - insets.left - insets.right),
+                Math.max(1, bounds.height - insets.top - insets.bottom));
+        }
+        catch (java.awt.HeadlessException unavailable)
+        {
+            available = new Dimension(1024, 768);
+        }
+        return scrollableMessage(message, base, available);
+    }
+
+    /** Screen dimensions are logical pixels; the remaining space is reserved for dialog chrome. */
+    static JScrollPane scrollableMessage(String message, Font base, Dimension availableScreen)
+    {
         javax.swing.JTextArea area = new javax.swing.JTextArea(message);
         area.setEditable(false);
         area.setLineWrap(true);
@@ -1001,7 +1024,27 @@ public class Swing
         area.setColumns(52);
         if (base != null)
             area.setFont(base);
-        return fitToScreen(area);
+        area.setCaretPosition(0);
+
+        JScrollPane scroll = new JScrollPane(area,
+            ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+            ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        scroll.setBorder(null);
+        scroll.setViewportBorder(null);
+        scroll.setOpaque(false);
+        scroll.getViewport().setOpaque(false);
+        scroll.getVerticalScrollBar().setUnitIncrement(Math.max(1, area.getFontMetrics(area.getFont()).getHeight()));
+
+        int maxWidth = Math.max(1, (int) (availableScreen.width * 0.80));
+        int maxHeight = Math.max(1, (int) (availableScreen.height * 0.65));
+        int scrollbarWidth = scroll.getVerticalScrollBar().getPreferredSize().width;
+        int width = Math.min(maxWidth, area.getPreferredSize().width + scrollbarWidth);
+        // Reserve scrollbar space before measuring; when it appears, wrapping must not
+        // grow the content beyond a bare component's previously measured preferred size.
+        area.setSize(Math.max(1, width - scrollbarWidth), maxHeight);
+        int height = Math.min(maxHeight, Math.max(1, area.getPreferredSize().height));
+        scroll.setPreferredSize(new Dimension(width, height));
+        return scroll;
     }
 
     public static Font fontForText(String text, Font baseFont)

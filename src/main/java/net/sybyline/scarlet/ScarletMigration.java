@@ -11,7 +11,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.FileVisitResult;
+import java.nio.file.LinkOption;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -25,6 +31,7 @@ import java.util.zip.ZipOutputStream;
 import java.io.OutputStream;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.Arrays;
@@ -32,6 +39,21 @@ import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Map;
+import java.security.MessageDigest;
+import java.util.zip.CRC32;
+import java.util.zip.ZipFile;
+
+import net.sybyline.scarlet.util.FileBackups;
+import net.sybyline.scarlet.util.ProcLock;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.GsonBuilder;
 
 import javax.crypto.AEADBadTagException;
 import javax.crypto.Cipher;
@@ -42,6 +64,11 @@ import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
 
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -81,6 +108,8 @@ public final class ScarletMigration
     static final String PREFS_ENTRY = "preferences.xml",
                         DATA_PREFIX = "data/",
                         GLOBAL_PREFS_KEY = "global-prefs.key",
+                        SECURE_PREFS_FILE = "secure-prefs.dat",
+                        SECURE_PREFS_BACKUP_FILE = "secure-prefs.dat.bak",
                         LEGACY_COOKIE_FILE = "store.bin",
                         MANIFEST_ENTRY = "scarlet-migration.txt";
     static final DateTimeFormatter BACKUP_TIMESTAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
@@ -178,60 +207,383 @@ public final class ScarletMigration
      */
     public static String exportBundle(File out, char[] pin, Progress progress) throws IOException
     {
-        File outAbs = out.getAbsoluteFile();
-        File parent = outAbs.getParentFile();
-        if (parent != null && !parent.isDirectory())
-            Files.createDirectories(parent.toPath());
-
-        boolean encrypt = pin != null && pin.length > 0;
-        try
+        try (ExportSession session = openExportSession())
         {
-            if (!encrypt)
-            {
-                String summary = writeBundle(outAbs, progress);
-                restrictToOwner(outAbs.toPath());
-                return summary;
-            }
-
-            File tempDir = parent != null ? parent : outAbs.getParentFile();
-            File temp = File.createTempFile("scarlet-bundle", ".tmp", tempDir);
-            restrictToOwner(temp.toPath());
-            try
-            {
-                String summary = writeBundle(temp, progress);
-                encryptFile(temp, outAbs, pin, progress);
-                restrictToOwner(outAbs.toPath());
-                return summary;
-            }
-            finally
-            {
-                try { Files.deleteIfExists(temp.toPath()); } catch (IOException ignored) { }
-            }
-        }
-        catch (IOException ex)
-        {
-            // Never leave a partial or cancelled bundle behind.
-            try { Files.deleteIfExists(outAbs.toPath()); } catch (IOException ignored) { }
-            throw ex;
+            return session.exportBundle(out, pin, progress);
         }
     }
 
-    private static String writeBundle(File outAbs, Progress progress) throws IOException
+    /** Exclusive for the complete offline cleanup/export/verification/optional-wipe workflow. */
+    public static ExportSession openExportSession() throws IOException
     {
-        File dataDir = Scarlet.dir;
-        Preferences prefs = Preferences.userNodeForPackage(Scarlet.class);
+        return openExportSession(Scarlet.dir, ProcLock.preferencesLockDirectory(),
+            ScarletMigration::snapshotPreferences, ScarletMigration::wipeLocalInstall);
+    }
 
-        ByteArrayOutputStream prefsXml = new ByteArrayOutputStream();
+    @FunctionalInterface interface PreferenceExport { byte[] snapshot() throws Exception; }
+    @FunctionalInterface interface WipeOperation { String wipe() throws IOException; }
+
+    /** Synthetic callers inject every preference and wipe operation; no real user state is touched. */
+    static ExportSession openExportSession(File dataDir, File preferenceLockDirectory,
+            PreferenceExport preferences, WipeOperation wipe) throws IOException
+    {
+        File canonical = dataDir.getCanonicalFile();
+        ProcLock.Lease data = ProcLock.acquireDataDirectory(canonical);
         try
         {
-            prefs.flush();
-            prefs.exportSubtree(prefsXml);
+            ProcLock.Lease prefs = ProcLock.acquirePreferences(preferenceLockDirectory, false);
+            return new ExportSession(canonical, data, prefs, preferences, wipe);
         }
-        catch (Exception ex)
+        catch (IOException | RuntimeException failure)
         {
-            throw new IOException("Failed to export Java Preferences subtree " + prefs.absolutePath(), ex);
+            try { data.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
+    public static final class ExportSession implements AutoCloseable
+    {
+        private final File dataDir;
+        private final ProcLock.Lease dataLease, preferenceLease;
+        private final PreferenceExport preferences;
+        private final WipeOperation wipe;
+        private boolean closed;
+        private File published, verified;
+        private byte[] publishedDigest, verifiedDigest;
+
+        private ExportSession(File dataDir, ProcLock.Lease dataLease, ProcLock.Lease preferenceLease,
+                PreferenceExport preferences, WipeOperation wipe)
+        {
+            this.dataDir = dataDir; this.dataLease = dataLease; this.preferenceLease = preferenceLease;
+            this.preferences = preferences; this.wipe = wipe;
         }
 
+        public File dataDirectory() { return this.dataDir; }
+
+        public synchronized String exportBundle(File out, char[] pin, Progress progress) throws IOException
+        {
+            return this.exportBundle(out, pin, progress, true);
+        }
+
+        /** Claims a new destination without replacing an existing or concurrently created file. */
+        public synchronized String exportNewBundle(File out, char[] pin, Progress progress) throws IOException
+        {
+            return this.exportBundle(out, pin, progress, false);
+        }
+
+        private String exportBundle(File out, char[] pin, Progress progress, boolean replaceExisting) throws IOException
+        {
+            this.requireOpen();
+            this.published = this.verified = null;
+            this.publishedDigest = this.verifiedDigest = null;
+            File destination = checkedExportDestination(out, this.dataDir);
+            ExportWriteResult result = exportBundleAtomic(destination, pin, progress, this.dataDir, this.preferences, replaceExisting);
+            this.publishedDigest = result.digest;
+            this.published = destination;
+            return result.summary;
+        }
+
+        public synchronized void verifyBundle(File out, char[] pin, Progress progress) throws IOException
+        {
+            this.requireOpen();
+            this.verified = null; this.verifiedDigest = null;
+            File candidate = checkedExportDestination(out, this.dataDir);
+            if (!candidate.equals(this.published) || !MessageDigest.isEqual(this.publishedDigest, fileDigest(candidate)))
+                throw new IOException("Export changed or was not created by this session; local deletion is disabled.");
+            verifyBundleContents(candidate, pin, progress);
+            byte[] after = fileDigest(candidate);
+            if (!MessageDigest.isEqual(this.publishedDigest, after))
+                throw new IOException("Export changed during verification; local deletion is disabled.");
+            this.verified = candidate; this.verifiedDigest = after;
+        }
+
+        public synchronized String wipeLocalInstall() throws IOException
+        {
+            this.requireOpen();
+            if (this.verified == null || !MessageDigest.isEqual(this.verifiedDigest, fileDigest(this.verified)))
+                throw new IOException("A complete unchanged export must be verified before local deletion.");
+            // Verification authorizes a single attempt, not an indefinitely reusable deletion capability.
+            this.verified = null; this.verifiedDigest = null;
+            return this.wipe.wipe();
+        }
+
+        private void requireOpen() throws IOException
+        {
+            if (this.closed) throw new IOException("Offline export session is closed");
+        }
+
+        @Override public synchronized void close() throws IOException
+        {
+            if (this.closed) return;
+            this.closed = true;
+            try { this.preferenceLease.close(); }
+            finally { this.dataLease.close(); }
+        }
+    }
+
+    private static byte[] snapshotPreferences() throws IOException
+    {
+        Preferences prefs = Preferences.userNodeForPackage(Scarlet.class);
+        ByteArrayOutputStream xml = new ByteArrayOutputStream();
+        try { prefs.sync(); prefs.exportSubtree(xml); }
+        catch (Exception ex) { throw new IOException("Failed to export the Scarlet Preferences subtree", ex); }
+        return xml.toByteArray();
+    }
+
+    private static File checkedExportDestination(File out, File dataDir) throws IOException
+    {
+        if (out == null || dataDir == null) throw new IOException("Export destination or data directory is unavailable");
+        if (Files.isSymbolicLink(out.toPath())) throw new IOException("Export destination must not be a symbolic link");
+        File target = out.getCanonicalFile(), root = dataDir.getCanonicalFile();
+        if (target.toPath().startsWith(root.toPath()))
+            throw new IOException("Choose an export destination outside the Scarlet data directory");
+        if (target.exists() && !target.isFile()) throw new IOException("Export destination is not a regular file");
+        return target;
+    }
+
+    /** Caller already holds both exclusive leases; used also by the pre-import safety backup. */
+    private static final class ExportWriteResult
+    {
+        final String summary;
+        final byte[] digest;
+        ExportWriteResult(String summary, byte[] digest) { this.summary = summary; this.digest = digest; }
+    }
+
+    private static ExportWriteResult exportBundleAtomic(File out, char[] pin, Progress progress, File dataDir,
+            PreferenceExport preferences) throws IOException
+    {
+        return exportBundleAtomic(out, pin, progress, dataDir, preferences, true);
+    }
+
+    private static ExportWriteResult exportBundleAtomic(File out, char[] pin, Progress progress, File dataDir,
+            PreferenceExport preferences, boolean replaceExisting) throws IOException
+    {
+        return exportBundleAtomic(out, pin, progress, dataDir, preferences, replaceExisting, false);
+    }
+
+    private static ExportWriteResult exportBundleAtomic(File out, char[] pin, Progress progress, File dataDir,
+            PreferenceExport preferences, boolean replaceExisting, boolean allowMissingDataDirectory) throws IOException
+    {
+        File destination = checkedExportDestination(out, dataDir);
+        if (!dataDir.isDirectory() && (!allowMissingDataDirectory || dataDir.exists()))
+            throw new IOException("Scarlet data directory does not exist or is not a directory");
+        Files.createDirectories(destination.toPath().getParent());
+        Path encrypted = null;
+        boolean published = false;
+        ScarletPrivateFiles.Workspace workspace = ScarletPrivateFiles.workspace(".scarlet-export-");
+        try
+        {
+            Path plain = ScarletPrivateFiles.file(workspace.path, "plain-", ".zip.tmp");
+            byte[] xml;
+            try { xml = normalizeScarletOnlyPrefs(preferences.snapshot()); }
+            catch (Exception ex) { throw new IOException("Could not capture validated Scarlet Preferences", ex); }
+            String summary = writeBundle(plain.toFile(), progress, dataDir, xml);
+            Path ready = plain;
+            if (pin != null && pin.length > 0)
+            {
+                encrypted = Files.createTempFile(destination.toPath().getParent(), ".scarlet-export-", ".enc.tmp");
+                encryptFile(plain.toFile(), encrypted.toFile(), pin, progress);
+                ready = encrypted;
+                // Do not publish an encrypted export while leaving its unencrypted staging copy.
+                Files.delete(plain);
+            }
+            if (progress != null && !progress.progress("Publishing", destination.getName(), 0, 0, 0, 0))
+                throw new IOException(CANCELLED_MESSAGE);
+            final Path complete = ready;
+            byte[] digest = fileDigest(complete.toFile());
+            if (replaceExisting)
+            {
+                // The existing destination is replaced only after the complete ZIP/GCM output exists.
+                // A failed callback, sync or atomic replacement leaves its previous bytes intact.
+                if (pin != null && pin.length > 0)
+                    FileBackups.writeBytes(destination, 0, output -> Files.copy(complete, output));
+                else publishPrivateReplacement(complete, destination.toPath());
+            }
+            else
+            {
+                publishNewExport(complete, destination.toPath(), pin == null || pin.length == 0);
+            }
+            published = true;
+            return new ExportWriteResult(summary, digest);
+        }
+        finally
+        {
+            IOException cleanupFailure = null;
+            try { workspace.close(); } catch (IOException ex) { cleanupFailure = ex; }
+            try { if (encrypted != null) Files.deleteIfExists(encrypted); }
+            catch (IOException ex) { if (cleanupFailure == null) cleanupFailure = ex; else cleanupFailure.addSuppressed(ex); }
+            if (cleanupFailure != null)
+            {
+                if (!published) throw cleanupFailure;
+                // Publication has succeeded; cleanup must not misreport it as a failed replacement.
+                System.err.println("Export completed, but a temporary export file could not be cleaned up: " + cleanupFailure);
+            }
+        }
+    }
+
+    static void publishNewExport(Path complete, Path destination) throws IOException
+    {
+        publishNewExport(complete, destination, true);
+    }
+
+    private static void publishPrivateReplacement(Path complete, Path destination) throws IOException
+    {
+        Files.createDirectories(destination.getParent());
+        // The adjacent workspace preserves same-filesystem atomic publication, including when
+        // the private OS staging directory and the selected destination are on different drives.
+        ScarletPrivateFiles.Workspace publication = ScarletPrivateFiles.directory(destination.getParent(), ".scarlet-publish-");
+        boolean published = false;
+        try
+        {
+            Path staged = ScarletPrivateFiles.file(publication.path, "plain-", ".tmp");
+            try (FileOutputStream output = new FileOutputStream(staged.toFile()))
+            { Files.copy(complete, output); output.flush(); output.getFD().sync(); }
+            Files.move(staged, destination, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            published = true;
+            // Match ordinary atomic saves: persist the destination rename where directories
+            // support fsync. Windows does not expose directory fsync through this API.
+            try (FileChannel directory = FileChannel.open(destination.getParent(), StandardOpenOption.READ))
+            { directory.force(true); }
+            catch (Exception unsupportedDirectorySync) { }
+        }
+        finally
+        {
+            try { publication.close(); }
+            catch (IOException cleanup)
+            {
+                if (!published) throw cleanup;
+                System.err.println("Private file publication completed, but its empty temporary directory could not be removed: " + cleanup);
+            }
+        }
+    }
+
+    private static void publishNewExport(Path complete, Path destination, boolean privateContent) throws IOException
+    {
+        if (!Files.isRegularFile(complete)) throw new IOException("Complete export staging file is unavailable");
+        // CREATE_NEW is atomic even on removable filesystems without links/atomic rename.
+        // The new file is visible while copied: callers must wait for successful verification.
+        boolean claimed = false;
+        java.nio.file.attribute.FileAttribute<?>[] attributes = privateContent
+            ? ScarletPrivateFiles.fileAttributes(complete, destination.getParent()) : new java.nio.file.attribute.FileAttribute<?>[0];
+        try (FileChannel output = FileChannel.open(destination,
+            EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), attributes))
+        {
+            claimed = true;
+            if (privateContent) ScarletPrivateFiles.protect(destination);
+            try (InputStream input = Files.newInputStream(complete))
+            {
+                byte[] bytes = new byte[8192];
+                for (int count; (count = input.read(bytes)) >= 0;)
+                {
+                    ByteBuffer buffer = ByteBuffer.wrap(bytes, 0, count);
+                    while (buffer.hasRemaining()) output.write(buffer);
+                }
+            }
+            output.force(true);
+        }
+        catch (IOException failure)
+        {
+            if (!claimed) throw failure;
+            // Portable Java cannot prove path ownership after concurrent replacement on every
+            // supported filesystem. Never risk deleting another process's replacement file.
+            throw new IOException("Export publication failed. A partial output may remain at " + destination
+                + "; do not use it. Local data was not removed. Choose a different new filename to retry.", failure);
+        }
+    }
+
+    private static byte[] fileDigest(File file) throws IOException
+    {
+        try
+        {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream input = new BufferedInputStream(new FileInputStream(file)))
+            {
+                byte[] buffer = new byte[8192];
+                for (int n; (n = input.read(buffer)) >= 0;) if (n > 0) digest.update(buffer, 0, n);
+            }
+            return digest.digest();
+        }
+        catch (GeneralSecurityException ex) { throw new IOException("SHA-256 unavailable", ex); }
+    }
+
+    static void verifyBundleContents(File bundle, char[] pin, Progress progress) throws IOException
+    {
+        try (PreparedBundle prepared = prepareBundle(bundle, pin, progress))
+        {
+            boolean preferencesSeen = false, manifestSeen = false, credentialKeySeen = false;
+            long total = 0L;
+            Set<String> names = new HashSet<>();
+            try (ZipFile zip = new ZipFile(prepared.file))
+            {
+                if (zip.size() == 0 || zip.size() > MAX_ENTRIES) throw new IOException("Invalid export entry count");
+                java.util.Enumeration<? extends ZipEntry> entries = zip.entries();
+                while (entries.hasMoreElements())
+                {
+                    ZipEntry entry = entries.nextElement();
+                    String raw = entry.getName();
+                    String name = normalizeEntryName(entry.isDirectory() && raw.endsWith("/") ? raw.substring(0, raw.length() - 1) : raw);
+                    if (name == null || !names.add(name.toLowerCase(Locale.ROOT))) throw new IOException("Unsafe or duplicate export entry");
+                    if (progress != null && !progress.progress("Verifying", name, names.size() - 1, zip.size(), total, 0))
+                        throw new IOException(CANCELLED_MESSAGE);
+                    CRC32 crc = new CRC32(); long size = 0L;
+                    ByteArrayOutputStream xml = PREFS_ENTRY.equals(name) ? new ByteArrayOutputStream() : null;
+                    try (InputStream input = zip.getInputStream(entry))
+                    {
+                        byte[] buffer = new byte[8192];
+                        for (int n; (n = input.read(buffer)) >= 0;)
+                        {
+                            if (n == 0) continue;
+                            size += n; total += n;
+                            if (size > (xml != null ? MAX_PREFS_XML_BYTES : MAX_ENTRY_BYTES) || total > MAX_TOTAL_BYTES)
+                                throw new IOException("Export exceeds verification size limits");
+                            crc.update(buffer, 0, n);
+                            if (xml != null) xml.write(buffer, 0, n);
+                            if (progress != null && !progress.progress("Verifying", name, names.size() - 1, zip.size(), total, 0))
+                                throw new IOException(CANCELLED_MESSAGE);
+                        }
+                    }
+                    if (entry.getCrc() != crc.getValue() || entry.getSize() != size)
+                        throw new IOException("Export failed complete ZIP CRC/size verification");
+                    if (xml != null) { normalizeScarletOnlyPrefs(xml.toByteArray()); preferencesSeen = true; }
+                    if (MANIFEST_ENTRY.equals(name)) manifestSeen = true;
+                    if ((DATA_PREFIX + GLOBAL_PREFS_KEY).equals(name) && size > 0) credentialKeySeen = true;
+                }
+            }
+            if (!preferencesSeen || !manifestSeen || !credentialKeySeen)
+                throw new IOException("Export is missing its required preferences, manifest, or nonempty credential key; local deletion is disabled.");
+        }
+    }
+
+    static final class PreparedBundle implements AutoCloseable
+    {
+        final File file;
+        private final ScarletPrivateFiles.Workspace workspace;
+        private PreparedBundle(File file, ScarletPrivateFiles.Workspace workspace)
+        { this.file = file; this.workspace = workspace; }
+        @Override public void close() throws IOException { if (this.workspace != null) this.workspace.close(); }
+    }
+
+    /** Decrypted credentials never enter the directory containing a shared encrypted bundle. */
+    static PreparedBundle prepareBundle(File bundle, char[] pin, Progress progress) throws IOException
+    {
+        if (!isEncryptedBundle(bundle)) return new PreparedBundle(bundle, null);
+        if (pin == null || pin.length == 0) throw new IOException("The bundle PIN is required for decryption");
+        ScarletPrivateFiles.Workspace workspace = ScarletPrivateFiles.workspace(".scarlet-decrypt-");
+        try
+        {
+            Path plain = ScarletPrivateFiles.file(workspace.path, "plain-", ".zip.tmp");
+            decryptFile(bundle, plain.toFile(), pin, progress);
+            return new PreparedBundle(plain.toFile(), workspace);
+        }
+        catch (IOException | RuntimeException | Error failure)
+        {
+            try { workspace.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
+    private static String writeBundle(File outAbs, Progress progress, File dataDir, byte[] prefsXml) throws IOException
+    {
         // Pre-scan the data folder so progress is reported against real totals
         // (file counts and bytes), Windows-Explorer style.
         File dataRoot = null;
@@ -249,12 +601,12 @@ public final class ScarletMigration
         try (ZipOutputStream zip = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(outAbs))))
         {
             zip.putNextEntry(new ZipEntry(PREFS_ENTRY));
-            zip.write(prefsXml.toByteArray());
+            zip.write(prefsXml);
             zip.closeEntry();
 
             StringBuilder manifest = new StringBuilder();
             manifest.append("Scarlet migration bundle\n")
-                    .append("preferences node: ").append(prefs.absolutePath()).append('\n')
+                    .append("preferences node: /net/sybyline/scarlet\n")
                     .append("data folder: ").append(dataDir == null ? "(none)" : dataDir.getAbsolutePath()).append('\n')
                     .append("exported: ").append(Instant.now()).append('\n');
             zip.putNextEntry(new ZipEntry(MANIFEST_ENTRY));
@@ -266,7 +618,6 @@ public final class ScarletMigration
                 zipDir(zip, dataRoot, dataRoot, DATA_PREFIX, skip, count, state);
             }
         }
-        LOG.info("Exported migration bundle to {} ({} data files + credentials from {})", outAbs, count[0], prefs.absolutePath());
         return count[0] + " data file(s) and your encrypted credentials";
     }
 
@@ -288,6 +639,16 @@ public final class ScarletMigration
 
     public static ImportResult importBundle(File in, ImportOptions options, char[] pin) throws IOException
     {
+        try (net.sybyline.scarlet.util.ProcLock.Lease ignored = net.sybyline.scarlet.util.ProcLock.acquireDataDirectory(Scarlet.dir);
+             net.sybyline.scarlet.util.ProcLock.Lease preferences = net.sybyline.scarlet.util.ProcLock.acquirePreferences(
+                 net.sybyline.scarlet.util.ProcLock.preferencesLockDirectory(), false))
+        {
+            return importBundleOffline(in, options, pin);
+        }
+    }
+
+    private static ImportResult importBundleOffline(File in, ImportOptions options, char[] pin) throws IOException
+    {
         ImportOptions importOptions = options == null ? ImportOptions.all() : options;
         if (!importOptions.importDataFiles && !importOptions.importCredentials)
             throw new IOException("Nothing selected to import.");
@@ -296,30 +657,12 @@ public final class ScarletMigration
 
         // A PIN-protected bundle is decrypted (and authenticated) to a temp file first, so a
         // wrong PIN or tampered bundle fails before we create a backup or touch local data.
-        File working = in;
-        File decryptedTemp = null;
-        if (isEncryptedBundle(in))
-        {
-            if (pin == null || pin.length == 0)
-                throw new IOException("This bundle is PIN-protected. A PIN is required to import it.");
-            File tempDir = in.getAbsoluteFile().getParentFile();
-            decryptedTemp = File.createTempFile("scarlet-import", ".tmp", tempDir);
-            restrictToOwner(decryptedTemp.toPath());
-            decryptFile(in, decryptedTemp, pin);
-            working = decryptedTemp;
-        }
-
-        try
+        try (PreparedBundle prepared = prepareBundle(in, pin, null))
         {
             File backup = createPreImportBackup();
             try
             {
-                String summary = importBundleContents(working, importOptions);
-                // Optional, additive post-step: if the user chose not to carry channels over
-                // (e.g. importing into a different Discord server), blank the imported channel
-                // routing. Default keepChannels==true skips this, so legacy imports are unchanged.
-                if (importOptions.importDataFiles && !importOptions.keepChannels)
-                    scrubImportedDiscordChannels();
+                String summary = importBundleContents(prepared.file, importOptions);
                 return new ImportResult(summary, backup);
             }
             catch (IOException ex)
@@ -333,11 +676,6 @@ public final class ScarletMigration
                     + backup.getAbsolutePath(), ex);
             }
         }
-        finally
-        {
-            if (decryptedTemp != null)
-                try { Files.deleteIfExists(decryptedTemp.toPath()); } catch (IOException ignored) { }
-        }
     }
 
     /**
@@ -348,196 +686,490 @@ public final class ScarletMigration
      */
     public static String wipeLocalInstall() throws IOException
     {
+        // Validate before changing Preferences, not after credentials have already been removed.
+        Path dataRoot = checkedWipeRoot(Scarlet.dir);
         int[] removed = { 0 };
+        int preferenceNodesRemoved = 0;
+        List<String> failures = new java.util.ArrayList<>();
+        Preferences root = Preferences.userRoot();
+        for (String path : preferenceNodePathsForWipe())
+        {
+            try
+            {
+                if (root.nodeExists(path))
+                {
+                    root.node(path).removeNode();
+                    preferenceNodesRemoved++;
+                }
+            }
+            catch (Exception ex)
+            {
+                failures.add("could not remove Preferences node " + path + ": " + ex.getMessage());
+                LOG.warn("Could not clear Scarlet Java Preferences node {} during wipe", path, ex);
+            }
+        }
         try
         {
-            Preferences node = Preferences.userNodeForPackage(Scarlet.class);
-            node.removeNode();
-            Preferences.userRoot().flush();
+            root.flush();
+            for (String path : preferenceNodePathsForWipe())
+                if (root.nodeExists(path))
+                    failures.add("Preferences node still exists after wipe: " + path);
         }
         catch (Exception ex)
         {
-            LOG.warn("Could not clear Scarlet Java Preferences during wipe", ex);
+            failures.add("could not flush or verify Java Preferences: " + ex.getMessage());
+            LOG.warn("Could not flush or verify Scarlet Java Preferences during wipe", ex);
         }
-        File dataDir = Scarlet.dir;
-        if (dataDir != null && dataDir.isDirectory())
-            deleteRecursively(dataDir.getCanonicalFile(), removed);
-        LOG.info("Wiped local Scarlet install: {} filesystem item(s) removed, preferences cleared", removed[0]);
-        return removed[0] + " item(s) removed and credentials cleared";
+
+        try { deleteDataDirectory(dataRoot.toFile(), removed, failures); }
+        catch (IOException ex) { failures.add("could not safely remove the data directory: " + ex.getMessage()); }
+
+        if (!failures.isEmpty())
+        {
+            String detail = String.join("; ", failures);
+            LOG.error("Scarlet local wipe was incomplete: {}", detail);
+            throw new IOException("Scarlet local wipe was incomplete after removing " + removed[0]
+                + " filesystem item(s) and " + preferenceNodesRemoved + " Preferences node(s): " + detail);
+        }
+        LOG.info("Wiped local Scarlet install: {} filesystem item(s) and {} Preferences node(s) removed",
+            removed[0], preferenceNodesRemoved);
+        return removed[0] + " filesystem item(s) and " + preferenceNodesRemoved + " Preferences node(s) removed";
     }
 
-    private static void deleteRecursively(File f, int[] removed)
+    static String[] preferenceNodePathsForWipe()
     {
-        // Delete a symlink itself; never follow it (so we can't delete files outside the tree).
-        if (Files.isSymbolicLink(f.toPath()))
+        String current = "/" + Scarlet.class.getPackage().getName().replace('.', '/');
+        // Do not initialize ScarletSettings here: its static encryption fallback can create files.
+        return new String[] { current, "/net/" + interimPreferencesOwnerName() + "/scarlet" };
+    }
+
+    private static Path checkedWipeRoot(File dataDir) throws IOException
+    {
+        return checkedWipeRoot(dataDir, configuredDirectory(System.getProperty("user.home")),
+            System.getenv(), configuredDirectory(System.getProperty("java.io.tmpdir")));
+    }
+
+    /** Injected directory identities keep protection tests independent of real user folders. */
+    static Path checkedWipeRoot(File dataDir, Path userHome, Map<String, String> environment, Path tempDirectory) throws IOException
+    {
+        if (dataDir == null) throw new IOException("Scarlet data directory is unavailable");
+        Path root = dataDir.toPath().toAbsolutePath().normalize();
+        if (root.getParent() == null) throw new IOException("Refusing to remove a filesystem root");
+        if (userHome == null) throw new IOException("Cannot verify the user-home boundary; local removal is disabled");
+        Path home = userHome.toAbsolutePath().normalize();
+        // A misplaced SCARLET_HOME must not turn an explicit move-out into deleting a home
+        // or one of its ancestors. Dedicated subdirectories remain valid.
+        if (home.startsWith(root)) throw new IOException("Refusing to remove a user home or its parent directory");
+        for (String directory : new String[] { "Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music", "Public",
+                "AppData", "AppData/Local", "AppData/Roaming", "AppData/LocalLow",
+                ".config", ".local", ".local/share", ".local/state", ".cache", ".java", ".java/.userPrefs" })
+            if (root.equals(home.resolve(directory))) throw new IOException("Refusing to remove a shared user directory");
+        if (tempDirectory != null && root.equals(tempDirectory.toAbsolutePath().normalize()))
+            throw new IOException("Refusing to remove the shared temporary directory");
+
+        Path filesystemRoot = root.getRoot();
+        for (String directory : new String[] { "home", "root", "usr", "usr/local", "usr/share", "usr/local/share",
+                "opt", "var", "var/lib", "var/log", "var/cache", "var/tmp", "etc", "bin", "sbin", "lib", "lib64",
+                "tmp", "run", "mnt", "media", "srv", "boot", "dev", "proc", "sys", "Users", "Documents and Settings",
+                "Windows", "Windows/System32", "Windows/SysWOW64", "Program Files", "Program Files (x86)", "ProgramData" })
+            if (root.equals(filesystemRoot.resolve(directory))) throw new IOException("Refusing to remove a common system directory");
+        // Other accounts' immediate home directories are just as broad as this account's.
+        for (String directory : new String[] { "home", "Users", "Documents and Settings" })
+            if (root.getParent().equals(filesystemRoot.resolve(directory)))
+                throw new IOException("Refusing to remove a user-profile directory");
+
+        Set<String> sharedEnvironmentDirectories = new HashSet<>(Arrays.asList("userprofile", "home", "allusersprofile",
+            "appdata", "localappdata", "programdata", "programfiles", "programfiles(x86)", "programw6432",
+            "commonprogramfiles", "commonprogramfiles(x86)", "systemroot", "windir", "public",
+            "xdg_config_home", "xdg_data_home", "xdg_cache_home", "xdg_state_home", "xdg_runtime_dir", "tmp", "temp", "tmpdir"));
+        for (Map.Entry<String, String> entry : environment.entrySet())
         {
-            try { if (Files.deleteIfExists(f.toPath())) removed[0]++; }
-            catch (IOException ex) { LOG.warn("Could not delete symlink {} during wipe", f, ex); }
-            return;
+            if (!sharedEnvironmentDirectories.contains(entry.getKey().toLowerCase(Locale.ROOT))) continue;
+            Path shared = configuredDirectory(entry.getValue());
+            if (shared != null && root.equals(shared.toAbsolutePath().normalize()))
+                throw new IOException("Refusing to remove a shared system or user directory");
         }
-        File[] children = f.listFiles();
-        if (children != null)
-            for (File child : children)
-                deleteRecursively(child, removed);
-        try { if (Files.deleteIfExists(f.toPath())) removed[0]++; }
-        catch (IOException ex) { LOG.warn("Could not delete {} during wipe", f, ex); }
+        if (Files.exists(root, LinkOption.NOFOLLOW_LINKS)
+                && (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS) || !root.equals(root.toRealPath())))
+            throw new IOException("Refusing to remove a data root that is not an exact directory or is a link/junction alias");
+        return root;
+    }
+
+    private static Path configuredDirectory(String value)
+    {
+        if (value == null || value.isBlank()) return null;
+        try { return Path.of(value); }
+        catch (java.nio.file.InvalidPathException invalid) { return null; }
+    }
+
+    /** Exact-root, no-follow deletion; injected synthetic directories need no Preferences access. */
+    static void deleteDataDirectory(File dataDir, int[] removed, List<String> failures) throws IOException
+    {
+        Path root = checkedWipeRoot(dataDir);
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return;
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>()
+        {
+            private boolean exactPath(Path path) throws IOException
+            {
+                Path absolute = path.toAbsolutePath().normalize();
+                return absolute.startsWith(root) && absolute.equals(path.toRealPath());
+            }
+
+            private void remove(Path path)
+            {
+                try { if (Files.deleteIfExists(path)) removed[0]++; }
+                catch (IOException ex) { failures.add("could not delete " + path + ": " + ex.getMessage()); }
+            }
+
+            @Override public FileVisitResult preVisitDirectory(Path path, BasicFileAttributes attrs)
+            {
+                try
+                {
+                    // NOFOLLOW_LINKS alone is insufficient for every Windows reparse directory.
+                    // Refuse aliases (including internal cycles) before enumerating their children.
+                    if (this.exactPath(path)) return FileVisitResult.CONTINUE;
+                    failures.add("refused linked or junction directory " + path);
+                }
+                catch (IOException ex) { failures.add("could not verify directory " + path + ": " + ex.getMessage()); }
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+
+            @Override public FileVisitResult visitFile(Path path, BasicFileAttributes attrs)
+            {
+                try
+                {
+                    if (attrs.isSymbolicLink() || this.exactPath(path)) this.remove(path);
+                    else failures.add("refused aliased filesystem entry " + path);
+                }
+                catch (IOException ex) { failures.add("could not verify file " + path + ": " + ex.getMessage()); }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override public FileVisitResult visitFileFailed(Path path, IOException failure)
+            {
+                failures.add("could not enumerate " + path + ": " + failure.getMessage());
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override public FileVisitResult postVisitDirectory(Path path, IOException failure)
+            {
+                if (failure != null) failures.add("could not enumerate directory " + path + ": " + failure.getMessage());
+                else
+                {
+                    try
+                    {
+                        if (this.exactPath(path)) this.remove(path);
+                        else failures.add("directory changed to a link or junction during removal: " + path);
+                    }
+                    catch (IOException ex) { failures.add("could not verify directory " + path + ": " + ex.getMessage()); }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     private static String importBundleContents(File in, ImportOptions options) throws IOException
     {
-        if (in == null || !in.isFile())
-            throw new FileNotFoundException("Bundle not found: " + in);
         File dataDir = Scarlet.dir;
         if (dataDir == null)
             throw new IOException("Scarlet data directory is unavailable; cannot import.");
-        File dataDirCanon = dataDir.getCanonicalFile();
-        Files.createDirectories(dataDirCanon.toPath());
-
-        byte[] prefsXml = options.importCredentials ? readPreferencesXml(in) : null;
-        if (options.importCredentials && prefsXml == null)
-            throw new IOException("Migration bundle did not contain " + PREFS_ENTRY + "; refusing to import without credentials.");
-        if (options.importCredentials && !containsDataEntry(in, GLOBAL_PREFS_KEY))
-            throw new IOException("Migration bundle did not contain " + DATA_PREFIX + GLOBAL_PREFS_KEY + "; refusing to import credentials without the decryption key.");
-
-        int dataFiles = 0;
-        int credentialDataFiles = 0;
-        int entryCount = 0;
-        long[] total = { 0L };
-        try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(new FileInputStream(in))))
+        return importBundleContents(in, options, dataDir, new PreferenceTransaction()
         {
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null)
+            @Override public byte[] backup() throws Exception
             {
-                if (++entryCount > MAX_ENTRIES)
-                    throw new IOException("Bundle has too many entries (possible zip bomb).");
-                String name = entry.getName();
-                if (entry.isDirectory())
+                ByteArrayOutputStream snapshot = new ByteArrayOutputStream();
+                Preferences.userNodeForPackage(Scarlet.class).exportSubtree(snapshot);
+                return snapshot.toByteArray();
+            }
+            @Override public void replace(byte[] xml) throws Exception
+            {
+                replaceScarletPreferences(xml);
+            }
+        });
+    }
+
+    /** A seam for hermetic failure tests; production uses only Scarlet's Preferences subtree. */
+    interface PreferenceTransaction
+    {
+        byte[] backup() throws Exception;
+        void replace(byte[] xml) throws Exception;
+    }
+
+    static String importBundleContents(File in, ImportOptions options, File dataDir,
+                                      PreferenceTransaction preferences) throws IOException
+    {
+        if (in == null || !in.isFile()) throw new FileNotFoundException("Bundle not found: " + in);
+        // ZipInputStream alone accepts archives with a missing/truncated central directory.
+        try (java.util.zip.ZipFile archive = new java.util.zip.ZipFile(in))
+        { if (archive.size() == 0 || archive.size() > MAX_ENTRIES) throw new IOException("Invalid bundle entry count"); }
+        File root = dataDir.getCanonicalFile();
+        Files.createDirectories(root.toPath());
+        ScarletPrivateFiles.Workspace privateWorkspace = ScarletPrivateFiles.workspace(".scarlet-import-");
+        Path workspace = privateWorkspace.path;
+        Map<String, Path> staged = new LinkedHashMap<>();
+        Map<String, Path> originals = new LinkedHashMap<>();
+        List<String> applied = new ArrayList<>();
+        byte[] incomingPrefs = null, originalPrefs = null;
+        boolean prefsAttempted = false, preserveRecovery = false;
+        try
+        {
+            Set<String> seen = new HashSet<>();
+            int count = 0;
+            long[] total = { 0L };
+            try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(new FileInputStream(in))))
+            {
+                ZipEntry entry;
+                while ((entry = zip.getNextEntry()) != null)
                 {
-                    zip.closeEntry();
-                    continue;
-                }
-                if (name.startsWith(DATA_PREFIX))
-                {
-                    String relative = name.substring(DATA_PREFIX.length());
-                    if (!shouldImportDataEntry(relative, options))
+                    if (++count > MAX_ENTRIES) throw new IOException("Bundle contains too many entries");
+                    String raw = entry.getName();
+                    String name = normalizeEntryName(entry.isDirectory() && raw.endsWith("/") ? raw.substring(0, raw.length() - 1) : raw);
+                    if (name == null || !seen.add(name.toLowerCase(Locale.ROOT)))
+                        throw new IOException("Unsafe or duplicate bundle destination");
+                    String relative = name.startsWith(DATA_PREFIX) ? name.substring(DATA_PREFIX.length()) : null;
+                    // This active config has one portable spelling; case aliases must not evade
+                    // credential preservation on Windows or create a second latent config on Linux.
+                    if (relative != null && "discord_bot.json".equalsIgnoreCase(relative)) relative = "discord_bot.json";
+                    if (relative != null && "settings.json".equalsIgnoreCase(relative)) relative = "settings.json";
+                    if (!entry.isDirectory() && PREFS_ENTRY.equals(name) && options.importCredentials)
                     {
-                        zip.closeEntry();
-                        continue;
+                        ByteArrayOutputStream xml = new ByteArrayOutputStream();
+                        copyCapped(zip, xml, MAX_PREFS_XML_BYTES, total, MAX_TOTAL_BYTES);
+                        incomingPrefs = normalizeScarletOnlyPrefs(xml.toByteArray());
                     }
-                    File dest = safeResolve(dataDirCanon, relative);
-                    if (dest == null)
+                    else if (!entry.isDirectory() && relative != null && shouldImportDataEntry(relative, options))
                     {
-                        LOG.warn("Skipping unsafe bundle entry: {}", name);
+                        checkedDestination(root, relative);
+                        Path stagedFile = ScarletPrivateFiles.file(workspace, "staged-", ".dat");
+                        try (OutputStream output = Files.newOutputStream(stagedFile))
+                        { copyCapped(zip, output, MAX_ENTRY_BYTES, total, MAX_TOTAL_BYTES); }
+                        staged.put(relative, stagedFile);
                     }
                     else
                     {
-                        File destParent = dest.getParentFile();
-                        if (destParent != null && !destParent.isDirectory())
-                            Files.createDirectories(destParent.toPath());
-                        // Delete first so we never write through a pre-existing symlink, and
-                        // copy with per-entry/total caps to bound a malicious bundle.
-                        Files.deleteIfExists(dest.toPath());
-                        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(dest)))
-                        {
-                            copyCapped(zip, os, MAX_ENTRY_BYTES, total, MAX_TOTAL_BYTES);
-                        }
-                        dataFiles++;
-                        if (isCredentialDataEntry(relative))
-                        {
-                            credentialDataFiles++;
-                            restrictToOwner(dest.toPath());
-                        }
+                        // Even unselected/unknown entries consume the same decompression budget.
+                        copyCapped(zip, OutputStream.nullOutputStream(), MAX_ENTRY_BYTES, total, MAX_TOTAL_BYTES);
+                    }
+                    zip.closeEntry(); // Checks ZIP CRC before any live mutation.
+                }
+            }
+            if (options.importCredentials && (incomingPrefs == null || !staged.containsKey(GLOBAL_PREFS_KEY)
+                    || Files.size(staged.get(GLOBAL_PREFS_KEY)) == 0))
+                throw new IOException("Credential imports require validated preferences.xml and nonempty data/global-prefs.key");
+            if (options.importDataFiles && staged.containsKey("discord_bot.json"))
+            {
+                Path config = staged.get("discord_bot.json");
+                JsonObject incoming = readConfigurationObject(config);
+                if (!options.keepChannels) scrubDiscordRouting(incoming);
+                if (!options.importCredentials)
+                {
+                    // Old builds accepted a plaintext bot token from this ordinary data file.
+                    // Remove incoming credentials and preserve the existing local values verbatim.
+                    for (String key : new ArrayList<>(incoming.keySet()))
+                        if (isDiscordCredentialField(key)) incoming.remove(key);
+                    Path local = checkedDestination(root, "discord_bot.json");
+                    if (Files.exists(local))
+                    {
+                        JsonObject current = readConfigurationObject(local);
+                        for (Map.Entry<String, JsonElement> entry : current.entrySet())
+                            if (isDiscordCredentialField(entry.getKey())) incoming.add(entry.getKey(), entry.getValue().deepCopy());
                     }
                 }
-                zip.closeEntry();
+                FileBackups.write(config.toFile(), 0, writer -> new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(incoming, writer));
+                ScarletPrivateFiles.protect(config);
             }
-        }
-
-        boolean prefsImported = false;
-        if (options.importCredentials)
-        {
-            try
+            if (options.importDataFiles && !options.importCredentials && staged.containsKey("settings.json"))
             {
-                replaceScarletPreferences(prefsXml);
-                prefsImported = true;
+                Path config = staged.get("settings.json");
+                JsonObject incoming = readConfigurationObject(config);
+                // Legacy login migrates these plaintext values into secure storage at startup.
+                // Data-only imports must neither adopt source values nor erase local values.
+                for (String key : new ArrayList<>(incoming.keySet()))
+                    if (isLegacyLoginField(key)) incoming.remove(key);
+                Path local = checkedDestination(root, "settings.json");
+                if (Files.exists(local))
+                {
+                    for (Map.Entry<String, JsonElement> entry : readConfigurationObject(local).entrySet())
+                        if (isLegacyLoginField(entry.getKey())) incoming.add(entry.getKey(), entry.getValue().deepCopy());
+                }
+                FileBackups.write(config.toFile(), 0, writer -> new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(incoming, writer));
+                ScarletPrivateFiles.protect(config);
             }
-            catch (Exception ex)
+            // Capture every replacement before applying the first file.
+            for (String relative : staged.keySet())
             {
-                throw new IOException("Failed to import Java Preferences from bundle", ex);
+                Path destination = checkedDestination(root, relative);
+                Path original = null;
+                if (Files.exists(destination))
+                {
+                    if (!Files.isRegularFile(destination)) throw new IOException("Import destination is not a regular file");
+                    original = ScarletPrivateFiles.file(workspace, "original-", ".dat");
+                    // Keep the already protected file rather than replacing its ACL with a
+                    // newly copied directory entry. The enclosing workspace is private too.
+                    try (OutputStream output = Files.newOutputStream(original, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING))
+                    { Files.copy(destination, output); }
+                    ScarletPrivateFiles.protect(original);
+                    if (!sameBytes(original, destination)) throw new IOException("Failed to verify staged original data");
+                }
+                originals.put(relative, original);
             }
+            if (options.importCredentials)
+            {
+                originalPrefs = preferences.backup();
+                byte[] recoveryPrefs = originalPrefs;
+                FileBackups.writeBytes(workspace.resolve("original-preferences.xml").toFile(), 0, output -> output.write(recoveryPrefs));
+                ScarletPrivateFiles.protect(workspace.resolve("original-preferences.xml"));
+            }
+            for (Map.Entry<String, Path> replacement : staged.entrySet())
+            {
+                Path destination = checkedDestination(root, replacement.getKey());
+                applied.add(replacement.getKey());
+                publishPrivateReplacement(replacement.getValue(), destination);
+                if (!sameBytes(replacement.getValue(), destination)) throw new IOException("Imported file failed read-back verification");
+            }
+            if (options.importCredentials)
+            {
+                prefsAttempted = true;
+                preferences.replace(incomingPrefs);
+            }
+            int credentialFiles = (int) staged.keySet().stream().filter(ScarletMigration::isCredentialDataEntry).count();
+            return importSummary(options, staged.size(), credentialFiles, options.importCredentials);
         }
-        LOG.info("Imported migration bundle from {} ({} data files restored to {}, credentials {})",
-            in, dataFiles, dataDirCanon, prefsImported ? "imported" : "not selected");
-        return importSummary(options, dataFiles, credentialDataFiles, prefsImported);
-    }
-
-    private static byte[] readPreferencesXml(File bundle) throws IOException
-    {
-        try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(new FileInputStream(bundle))))
+        catch (Exception failure)
         {
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null)
+            IOException result = new IOException("Import failed; restoring the original configuration", failure);
+            java.util.Collections.reverse(applied);
+            for (String relative : applied)
             {
                 try
                 {
-                    if (!entry.isDirectory() && PREFS_ENTRY.equals(entry.getName()))
-                        return readAll(zip, MAX_PREFS_XML_BYTES);
+                    Path destination = checkedDestination(root, relative), original = originals.get(relative);
+                    if (original == null) Files.deleteIfExists(destination);
+                    else
+                    {
+                        publishPrivateReplacement(original, destination);
+                        if (!sameBytes(original, destination)) throw new IOException("Restored file failed verification");
+                    }
                 }
-                finally
-                {
-                    zip.closeEntry();
-                }
+                catch (Exception rollback) { result.addSuppressed(rollback); preserveRecovery = true; }
             }
+            if (prefsAttempted)
+            {
+                try { preferences.replace(originalPrefs); }
+                catch (Exception rollback) { result.addSuppressed(rollback); preserveRecovery = true; }
+            }
+            if (preserveRecovery)
+                throw new IOException("Import failed and rollback could not complete. Recovery files retained at " + workspace, result);
+            throw result;
         }
-        return null;
+        finally
+        {
+            if (preserveRecovery) privateWorkspace.retain();
+            try { privateWorkspace.close(); }
+            catch (IOException cleanup) { LOG.warn("Could not remove private temporary import staging files", cleanup); }
+        }
     }
 
-    private static boolean containsDataEntry(File bundle, String relativeName) throws IOException
+    private static boolean sameBytes(Path first, Path second) throws IOException
     {
-        try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(new FileInputStream(bundle))))
+        if (Files.size(first) != Files.size(second)) return false;
+        try (InputStream left = Files.newInputStream(first); InputStream right = Files.newInputStream(second))
         {
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null)
+            byte[] a = new byte[8192], b = new byte[8192];
+            int count;
+            while ((count = left.read(a)) >= 0)
+                if (right.readNBytes(b, 0, count) != count || !Arrays.equals(Arrays.copyOf(a, count), Arrays.copyOf(b, count))) return false;
+            return right.read() == -1;
+        }
+    }
+
+    private static Path checkedDestination(File root, String relative) throws IOException
+    {
+        String name = normalizeEntryName(relative);
+        if (name == null) throw new IOException("Unsafe import destination");
+        Path destination = root.toPath().resolve(name).normalize();
+        if (!destination.startsWith(root.toPath()) || destination.equals(root.toPath())) throw new IOException("Unsafe import destination");
+        for (Path current = destination; current != null && !current.equals(root.toPath()); current = current.getParent())
+        {
+            if (Files.isSymbolicLink(current)) throw new IOException("Import does not replace or traverse symbolic links");
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS))
             {
-                try
-                {
-                    if (!entry.isDirectory()
-                        && entry.getName().startsWith(DATA_PREFIX)
-                        && normalizeEntryName(entry.getName().substring(DATA_PREFIX.length())).equals(relativeName))
-                        return true;
-                }
-                finally
-                {
-                    zip.closeEntry();
-                }
+                Path real = current.toRealPath();
+                // Directory junctions are not necessarily symbolic links on Windows. Resolve
+                // every existing ancestor before staging/applying, including internal aliases.
+                if (!real.startsWith(root.toPath()) || !real.equals(current.toAbsolutePath().normalize()))
+                    throw new IOException("Import does not replace or traverse linked or junction path aliases");
             }
         }
-        return false;
+        return destination;
     }
 
     private static void replaceScarletPreferences(byte[] prefsXml) throws IOException, BackingStoreException, InvalidPreferencesFormatException
     {
         // Refuse any preferences XML that targets nodes outside Scarlet's own subtree, so a
         // malicious bundle can't inject/overwrite arbitrary Java Preferences for this user.
-        validateScarletOnlyPrefs(prefsXml);
-        Preferences existing = Preferences.userNodeForPackage(Scarlet.class);
+        Preferences imported = replaceScarletPreferences(prefsXml, Preferences.userRoot());
+        if (imported.getBoolean(ScarletSettings.INTERIM_NAMESPACE_RECONCILED_KEY, false))
+        {
+            String importedGlobalPassword = ScarletSettings.currentImportedGlobalPassword();
+            if (importedGlobalPassword == null
+                || !ScarletSettings.ensureImportedInterimSeedIsRewrapped(imported, importedGlobalPassword))
+                throw new IOException("Imported interim-namespace credentials could not be verified and re-wrapped for the restored Preferences namespace.");
+        }
+        Preferences.userRoot().flush();
+    }
+
+    // The injected root permits hermetic tests; XML can never choose a root or a path.
+    static Preferences replaceScarletPreferences(byte[] prefsXml, Preferences userRoot) throws IOException, BackingStoreException
+    {
+        Document doc = validatedScarletPreferences(prefsXml);
+        if (!userRoot.isUserNode() || !"/".equals(userRoot.absolutePath()))
+            throw new IOException("Scarlet preferences require a user preferences root.");
+        Element root = firstChildElement(doc.getDocumentElement(), "root");
+        Element net = onlyChildNode(root, "net", "/");
+        Element owner = onlyChildNode(net, "sybyline", "/net");
+        Element scarlet = onlyChildNode(owner, "scarlet", "/net/sybyline");
+        Preferences existing = userRoot.node("net/sybyline/scarlet");
         try
         {
             existing.removeNode();
-            Preferences.userRoot().flush();
+            userRoot.flush();
         }
         catch (IllegalStateException ignored)
         {
             // Already removed by another Preferences handle in this process.
         }
-        Preferences.importPreferences(new ByteArrayInputStream(prefsXml));
-        Preferences imported = Preferences.userNodeForPackage(Scarlet.class);
+        Preferences imported = userRoot.node("net/sybyline/scarlet");
+        copyValidatedPreferenceNode(scarlet, imported);
         imported.flush();
-        Preferences.userRoot().flush();
+        userRoot.flush();
+        return imported;
     }
 
-    private static boolean shouldImportDataEntry(String relative, ImportOptions options)
+    private static void copyValidatedPreferenceNode(Element source, Preferences destination)
     {
+        NodeList children = source.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++)
+        {
+            if (!(children.item(i) instanceof Element)) continue;
+            Element child = (Element) children.item(i);
+            if ("map".equals(child.getTagName()))
+            {
+                NodeList entries = child.getChildNodes();
+                for (int j = 0; j < entries.getLength(); j++)
+                    if (entries.item(j) instanceof Element)
+                    {
+                        Element entry = (Element) entries.item(j);
+                        destination.put(entry.getAttribute("key"), entry.getAttribute("value"));
+                    }
+            }
+            else copyValidatedPreferenceNode(child, destination.node(child.getAttribute("name")));
+        }
+    }
+
+    static boolean shouldImportDataEntry(String relative, ImportOptions options)
+    {
+        if (normalizeEntryName(relative) == null) return false;
         boolean credentialData = isCredentialDataEntry(relative);
         if (options.importDataFiles)
             return options.importCredentials || !credentialData;
@@ -556,15 +1188,43 @@ public final class ScarletMigration
             ScarletDiscordJDA.scrubDiscordChannels(discordConfig);
     }
 
-    private static boolean isCredentialDataEntry(String relative)
+    static boolean isCredentialDataEntry(String relative)
     {
         String normalized = normalizeEntryName(relative);
-        return GLOBAL_PREFS_KEY.equals(normalized) || LEGACY_COOKIE_FILE.equals(normalized);
+        if (normalized == null) return true; // Invalid names always fail closed.
+        normalized = normalized.toLowerCase(Locale.ROOT);
+        return GLOBAL_PREFS_KEY.equals(normalized)
+            || LEGACY_COOKIE_FILE.equals(normalized)
+            || SECURE_PREFS_FILE.equals(normalized)
+            || SECURE_PREFS_BACKUP_FILE.equals(normalized)
+            || (SECURE_PREFS_FILE + ".tmp").equals(normalized)
+            || normalized.startsWith(SECURE_PREFS_FILE + ".")
+            || normalized.startsWith("secure-prefs.dat.backup-")
+            || normalized.startsWith("secure-prefs.registry-backup-")
+            || normalized.startsWith("secure-prefs.quarantine-")
+            || normalized.startsWith("preference-namespace-backups/")
+            || isCredentialBearingConfigurationBackup(normalized);
+    }
+
+    private static boolean isCredentialBearingConfigurationBackup(String normalized)
+    {
+        if (!normalized.startsWith("backups/") || !normalized.endsWith(".bak")) return false;
+        String name = normalized.substring("backups/".length());
+        // Settings automatically falls back to these files. A data-only import must not
+        // plant source login values in a future recovery path, or replace local recovery copies.
+        for (String base : new String[] { "settings.json", "discord_bot.json", GLOBAL_PREFS_KEY,
+                SECURE_PREFS_FILE, LEGACY_COOKIE_FILE })
+            if (name.startsWith(base + ".")) return true;
+        return false;
     }
 
     private static String normalizeEntryName(String name)
     {
-        return name == null ? "" : name.replace('\\', '/');
+        if (name == null || name.isEmpty() || name.indexOf('\\') >= 0 || name.indexOf(':') >= 0 || name.indexOf('\0') >= 0)
+            return null;
+        for (String part : name.split("/", -1))
+            if (part.isEmpty() || part.equals(".") || part.equals("..") || part.endsWith(".") || part.endsWith(" ")) return null;
+        return name;
     }
 
     private static String importSummary(ImportOptions options, int dataFiles, int credentialDataFiles, boolean prefsImported)
@@ -586,10 +1246,17 @@ public final class ScarletMigration
     private static File createPreImportBackup() throws IOException
     {
         File backup = nextPreImportBackupFile();
-        String summary = exportBundle(backup);   // unencrypted local safety copy; exportBundle restricts it owner-only
+        // Import already owns both exclusive leases. Never enter the public export wrapper here.
+        String summary = createPreImportBackup(Scarlet.dir, backup, ScarletMigration::snapshotPreferences);
         pruneOldBackups(backup.getParentFile());
         LOG.info("Created pre-import migration backup at {} ({})", backup, summary);
         return backup;
+    }
+
+    /** Under the import's existing leases, capture even an absent first-install data home. */
+    static String createPreImportBackup(File dataDir, File backup, PreferenceExport preferences) throws IOException
+    {
+        return exportBundleAtomic(backup, null, null, dataDir, preferences, true, true).summary;
     }
 
     private static File nextPreImportBackupFile() throws IOException
@@ -654,13 +1321,13 @@ public final class ScarletMigration
     {
         File[] files = dir.listFiles();
         if (files == null)
-            return;
+            throw new IOException("Cannot enumerate the complete data directory for export");
         byte[] buffer = new byte[8192];
         for (File f : files)
         {
+            if (skipExportEntry(f)) continue;
             if (Files.isSymbolicLink(f.toPath()))
             {
-                LOG.warn("Skipping symbolic link during migration export: {}", f);
                 continue;
             }
             File fCanon = f.getCanonicalFile();
@@ -672,6 +1339,7 @@ public final class ScarletMigration
                 continue;
             }
             String entryName = prefix + f.getName();
+            if (normalizeEntryName(entryName) == null) throw new IOException("Data filename cannot be represented in a portable migration bundle");
             if (f.isDirectory())
             {
                 zipDir(zip, root, fCanon, entryName + "/", skip, count, state);
@@ -701,9 +1369,10 @@ public final class ScarletMigration
     {
         File[] files = dir.listFiles();
         if (files == null)
-            return;
+            throw new IOException("Cannot enumerate the complete data directory for export");
         for (File f : files)
         {
+            if (skipExportEntry(f)) continue;
             if (Files.isSymbolicLink(f.toPath()))
                 continue;
             File fCanon = f.getCanonicalFile();
@@ -721,6 +1390,51 @@ public final class ScarletMigration
                 filesBytes[1] += f.length();
             }
         }
+    }
+
+    private static boolean skipExportEntry(File file)
+    {
+        String name = file.getName().toLowerCase(Locale.ROOT);
+        return name.endsWith(".tmp") || name.endsWith(".scarlet-data.lock")
+            || name.equals(".scarlet-preferences.lock") || name.equals("ipc.token")
+            || name.startsWith(".scarlet-export-") || name.startsWith(".scarlet-verify-")
+            || name.startsWith(".scarlet-import-") || name.startsWith(".scarlet-decrypt-")
+            || name.startsWith(".scarlet-publish-");
+    }
+
+    private static JsonObject readConfigurationObject(Path file) throws IOException
+    {
+        if (!Files.isRegularFile(file) || Files.size(file) > MAX_PREFS_XML_BYTES)
+            throw new IOException("Imported or existing configuration is not a bounded regular file");
+        try (java.io.Reader input = Files.newBufferedReader(file, StandardCharsets.UTF_8))
+        {
+            JsonElement parsed = JsonParser.parseReader(input);
+            if (!parsed.isJsonObject()) throw new IOException("Imported or existing configuration must be a JSON object");
+            return parsed.getAsJsonObject();
+        }
+        catch (RuntimeException ex) { throw new IOException("Imported or existing configuration is invalid; no import was applied", ex); }
+    }
+
+    private static boolean isLegacyLoginField(String field)
+    {
+        String key = field.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "").replace(".", "");
+        return key.equals("vrcusername") || key.equals("vrcpassword") || key.equals("vrcsecret");
+    }
+
+    private static boolean isDiscordCredentialField(String field)
+    {
+        String key = field.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "").replace(".", "");
+        return key.equals("token") || key.equals("bottoken") || key.equals("discordtoken")
+            || key.equals("encryptedtoken") || key.equals("tokenencrypted")
+            || key.equals("clientsecret") || key.equals("scarletauxwh2webhookurl");
+    }
+
+    private static void scrubDiscordRouting(JsonObject config)
+    {
+        for (String field : new String[] { "audioChannelSf", "discordActionLogChannelSf", "opsAlertChannelSf",
+            "trainingChannelSf", "evidenceRoot", "ticketToolCategorySf" }) config.add(field, com.google.gson.JsonNull.INSTANCE);
+        for (String field : new String[] { "auditType2channelSf", "auditExType2channelSf", "auditType2secretChannelSf",
+            "auditExType2secretChannelSf", "scarletAuxWh2webhookUrl", "auditType2scarletAuxWh" }) config.add(field, new JsonObject());
     }
 
     /** Total bytes of all regular files under dir (symlinks not followed); 0 if dir is missing. */
@@ -791,21 +1505,10 @@ public final class ScarletMigration
         }
     }
 
-    /** Best-effort owner-only permissions (POSIX). No-op where POSIX perms are unsupported (e.g. Windows). */
-    private static void restrictToOwner(Path path)
+    /** Plaintext recovery backups must receive verified protection on every supported OS. */
+    private static void restrictToOwner(Path path) throws IOException
     {
-        try
-        {
-            Set<PosixFilePermission> perms = Files.isDirectory(path)
-                ? EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE)
-                : EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
-            Files.setPosixFilePermissions(path, perms);
-        }
-        catch (IOException | RuntimeException ignored)
-        {
-            // Non-POSIX filesystem (Windows) or insufficient privileges; rely on the user
-            // profile's default ACLs there.
-        }
+        ScarletPrivateFiles.protect(path);
     }
 
     private static void pruneOldBackups(File backupDir)
@@ -891,6 +1594,11 @@ public final class ScarletMigration
 
     private static void decryptFile(File in, File outPlain, char[] pin) throws IOException
     {
+        decryptFile(in, outPlain, pin, null);
+    }
+
+    private static void decryptFile(File in, File outPlain, char[] pin, Progress progress) throws IOException
+    {
         try (InputStream is = new BufferedInputStream(new FileInputStream(in)))
         {
             byte[] magic = new byte[ENC_MAGIC.length];
@@ -910,12 +1618,16 @@ public final class ScarletMigration
             try (OutputStream os = new BufferedOutputStream(new FileOutputStream(outPlain)))
             {
                 byte[] buffer = new byte[8192];
+                long done = 0L;
                 int n;
                 while ((n = is.read(buffer)) > 0)
                 {
                     byte[] dec = cipher.update(buffer, 0, n);
                     if (dec != null)
                         os.write(dec);
+                    done += n;
+                    if (progress != null && !progress.progress("Verifying encryption", in.getName(), 0, 0, done, in.length()))
+                        throw new IOException(CANCELLED_MESSAGE);
                 }
                 byte[] fin = cipher.doFinal();   // verifies the GCM tag; throws on wrong PIN / tamper
                 if (fin != null)
@@ -962,30 +1674,78 @@ public final class ScarletMigration
 
     // ── Preferences-XML validation (XXE-hardened) ──────────────────────────────
 
-    private static void validateScarletOnlyPrefs(byte[] prefsXml) throws IOException
+    static byte[] normalizeScarletOnlyPrefs(byte[] prefsXml) throws IOException
     {
-        Element scarlet;
+        Document doc = validatedScarletPreferences(prefsXml);
+        try
+        {
+            TransformerFactory factory = TransformerFactory.newInstance();
+            factory.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            factory.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_STYLESHEET, "");
+            Transformer transformer = factory.newTransformer();
+            transformer.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
+            transformer.setOutputProperty(OutputKeys.DOCTYPE_SYSTEM, "http://java.sun.com/dtd/preferences.dtd");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            transformer.transform(new DOMSource(doc), new StreamResult(out));
+            return out.toByteArray();
+        }
+        catch (Exception ex)
+        {
+            throw new IOException("Bundle preferences could not be normalized for the maintained namespace.", ex);
+        }
+    }
+
+    private static Document validatedScarletPreferences(byte[] prefsXml) throws IOException
+    {
+        if (prefsXml == null || prefsXml.length == 0 || prefsXml.length > MAX_PREFS_XML_BYTES)
+            throw new IOException("Bundle preferences XML is empty or exceeds its size limit.");
         try
         {
             DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
             dbf.setExpandEntityReferences(false);
-            setFeatureQuietly(dbf, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-            setFeatureQuietly(dbf, "http://xml.org/sax/features/external-general-entities", false);
-            setFeatureQuietly(dbf, "http://xml.org/sax/features/external-parameter-entities", false);
+            dbf.setXIncludeAware(false);
+            dbf.setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            dbf.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            dbf.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
             DocumentBuilder db = dbf.newDocumentBuilder();
             // Never fetch the (dead) preferences DTD URL or any external entity.
             db.setEntityResolver((publicId, systemId) -> new InputSource(new java.io.StringReader("")));
             Document doc = db.parse(new ByteArrayInputStream(prefsXml));
+            if (doc.getDoctype() != null && (doc.getDoctype().getInternalSubset() != null
+                || !"preferences".equals(doc.getDoctype().getName())
+                || !"http://java.sun.com/dtd/preferences.dtd".equals(doc.getDoctype().getSystemId())
+                || doc.getDoctype().getPublicId() != null))
+                throw new IOException("Bundle preferences contain an unsupported document type.");
             Element prefs = doc.getDocumentElement();
+            if (!"preferences".equals(prefs.getTagName()) || !"1.0".equals(prefs.getAttribute("EXTERNAL_XML_VERSION")))
+                throw new IOException("Bundle preferences require the supported preferences document format.");
+            requirePreferenceAttributes(prefs, "EXTERNAL_XML_VERSION");
+            java.util.List<Element> top = preferenceElements(prefs);
+            if (top.size() != 1 || !"root".equals(top.get(0).getTagName()))
+                throw new IOException("Bundle preferences require exactly one root.");
             Element root = firstChildElement(prefs, "root");
-            if (root == null)
-                throw new IOException("preferences XML has no <root>.");
+            requirePreferenceAttributes(root, "type");
+            if (!"user".equals(root.getAttribute("type")))
+                throw new IOException("Bundle preferences cannot target system preferences.");
+            validatePreferenceNode(root, 0, new int[2]);
             requireEmptyMap(root, "/");
             Element net = onlyChildNode(root, "net", "/");
             requireEmptyMap(net, "/net");
-            Element sybyline = onlyChildNode(net, "sybyline", "/net");
-            requireEmptyMap(sybyline, "/net/sybyline");
-            scarlet = onlyChildNode(sybyline, "scarlet", "/net/sybyline");
+            Element owner = singleChildNode(net, "/net");
+            String ownerName = owner.getAttribute("name");
+            if (!"sybyline".equals(ownerName) && !interimPreferencesOwnerName().equals(ownerName))
+                throw new IOException("Bundle preferences target an unexpected owner namespace; refusing import.");
+            requireEmptyMap(owner, "/net/<owner>");
+            Element scarlet = onlyChildNode(owner, "scarlet", "/net/<owner>");
+            if (interimPreferencesOwnerName().equals(ownerName))
+            {
+                owner.setAttribute("name", "sybyline");
+                putMapEntry(doc, scarlet, ScarletSettings.INTERIM_NAMESPACE_RECONCILED_KEY, "true");
+            }
+            return doc;
         }
         catch (IOException ex)
         {
@@ -995,14 +1755,67 @@ public final class ScarletMigration
         {
             throw new IOException("Bundle preferences failed validation: " + ex.getMessage(), ex);
         }
-        if (scarlet == null)
-            throw new IOException("Bundle preferences do not describe the Scarlet node.");
     }
 
-    private static void setFeatureQuietly(DocumentBuilderFactory dbf, String feature, boolean value)
+    private static void validatePreferenceNode(Element node, int depth, int[] counts) throws IOException
     {
-        try { dbf.setFeature(feature, value); }
-        catch (Exception ignored) { }
+        if (depth > 32 || ++counts[0] > 4096)
+            throw new IOException("Bundle preferences exceed the node/depth limit.");
+        java.util.List<Element> children = preferenceElements(node);
+        if (children.isEmpty() || !"map".equals(children.get(0).getTagName()))
+            throw new IOException("Each preferences node must start with exactly one map.");
+        Element map = children.get(0);
+        requirePreferenceAttributes(map);
+        java.util.Set<String> keys = new java.util.HashSet<>(), names = new java.util.HashSet<>();
+        for (Element entry : preferenceElements(map))
+        {
+            if (!"entry".equals(entry.getTagName())) throw new IOException("Invalid preferences map content.");
+            requirePreferenceAttributes(entry, "key", "value");
+            if (!preferenceElements(entry).isEmpty() || !entry.hasAttribute("key") || !entry.hasAttribute("value")
+                || entry.getAttribute("key").length() > Preferences.MAX_KEY_LENGTH
+                || entry.getAttribute("value").length() > Preferences.MAX_VALUE_LENGTH
+                || !keys.add(entry.getAttribute("key")) || ++counts[1] > 65536)
+                throw new IOException("Invalid, duplicate, or excessive preferences entries.");
+        }
+        for (int i = 1; i < children.size(); i++)
+        {
+            Element child = children.get(i);
+            if (!"node".equals(child.getTagName())) throw new IOException("Invalid preferences child node.");
+            requirePreferenceAttributes(child, "name");
+            String name = child.getAttribute("name");
+            if (name.isEmpty() || name.length() > Preferences.MAX_NAME_LENGTH || name.indexOf('/') >= 0
+                || name.indexOf('\\') >= 0 || ".".equals(name) || "..".equals(name) || !names.add(name))
+                throw new IOException("Preferences node names must be unique single relative names.");
+            validatePreferenceNode(child, depth + 1, counts);
+        }
+    }
+
+    private static java.util.List<Element> preferenceElements(Element parent) throws IOException
+    {
+        java.util.List<Element> elements = new java.util.ArrayList<>();
+        NodeList children = parent.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++)
+        {
+            Node child = children.item(i);
+            if (child instanceof Element) elements.add((Element) child);
+            else if (child.getNodeType() != Node.COMMENT_NODE
+                && !(child.getNodeType() == Node.TEXT_NODE && child.getNodeValue().trim().isEmpty()))
+                throw new IOException("Unexpected preferences XML content.");
+        }
+        return elements;
+    }
+
+    private static void requirePreferenceAttributes(Element element, String... allowed) throws IOException
+    {
+        java.util.Set<String> names = new java.util.HashSet<>(Arrays.asList(allowed));
+        for (int i = 0; i < element.getAttributes().getLength(); i++)
+            if (!names.contains(element.getAttributes().item(i).getNodeName()))
+                throw new IOException("Unexpected preferences XML attribute.");
+    }
+
+    private static String interimPreferencesOwnerName()
+    {
+        return new String(new char[] { 'h', 'a', 't', 's', 'o', 'n', '3', '2', '1' });
     }
 
     private static Element firstChildElement(Element parent, String tag)
@@ -1015,6 +1828,32 @@ public final class ScarletMigration
                 return (Element) n;
         }
         return null;
+    }
+
+    private static void putMapEntry(Document doc, Element node, String key, String value)
+    {
+        Element map = firstChildElement(node, "map");
+        if (map == null)
+        {
+            map = doc.createElement("map");
+            node.insertBefore(map, node.getFirstChild());
+        }
+        NodeList entries = map.getChildNodes();
+        for (int i = 0; i < entries.getLength(); i++)
+        {
+            Node child = entries.item(i);
+            if (child.getNodeType() == Node.ELEMENT_NODE
+                && "entry".equals(child.getNodeName())
+                && key.equals(((Element) child).getAttribute("key")))
+            {
+                ((Element) child).setAttribute("value", value);
+                return;
+            }
+        }
+        Element entry = doc.createElement("entry");
+        entry.setAttribute("key", key);
+        entry.setAttribute("value", value);
+        map.appendChild(entry);
     }
 
     /** Returns the single child {@code <node>} of parent, requiring its name attribute to equal expectedName. */
@@ -1035,6 +1874,25 @@ public final class ScarletMigration
             throw new IOException("Bundle preferences are missing the " + expectedName + " node under " + pathForError + ".");
         if (!expectedName.equals(only.getAttribute("name")))
             throw new IOException("Bundle preferences reference node '" + only.getAttribute("name") + "' outside the Scarlet subtree; refusing import.");
+        return only;
+    }
+
+    /** Returns the single child {@code <node>} without constraining its name attribute. */
+    private static Element singleChildNode(Element parent, String pathForError) throws IOException
+    {
+        Element only = null;
+        NodeList children = parent.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++)
+        {
+            Node n = children.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE || !"node".equals(n.getNodeName()))
+                continue;
+            if (only != null)
+                throw new IOException("Bundle preferences contain unexpected extra nodes under " + pathForError + "; refusing import.");
+            only = (Element) n;
+        }
+        if (only == null)
+            throw new IOException("Bundle preferences are missing the owner node under " + pathForError + ".");
         return only;
     }
 

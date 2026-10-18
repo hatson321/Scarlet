@@ -7,9 +7,6 @@
 # BlueJ files
 *.ctxt
 
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
-
 # Package Files #
 *.jar
 *.war
@@ -24,3 +21,6 @@ hs_err_pid*
 replay_pid*
 target
 .vscode
+
+# Workspace-local Linux maintainer build cache
+.build-cache/

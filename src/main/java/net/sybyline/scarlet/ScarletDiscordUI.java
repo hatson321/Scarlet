@@ -21,7 +21,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
 
 import io.github.vrchatapi.ApiException;
 import io.github.vrchatapi.JSON;
@@ -32,14 +31,15 @@ import io.github.vrchatapi.model.GroupJoinRequestAction;
 import io.github.vrchatapi.model.GroupPermissions;
 import io.github.vrchatapi.model.Instance;
 import io.github.vrchatapi.model.InstanceRegion;
-import io.github.vrchatapi.model.LimitedUserGroups;
 import io.github.vrchatapi.model.PerformanceRatings;
 import io.github.vrchatapi.model.User;
 
 import net.dv8tion.jda.api.EmbedBuilder;
+import net.dv8tion.jda.api.Permission;
 import net.dv8tion.jda.api.entities.Member;
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.MessageEmbed;
+import net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.events.interaction.GenericInteractionCreateEvent;
 import net.dv8tion.jda.api.events.interaction.ModalInteractionEvent;
@@ -62,6 +62,7 @@ import net.sybyline.scarlet.server.discord.DInteractions.Ephemeral;
 import net.sybyline.scarlet.server.discord.DInteractions.FeatureGate;
 import net.sybyline.scarlet.server.discord.DInteractions.ModalSub;
 import net.sybyline.scarlet.server.discord.DInteractions.StringSel;
+import net.sybyline.scarlet.server.discord.DPerms;
 import net.sybyline.scarlet.util.HttpURLInputStream;
 import net.sybyline.scarlet.util.MiscUtils;
 import net.sybyline.scarlet.util.UniqueStrings;
@@ -355,11 +356,34 @@ public class ScarletDiscordUI
 
     boolean _vrchatUserBan(InteractionHook hook, Member member, String vrcTargetId)
     {
+        return this._vrchatUserBan(hook, member, vrcTargetId, "vrchat-user-ban");
+    }
+
+    boolean _vrchatUserBan(InteractionHook hook, Member member, String vrcTargetId, String operation)
+    {
+        if (member == null)
+        {
+            hook.sendMessage("Cannot verify the requesting Discord member.").setEphemeral(true).queue();
+            return false;
+        }
         String vrcActorId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(member.getId());
         if (vrcActorId == null)
         {
             hook.sendMessage(this.discord.linkedIdsReply(member)).setEphemeral(true).queue();
             return false;
+        }
+        if ("immediate-ban-confirm".equals(operation))
+        {
+            ScarletPendingModActions.BanInfo original = this.discord.scarlet.pendingModActions.getBanInfo(vrcTargetId);
+            if (original == null || !member.getId().equals(original.ownerSnowflake)
+                || !vrcActorId.equals(original.actorUserId)
+                || original.vrchatGroupId == null || !original.vrchatGroupId.equals(this.discord.scarlet.vrc.groupId)
+                || original.discordGuildId == null || !original.discordGuildId.equals(this.discord.guildSf))
+            {
+                hook.sendMessage("This ban confirmation has missing or changed requester/group information. Cancel it and submit a new request.")
+                    .setEphemeral(true).queue();
+                return false;
+            }
         }
         
         long within1day = System.currentTimeMillis() - 86400_000L;
@@ -371,22 +395,19 @@ public class ScarletDiscordUI
             return false;
         }
 
-        if (!this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, member))
-        {
-            if (!this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, member, false))
-            {
-                hook.sendMessage("You do not have permission to ban users.\n||(Your admin can enable this by giving your associated VRChat user ban management permissions in the group or with the command `/scarlet-discord-permissions type:Other name:groupex-bans-manage value:Allow`)||").setEphemeral(true).queue();
-                return false;
-            }
-        }
         if (training)
         {
-            // Training user: the permission checks above are real; the ban itself is simulated.
+            if (!this.checkTrainingBanPermission(hook, member)) return false;
             hook.sendMessage("Banned the training user. *(Training simulation — no real ban occurred.)*").setEphemeral(false).queue();
             return true;
         }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, hook))
+        ScarletDiscordJDA.VRChatBanAccess access = this.discord.checkVRChatBanAccess(member.getId(), vrcActorId, vrcTargetId,
+            net.sybyline.scarlet.server.discord.DPerms.PermType.BUTTON_PRESS, operation);
+        if (!access.allowed())
+        {
+            hook.sendMessage(access.message).setEphemeral(true).queue();
             return false;
+        }
         
         GroupMemberStatus status = this.discord.scarlet.vrc.getGroupMembershipStatus(this.discord.scarlet.vrc.groupId, vrcTargetId);
         
@@ -396,16 +417,11 @@ public class ScarletDiscordUI
             return false;
         }
         
-        if (this.discord.scarlet.pendingModActions.addPending(GroupAuditType.USER_BAN, vrcTargetId, vrcActorId) != null)
+        ScarletDiscordJDA.VRChatBanAttempt attempt = this.discord.executeVRChatBan(member.getId(), access.actorId, vrcTargetId,
+            net.sybyline.scarlet.server.discord.DPerms.PermType.BUTTON_PRESS, operation);
+        if (!attempt.succeeded())
         {
-            hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
-            return false;
-        }
-        
-        if (!this.discord.scarlet.vrc.banFromGroup(vrcTargetId))
-        {
-            this.discord.scarlet.pendingModActions.pollPending(GroupAuditType.USER_BAN, vrcTargetId);
-            hook.sendMessageFormat("Failed to ban %s", sc.getDisplayName()).setEphemeral(true).queue();
+            hook.sendMessage(attempt.message).setEphemeral(true).queue();
             return false;
         }
         
@@ -462,14 +478,27 @@ public class ScarletDiscordUI
             return;
         }
         event.deferReply(true).queue();
-        this._timedBan(event.getHook(), event.getMember(), targetUserId, durationMillis);
+        this._timedBan(event.getHook(), event.getMember(), targetUserId, durationMillis,
+            net.sybyline.scarlet.server.discord.DPerms.PermType.MODAL_SUBMIT, "timed-ban-custom");
     }
 
     boolean _timedBan(InteractionHook hook, Member member, String vrcTargetId, long durationMillis)
     {
+        return this._timedBan(hook, member, vrcTargetId, durationMillis,
+            net.sybyline.scarlet.server.discord.DPerms.PermType.BUTTON_PRESS, "timed-ban");
+    }
+
+    boolean _timedBan(InteractionHook hook, Member member, String vrcTargetId, long durationMillis,
+        net.sybyline.scarlet.server.discord.DPerms.PermType type, String operation)
+    {
         if (!Boolean.TRUE.equals(this.discord.scarlet.timedBansEnabled.get()))
         {
             hook.sendMessage("Timed bans are disabled in Scarlet's settings.").setEphemeral(true).queue();
+            return false;
+        }
+        if (member == null)
+        {
+            hook.sendMessage("Cannot verify the requesting Discord member.").setEphemeral(true).queue();
             return false;
         }
         String vrcActorId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(member.getId());
@@ -488,52 +517,44 @@ public class ScarletDiscordUI
             return false;
         }
 
-        if (!this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, member))
-        {
-            if (!this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, member, false))
-            {
-                hook.sendMessage("You do not have permission to ban users.\n||(Your admin can enable this by giving your associated VRChat user ban management permissions in the group or with the command `/scarlet-discord-permissions type:Other name:groupex-bans-manage value:Allow`)||").setEphemeral(true).queue();
-                return false;
-            }
-        }
         if (training)
         {
-            // Training user: the permission checks above are real; the timed ban itself is simulated.
+            if (!this.checkTrainingBanPermission(hook, member)) return false;
             hook.sendMessageFormat("Banned the training user for %s. *(Training simulation — no real ban or unban timer was created.)*", formatDuration(durationMillis)).setEphemeral(false).queue();
             return true;
         }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, hook))
+        ScarletDiscordJDA.VRChatBanAccess access = this.discord.checkVRChatBanAccess(member.getId(), vrcActorId, vrcTargetId,
+            type, operation);
+        if (!access.allowed())
+        {
+            hook.sendMessage(access.message).setEphemeral(true).queue();
             return false;
+        }
 
         long expiresAt = System.currentTimeMillis() + durationMillis;
         long unbanEpochSec = expiresAt / 1000L;
         String human = formatDuration(durationMillis);
 
-        GroupMemberStatus status = this.discord.scarlet.vrc.getGroupMembershipStatus(this.discord.scarlet.vrc.groupId, vrcTargetId);
-
-        // Already banned → just attach/refresh a timer, converting a standing ban into a timed one.
-        if (status == GroupMemberStatus.BANNED)
+        // Only a newly authorized successful ban can create an automatic-unban timer.
+        // Existing bans are refused by the policy: their previous rank is not verifiable.
+        ScarletDiscordJDA.VRChatBanAttempt attempt = this.discord.executeVRChatBan(member.getId(), access.actorId, vrcTargetId,
+            type, operation, expiresAt);
+        if (!attempt.succeeded())
         {
-            this.discord.scarlet.pendingModActions.setTimedBan(vrcTargetId, expiresAt, vrcActorId);
-            hook.sendMessageFormat("%s is already banned — scheduled automatic unban in %s (<t:%d:R>)", sc.getDisplayName(), human, Long.valueOf(unbanEpochSec)).setEphemeral(false).queue();
-            return true;
-        }
-
-        // Otherwise ban now, then schedule the unban.
-        if (this.discord.scarlet.pendingModActions.addPending(GroupAuditType.USER_BAN, vrcTargetId, vrcActorId) != null)
-        {
-            hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
+            hook.sendMessage(attempt.message).setEphemeral(true).queue();
             return false;
         }
-        if (!this.discord.scarlet.vrc.banFromGroup(vrcTargetId))
-        {
-            this.discord.scarlet.pendingModActions.pollPending(GroupAuditType.USER_BAN, vrcTargetId);
-            hook.sendMessageFormat("Failed to ban %s", sc.getDisplayName()).setEphemeral(true).queue();
-            return false;
-        }
-        this.discord.scarlet.pendingModActions.setTimedBan(vrcTargetId, expiresAt, vrcActorId);
         hook.sendMessageFormat("Banned %s for %s — automatic unban <t:%d:R>", sc.getDisplayName(), human, Long.valueOf(unbanEpochSec)).setEphemeral(false).queue();
         return true;
+    }
+
+    private boolean checkTrainingBanPermission(InteractionHook hook, Member member)
+    {
+        if (this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, member)
+            || this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, member, false))
+            return true;
+        hook.sendMessage("You do not have permission to ban users, including training actions.").setEphemeral(true).queue();
+        return false;
     }
 
     /** Parse a duration like "30m", "6h", "3d", "2w", or a bare number (interpreted as hours). Returns millis, or -1 if unparseable. */
@@ -703,7 +724,7 @@ public class ScarletDiscordUI
         String targetUserId = parts[1];
         if (!this.checkPendingBanOwnership(event.getMember(), hook, event.getUser().getId(), targetUserId))
             return;
-        if (this._vrchatUserBan(hook, event.getMember(), targetUserId))
+        if (this._vrchatUserBan(hook, event.getMember(), targetUserId, "immediate-ban-confirm"))
         {
             event.getMessage().delete().queue();
         }
@@ -713,38 +734,42 @@ public class ScarletDiscordUI
     @ModalSub("vrchat-user-ban-multi")
     public void vrchatUserBanMulti(ModalInteractionEvent event)
     {
-        String vrcActorId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(event.getUser().getId());
-        if (vrcActorId == null)
+        String requestedGroupId = this.discord.scarlet.vrc.groupId, requestedGuildId = this.discord.guildSf;
+        // Fresh checks for every requested target can exceed Discord's acknowledgement window.
+        event.deferReply(true).queue();
+        InteractionHook hook = event.getHook();
+        ScarletDiscordJDA.VRChatBanAccess requester = this.discord.resolveVRChatBanRequester(event.getUser().getId(), null,
+            net.sybyline.scarlet.server.discord.DPerms.PermType.MODAL_SUBMIT, "vrchat-user-ban-multi");
+        if (!requester.allowed())
         {
-            event.reply(this.discord.linkedIdsReply(event.getUser())).setEphemeral(true).queue();
+            hook.sendMessage(requester.message).setEphemeral(true).queue();
             return;
         }
-        
-        if (!this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, event.getMember()))
-        {
-            if (!this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, event.getMember(), false))
-            {
-                event.reply("You do not have permission to unban users.\n||(Your admin can enable this by giving your associated VRChat user ban management permissions in the group or with the command `/scarlet-discord-permissions type:Other name:groupex-bans-manage value:Allow`)||").setEphemeral(true).queue();
-                return;
-            }
-        }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, event))
-            return;
-        
         List<ScarletDiscordJDA.Action> banActions = new ArrayList<>();
         
         for (Matcher m = FIND_USER_IDS.matcher(event.getValue("target-ids").getAsString()); m.find();)
-            banActions.add(new ScarletDiscordJDA.Action("ban", vrcActorId, m.group("id"), null));
+        {
+            String targetId = m.group("id");
+            ScarletDiscordJDA.VRChatBanAccess access = this.discord.checkVRChatBanAccess(event.getUser().getId(), requester.actorId,
+                targetId, net.sybyline.scarlet.server.discord.DPerms.PermType.MODAL_SUBMIT, "vrchat-user-ban-multi");
+            if (!access.allowed())
+            {
+                hook.sendMessage("No bans were queued: " + access.message).setEphemeral(true).queue();
+                return;
+            }
+            banActions.add(new ScarletDiscordJDA.Action("ban", access.actorId, targetId, null, event.getUser().getId(),
+                requestedGuildId, requestedGroupId));
+        }
         
         if (banActions.isEmpty())
         {
-            event.reply("No user ids found!").setEphemeral(true).queue();
+            hook.sendMessage("No user ids found!").setEphemeral(true).queue();
             return;
         }
         
         this.discord.queuedActions.addAll(banActions);
         
-        event.replyFormat("Queuing %s user ban(s)", banActions.size()).setEphemeral(true).queue();
+        hook.sendMessageFormat("Queuing %s user ban(s)", banActions.size()).setEphemeral(true).queue();
     }
 
     @ButtonClk("vrchat-user-unban")
@@ -815,6 +840,7 @@ public class ScarletDiscordUI
     @ModalSub("vrchat-user-unban-multi")
     public void vrchatUserUnbanMulti(ModalInteractionEvent event)
     {
+        String requestedGroupId = this.discord.scarlet.vrc.groupId, requestedGuildId = this.discord.guildSf;
         String vrcActorId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(event.getUser().getId());
         if (vrcActorId == null)
         {
@@ -833,10 +859,17 @@ public class ScarletDiscordUI
         if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, event))
             return;
         
+        if (!java.util.Objects.equals(requestedGroupId, this.discord.scarlet.vrc.groupId)
+            || !java.util.Objects.equals(requestedGuildId, this.discord.guildSf))
+        {
+            event.reply("The configured group changed during verification. Reopen the command; no unbans were queued.").setEphemeral(true).queue();
+            return;
+        }
         List<ScarletDiscordJDA.Action> unbanActions = new ArrayList<>();
         
         for (Matcher m = FIND_USER_IDS.matcher(event.getValue("target-ids").getAsString()); m.find();)
-            unbanActions.add(new ScarletDiscordJDA.Action("unban", vrcActorId, m.group("id"), null));
+            unbanActions.add(new ScarletDiscordJDA.Action("unban", vrcActorId, m.group("id"), null,
+                event.getUser().getId(), requestedGuildId, requestedGroupId));
         
         if (unbanActions.isEmpty())
         {
@@ -872,10 +905,21 @@ public class ScarletDiscordUI
             return;
         }
         
-        auditEntryMeta.entryRedacted = true;
-        
+        this.discord.beginLocalSummaryPrivacyChange();
+        try
+        {
+            auditEntryMeta = this.discord.scarlet.data.updateAuditEntryMetadata(auditEntryId, current -> {
+                current.entryRedacted = true;
+                return current;
+            });
+        }
+        finally { this.discord.endLocalSummaryPrivacyChange(); }
+        if (auditEntryMeta == null)
+        {
+            hook.sendMessage("The audit event is no longer available. Nothing changed.").setEphemeral(true).queue();
+            return;
+        }
         hook.sendMessage("Event redacted.").setEphemeral(false).queue();
-        this.discord.scarlet.data.auditEntryMetadata(auditEntryId, auditEntryMeta);
         this.updateAuxMessage(event.getChannel(), auditEntryMeta);
     }
     
@@ -883,15 +927,21 @@ public class ScarletDiscordUI
     {
         if (auditEntryMeta.hasMessage() && auditEntryMeta.auxMessageSnowflake != null && auditEntryMeta.entry != null)
         {
-            ScarletData.UserMetadata actorMeta = this.discord.scarlet.data.userMetadata(auditEntryMeta.entry.getActorId());
+            String actorId = auditEntryMeta.hasAuxActor() ? auditEntryMeta.auxActorId : auditEntryMeta.entry.getActorId();
+            ScarletData.UserMetadata actorMeta = this.discord.scarlet.data.userMetadata(actorId);
             String content = auditEntryMeta.entryRedacted ? "# **__REDACTED__**\n\n" : "";
-            content = content + (actorMeta == null || actorMeta.userSnowflake == null ? ("Unknown Discord id for actor "+auditEntryMeta.entry.getActorDisplayName()) : ("<@"+actorMeta.userSnowflake+">"));
+            // An old message can outlive routing changes or a newly confidential staff identity.
+            // Edits must not introduce (or reintroduce) a confidential name/mention.
+            boolean confidential = ScarletAuditPrivacy.confidential(auditEntryMeta, this.discord.scarlet.secretStaffList::isSecretStaffId);
+            content = content + (confidential ? "Confidential staff action" : actorMeta == null || actorMeta.userSnowflake == null
+                ? "Unknown Discord id for actor " + (auditEntryMeta.hasAuxActor() ? auditEntryMeta.auxActorDisplayName : auditEntryMeta.entry.getActorDisplayName())
+                : "<@" + actorMeta.userSnowflake + ">");
             if (auditEntryMeta.entryTags != null && auditEntryMeta.entryTags.size() > 0)
             {
                 String joined = auditEntryMeta.entryTags.strings().stream().map(this.discord.scarlet.moderationTags::getTagLabel).collect(Collectors.joining(", "));
                 content = content + "\n### Tags:\n" + joined;
             }
-            if (auditEntryMeta.entryDescription != null && !auditEntryMeta.entryDescription.trim().isEmpty())
+            if (!confidential && auditEntryMeta.entryDescription != null && !auditEntryMeta.entryDescription.trim().isEmpty())
             {
                 content = content + "\n### Description:\n" + auditEntryMeta.entryDescription;
             }
@@ -922,10 +972,21 @@ public class ScarletDiscordUI
             return;
         }
         
-        auditEntryMeta.entryRedacted = false;
-        
+        this.discord.beginLocalSummaryPrivacyChange();
+        try
+        {
+            auditEntryMeta = this.discord.scarlet.data.updateAuditEntryMetadata(auditEntryId, current -> {
+                current.entryRedacted = false;
+                return current;
+            });
+        }
+        finally { this.discord.endLocalSummaryPrivacyChange(); }
+        if (auditEntryMeta == null)
+        {
+            hook.sendMessage("The audit event is no longer available. Nothing changed.").setEphemeral(true).queue();
+            return;
+        }
         hook.sendMessage("Event unredacted.").setEphemeral(false).queue();
-        this.discord.scarlet.data.auditEntryMetadata(auditEntryId, auditEntryMeta);
         this.updateAuxMessage(event.getChannel(), auditEntryMeta);
     }
 
@@ -1244,10 +1305,16 @@ public class ScarletDiscordUI
                metaDescription = null,
                metaTags[] = null;
         
-        String eventUserSnowflake = event.getUser().getId(),
-               eventUserId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(eventUserSnowflake);
-        
         ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
+        // Old public report buttons can survive an actor becoming confidential or an event being redacted.
+        // An ephemeral response protects its audience, but does not itself authorize the requester.
+        if (event.getMember() == null || !this.discord.auditVisibleTo(auditEntryMeta, event.getMember().getId()))
+        {
+            hook.sendMessage("This audit event is unavailable or you do not have access to its report details.")
+                .setEphemeral(true).queue();
+            return;
+        }
+        String rawActorId = auditEntryMeta.entry.getActorId();
         if (auditEntryMeta != null && auditEntryMeta.entry != null)
         {
             targetUserId = auditEntryMeta.entry.getTargetId();
@@ -1326,59 +1393,25 @@ public class ScarletDiscordUI
                       ;
         }
         
-        String requestingUserId = eventUserId != null ? eventUserId : actorUserId;
-        
         String requestingEmail = this.discord.requestingEmail.get();
-        
-        String link = VRChatHelpDeskURLs.newModerationRequest_account_other(
-            requestingEmail,
-            targetUserId,
-            reportSubject,
-            reportDesc.length() == 0 ? null : reportDesc.toString()
-        );
-        
-        
-        // VRChat now steers general reports to in-app reporting and restricts the Help Desk form to
-        // appeals and evidence-backed reports (help.vrchat.com Trust & Safety Reporting Changes), and it
-        // requires signing in. So the primary output is a plain-text, copy-paste report block a signed-in
-        // moderator pastes into the in-app report (or the Help Desk for appeals/evidence). The pre-filled
-        // Help Desk link is kept but labelled for its now-narrow use.
-        String plainReport = reportHtmlToPlain(params.format(this.discord.appendTemplateFooter.get()));
-        String reportedWho = reportSubject != null ? reportSubject : (targetDisplayName != null ? targetDisplayName : targetUserId);
-        String block = MiscUtils.maybeEllipsis(1500, plainReport);
-        StringBuilder content = new StringBuilder();
-        content.append("**Copy-paste report for ").append(reportedWho == null ? "user" : MarkdownSanitizer.escape(reportedWho)).append("**\n");
-        content.append("Paste this into VRChat's **in-app** report (now the primary method). The Help Desk only accepts **appeals** and **evidence-backed** reports \u2014 general reports filed there are auto-closed.\n");
-        content.append("```\n").append(block).append("\n```");
-        if (eventUserId == null)
-            content.append("\n\u26a0 The Help Desk link below autofills the requesting id of the **audit actor, not you** \u2014 associate your ids with `/associate-ids`.");
-
-        hook.sendMessageEmbeds(new EmbedBuilder()
-                .setTitle("Help Desk link (appeals / evidence-backed reports only)")
-                .appendDescription("[Open VRChat moderation request](<")
-                .appendDescription(link)
-                .appendDescription(">)\nFor a general report, use in-app reporting and paste the block above.")
-            .build())
-            .setContent(MiscUtils.maybeEllipsis(2000, content.toString()))
+        // Use the same configured template for the restored autofill link and the copyable report.
+        // An unconfigured template falls back to the event's notes, tags, and identifying footer.
+        String templateHtml = this.discord.scarlet.vrcReport.get().trim().isEmpty() ? null
+            : params.format(this.discord.appendTemplateFooter.get());
+        // Lookups and template expansion may take time. Recheck both the latest event policy and
+        // the identities captured in this payload before returning an old button's report.
+        if (!this.discord.auditVisibleTo(this.discord.scarlet.data.auditEntryMetadata(auditEntryId), event.getMember().getId())
+            || this.discord.shouldRedact(rawActorId, event.getMember().getId())
+            || this.discord.shouldRedact(actorUserId, event.getMember().getId()))
+        {
+            hook.sendMessage("This audit event is unavailable or you do not have access to its report details.")
+                .setEphemeral(true).queue();
+            return;
+        }
+        hook.sendMessage(ScarletVRChatReportMessage.create(
+                requestingEmail, targetUserId, reportSubject, reportDesc.toString(), templateHtml))
             .setEphemeral(true)
             .queue();
-    }
-
-    /** Converts the report template's HTML (as built for the Zendesk description field) into clean
-     *  plain text a moderator can paste into VRChat's in-app report or Help Desk form. */
-    static String reportHtmlToPlain(String html)
-    {
-        if (html == null)
-            return "";
-        String out = html;
-        out = out.replaceAll("(?i)<br\\s*/?>", "\n");
-        out = out.replaceAll("(?i)<li>", "- ");
-        out = out.replaceAll("(?i)</li>", "\n");
-        out = out.replaceAll("(?i)</?ul>", "");
-        out = out.replaceAll("<[^>]+>", "");
-        out = out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">");
-        out = out.replaceAll("\n{3,}", "\n\n");
-        return out.trim();
     }
 
     @ButtonClk("view-potential-avatar-matches")
@@ -1422,106 +1455,103 @@ public class ScarletDiscordUI
     @Ephemeral
     public void viewSnapshotUser(ButtonInteractionEvent event, InteractionHook hook)
     {
-        String[] parts = event.getButton().getCustomId().split(":");
-        String auditEntryId = parts[1];
-        ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
-        if (auditEntryMeta == null)
-        {
-            hook.sendMessage("Failed to find the audit event.").setEphemeral(true).queue();
-            return;
-        }
-        if (auditEntryMeta.snapshotTargetUser == null)
-        {
-            hook.sendMessage("This event has no user snapshot available.").setEphemeral(true).queue();
-            return;
-        }
-        MessageEmbed[] embeds = auditEntryMeta.snapshotTargetUser.entrySet().stream().map($ ->
-        {
-            EmbedBuilder embed = new EmbedBuilder().setTitle($.getKey());
-            JsonElement value = $.getValue();
-            if (value.isJsonObject())
-            {
-                value.getAsJsonObject().entrySet().forEach($$ -> embed.addField($$.getKey(), String.valueOf($$.getValue()), false));
-            }
-            else if (value.isJsonArray())
-            {
-                value.getAsJsonArray().forEach($$ -> embed.addField("", String.valueOf($$), false));
-            }
-            else
-            {
-                embed.setDescription(String.valueOf(value));
-            }
-            return embed.build();
-        }).toArray(MessageEmbed[]::new);
-        this.discord.interactions.new Pagination(event.getId(), embeds, 10).queue(hook);
+        this.viewSnapshot(event, hook, "view-snapshot-user", 0);
     }
 
     @ButtonClk("view-snapshot-user-groups")
     @Ephemeral
     public void viewSnapshotUserGroups(ButtonInteractionEvent event, InteractionHook hook)
     {
-        String[] parts = event.getButton().getCustomId().split(":");
-        String auditEntryId = parts[1];
-        ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
-        if (auditEntryMeta == null)
-        {
-            hook.sendMessage("Failed to find the audit event.").setEphemeral(true).queue();
-            return;
-        }
-        if (auditEntryMeta.snapshotTargetUserGroups == null)
-        {
-            hook.sendMessage("This event has no user snapshot available.").setEphemeral(true).queue();
-            return;
-        }
-        MessageEmbed[] embeds = auditEntryMeta.snapshotTargetUserGroups.asList().stream().map($ ->
-        {
-            JsonObject object = $.getAsJsonObject();
-            EmbedBuilder embed = new EmbedBuilder();
-            embed.setAuthor(object.get(LimitedUserGroups.SERIALIZED_NAME_SHORT_CODE).getAsString()+"."+object.get(LimitedUserGroups.SERIALIZED_NAME_DISCRIMINATOR).getAsString(), null, object.get(LimitedUserGroups.SERIALIZED_NAME_ICON_URL).getAsString());
-            embed.setTitle(MarkdownSanitizer.escape(object.get(LimitedUserGroups.SERIALIZED_NAME_NAME).getAsString()), VrcWeb.Home.group(object.get(LimitedUserGroups.SERIALIZED_NAME_GROUP_ID).getAsString()));
-            embed.setDescription(object.get(LimitedUserGroups.SERIALIZED_NAME_DESCRIPTION).getAsString());
-            embed.setThumbnail(object.get(LimitedUserGroups.SERIALIZED_NAME_BANNER_URL).getAsString());
-            return embed.build();
-        }).toArray(MessageEmbed[]::new);
-        this.discord.interactions.new Pagination(event.getId(), embeds, 10).queue(hook);
+        this.viewSnapshot(event, hook, "view-snapshot-user-groups", 1);
     }
 
     @ButtonClk("view-snapshot-user-represented-group")
     @Ephemeral
     public void viewSnapshotUserRepresentedGroup(ButtonInteractionEvent event, InteractionHook hook)
     {
-        String[] parts = event.getButton().getCustomId().split(":");
-        String auditEntryId = parts[1];
-        ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
-        if (auditEntryMeta == null)
+        this.viewSnapshot(event, hook, "view-snapshot-user-represented-group", 2);
+    }
+
+    private void viewSnapshot(ButtonInteractionEvent event, InteractionHook hook, String operation, int kind)
+    {
+        String customId = event.getButton().getCustomId();
+        String prefix = operation + ":";
+        String auditId = customId != null && customId.startsWith(prefix) ? customId.substring(prefix.length()) : "";
+        ScarletData.AuditEntryMetadata metadata = this.snapshotMetadata(auditId);
+        String requester = event.getMember() == null ? null : event.getMember().getId();
+        Message origin = event.getMessage();
+        if (!this.snapshotAllowed(metadata, requester, origin, operation))
         {
-            hook.sendMessage("Failed to find the audit event.").setEphemeral(true).queue();
+            hook.sendMessage("This snapshot is unavailable or you no longer have access to its audit event.")
+                .setEphemeral(true).queue();
             return;
         }
-        if (auditEntryMeta.snapshotTargetUserRepresentedGroup == null)
+        // Project again: old files may still contain the original unfiltered self-account response.
+        MessageEmbed[] embeds = kind == 0 ? ScarletSnapshotPrivacy.embeds(ScarletSnapshotPrivacy.user(
+            metadata.snapshotTargetUser, metadata.entry.getTargetId()))
+            : kind == 1 ? ScarletSnapshotPrivacy.groupEmbeds(ScarletSnapshotPrivacy.groups(metadata.snapshotTargetUserGroups))
+            : ScarletSnapshotPrivacy.embeds(ScarletSnapshotPrivacy.group(metadata.snapshotTargetUserRepresentedGroup));
+        if (!this.snapshotAllowed(metadata, requester, origin, operation))
         {
-            hook.sendMessage("This event has no user represented group snapshot available.").setEphemeral(true).queue();
+            hook.sendMessage("This snapshot is unavailable or you no longer have access to its audit event.")
+                .setEphemeral(true).queue();
             return;
         }
-        MessageEmbed[] embeds = auditEntryMeta.snapshotTargetUserRepresentedGroup.entrySet().stream().map($ ->
+        if (embeds.length == 0)
         {
-            EmbedBuilder embed = new EmbedBuilder().setTitle($.getKey());
-            JsonElement value = $.getValue();
-            if (value.isJsonObject())
-            {
-                value.getAsJsonObject().entrySet().forEach($$ -> embed.addField($$.getKey(), String.valueOf($$.getValue()), false));
-            }
-            else if (value.isJsonArray())
-            {
-                value.getAsJsonArray().forEach($$ -> embed.addField("", String.valueOf($$), false));
-            }
-            else
-            {
-                embed.setDescription(String.valueOf(value));
-            }
-            return embed.build();
-        }).toArray(MessageEmbed[]::new);
-        this.discord.interactions.new Pagination(event.getId(), embeds, 10).queue(hook);
+            hook.sendMessage("This event has no verified public snapshot information available.")
+                .setEphemeral(true).queue();
+            return;
+        }
+        this.discord.interactions.new Pagination(event.getId(), embeds, 1)
+            .restrictTo(requester, interaction -> this.snapshotAllowed(metadata,
+                interaction.getMember() == null ? null : interaction.getMember().getId(), origin, operation))
+            .queue(hook);
+    }
+
+    private ScarletData.AuditEntryMetadata snapshotMetadata(String auditId)
+    {
+        if (auditId == null || !VrcIds.id_groupaudit.matcher(auditId).matches()) return null;
+        try
+        {
+            ScarletData.AuditEntryMetadata metadata = this.discord.scarlet.data.auditEntryMetadata(auditId);
+            return metadata != null && metadata.entry != null && auditId.equals(metadata.entry.getId()) ? metadata : null;
+        }
+        catch (RuntimeException unavailable)
+        {
+            return null;
+        }
+    }
+
+    boolean snapshotAllowed(ScarletData.AuditEntryMetadata snapshot, String requester, Message origin, String operation)
+    {
+        try
+        {
+            ScarletData.AuditEntryMetadata current = snapshot == null || snapshot.entry == null ? null
+                : this.snapshotMetadata(snapshot.entry.getId());
+            if (!ScarletAuditPrivacy.sameRecordedAudit(snapshot, current) || requester == null || origin == null
+                || current.entry.getActorId() == null || current.entry.getActorId().trim().isEmpty()
+                || current.entry.getTargetId() == null || !VrcIds.id_user.matcher(current.entry.getTargetId()).matches()
+                || !origin.isFromGuild() || origin.isWebhookMessage() || this.discord.jda == null
+                || this.discord.guildSf == null || !this.discord.guildSf.equals(origin.getGuild().getId())
+                || !this.discord.guildSf.equals(current.guildSnowflake)
+                || !this.discord.jda.getSelfUser().getId().equals(origin.getAuthor().getId())
+                || current.auxMessageSnowflake == null || !current.auxMessageSnowflake.equals(origin.getId())
+                || !Objects.equals(snapshot.auxMessageSnowflake, current.auxMessageSnowflake)
+                || current.threadSnowflake == null || !current.threadSnowflake.equals(origin.getChannel().getId())) return false;
+            Member member = origin.getGuild().getMemberById(requester);
+            ThreadChannel thread = origin.getGuild().getThreadChannelById(current.threadSnowflake);
+            return member != null && thread != null && this.discord.perms != null
+                && this.discord.perms.checkOperation(member, DPerms.PermType.BUTTON_PRESS, operation)
+                && member.hasPermission(thread, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY)
+                && this.discord.auditVisibleTo(current, requester)
+                && this.discord.auditThreadDestinationProblem(current, thread) == null;
+        }
+        catch (RuntimeException unavailable)
+        {
+            // A missing/corrupt record, policy or Discord cache must never authorize disclosure.
+            return false;
+        }
     }
 
     @ButtonClk("submit-evidence")
@@ -1638,7 +1668,9 @@ public class ScarletDiscordUI
                         dest.getParentFile().mkdirs();
                     attachment.getProxy().downloadToFile(dest).join();
                     
-                    auditEntryTargetUserMeta.addUserCaseEvidence(new ScarletData.EvidenceSubmission(auditEntryId, requesterSf, requesterDisplayName, timestamp, fileName, filePath.prevFormat(), attachmentUrl, attachmentProxyUrl));
+                    ScarletData.EvidenceSubmission evidence = new ScarletData.EvidenceSubmission(auditEntryId, requesterSf, requesterDisplayName, timestamp, fileName, filePath.prevFormat(), attachmentUrl, attachmentProxyUrl);
+                    auditEntryTargetUserMeta = this.discord.scarlet.data.updateUserMetadata(auditEntryTargetId,
+                        metadata -> { metadata.addUserCaseEvidence(evidence); return metadata; });
                     
                     hook.sendMessageFormat("Saved '%s'.", filePath.prevFormat()).setEphemeral(true).queue();
                     LOG.info(String.format("%s (<@%s>) saved evidence to '%s'.", requesterDisplayName, requesterSf, filePath.prevFormat()));
@@ -1650,7 +1682,6 @@ public class ScarletDiscordUI
                 }
             }
             
-            this.discord.scarlet.data.userMetadata(auditEntryTargetId, auditEntryTargetUserMeta);
         }
     }
 
@@ -1767,15 +1798,26 @@ public class ScarletDiscordUI
     @Ephemeral
     public void discordKickConfirm(ButtonInteractionEvent event, InteractionHook hook)
     {
+        if (!this.discord.scarlet.discordKickBanEnabled.get())
+        {
+            hook.sendMessage("Discord moderation is disabled.").queue();
+            return;
+        }
         if (event.getMember() == null || !event.getMember().hasPermission(net.dv8tion.jda.api.Permission.KICK_MEMBERS))
         {
             hook.sendMessage("You do not have permission to kick members.").setEphemeral(true).queue();
             return;
         }
-        // Split with limit 3 so a colon inside the reason is preserved intact
-        String[] parts = event.getButton().getCustomId().split(":", 3);
-        String targetId = parts[1];
-        String reason = parts.length > 2 ? parts[2] : null;
+        String[] parts = event.getButton().getCustomId().split(":", 2);
+        ScarletDiscordJDA.PendingDiscordModeration pending = parts.length == 2
+            ? this.discord.consumeDiscordModeration(parts[1], event.getUser().getId(), net.dv8tion.jda.api.Permission.KICK_MEMBERS) : null;
+        if (pending == null)
+        {
+            hook.sendMessage("This confirmation expired, was already used, or belongs to another requester. Run the command again.").queue();
+            return;
+        }
+        String targetId = pending.target;
+        String reason = pending.reason;
 
         net.dv8tion.jda.api.entities.Guild guild =
             this.discord.jda.getGuildById(this.discord.guildSf);
@@ -1825,8 +1867,15 @@ public class ScarletDiscordUI
             return;
         }
 
+        final Member actorMember;
+        try { actorMember = guild.retrieveMemberById(event.getUser().getId()).complete(); }
+        catch (Exception ex) { hook.sendMessage("Unable to verify your current permissions. No action taken.").queue(); return; }
+        if (!DiscordModerationAuthorization.allowed(actorMember, target, net.dv8tion.jda.api.Permission.KICK_MEMBERS))
+        {
+            hook.sendMessage("Your current permission or role hierarchy does not allow this kick.").queue();
+            return;
+        }
         String name = target.getEffectiveName();
-        final Member actorMember = event.getMember();
         String actor = actorMember != null
             ? actorMember.getEffectiveName()
             : event.getUser().getName();
@@ -1853,7 +1902,14 @@ public class ScarletDiscordUI
         final String finalGuildId = guild.getId();
 
         // Helper runnable that performs the actual kick
-        Runnable doKick = () -> guild.kick(finalTarget)
+        Runnable doKick = () -> {
+            if (!this.discord.scarlet.discordKickBanEnabled.get()
+                || !DiscordModerationAuthorization.allowed(guild.getMemberById(actorMember.getId()), guild.getMemberById(finalTargetId), net.dv8tion.jda.api.Permission.KICK_MEMBERS))
+            {
+                hook.sendMessage("Permissions or member hierarchy changed while confirming; no kick performed.").queue();
+                return;
+            }
+            guild.kick(finalTarget)
             .reason(finalAuditReason)
             .queue(
                 success -> {
@@ -1872,6 +1928,7 @@ public class ScarletDiscordUI
                     hook.sendMessageFormat("Failed to kick **%s**: %s",
                         MarkdownSanitizer.escape(finalName), error.getMessage()).queue();
                 });
+        };
 
         // DM the user FIRST; the kick only fires after the DM attempt has fully
         // settled (success or failure). This ensures the user still shares a mutual
@@ -1910,15 +1967,26 @@ public class ScarletDiscordUI
     @Ephemeral
     public void discordBanConfirm(ButtonInteractionEvent event, InteractionHook hook)
     {
+        if (!this.discord.scarlet.discordKickBanEnabled.get())
+        {
+            hook.sendMessage("Discord moderation is disabled.").queue();
+            return;
+        }
         if (event.getMember() == null || !event.getMember().hasPermission(net.dv8tion.jda.api.Permission.BAN_MEMBERS))
         {
             hook.sendMessage("You do not have permission to ban members.").setEphemeral(true).queue();
             return;
         }
-        // Split with limit 3 so a colon inside the reason is preserved intact
-        String[] parts = event.getButton().getCustomId().split(":", 3);
-        String targetId = parts[1];
-        String reason = parts.length > 2 ? parts[2] : null;
+        String[] parts = event.getButton().getCustomId().split(":", 2);
+        ScarletDiscordJDA.PendingDiscordModeration pending = parts.length == 2
+            ? this.discord.consumeDiscordModeration(parts[1], event.getUser().getId(), net.dv8tion.jda.api.Permission.BAN_MEMBERS) : null;
+        if (pending == null)
+        {
+            hook.sendMessage("This confirmation expired, was already used, or belongs to another requester. Run the command again.").queue();
+            return;
+        }
+        String targetId = pending.target;
+        String reason = pending.reason;
 
         net.dv8tion.jda.api.entities.Guild guild =
             this.discord.jda.getGuildById(this.discord.guildSf);
@@ -1943,8 +2011,8 @@ public class ScarletDiscordUI
         }
         catch (Exception ex)
         {
-            // Member may have already left — we can still ban by ID
-            target = null;
+            hook.sendMessage("Unable to verify the member's current role hierarchy. No ban performed.").queue();
+            return;
         }
 
         String name;
@@ -1970,7 +2038,14 @@ public class ScarletDiscordUI
             name = targetId;
         }
 
-        final Member actorMember = event.getMember();
+        final Member actorMember;
+        try { actorMember = guild.retrieveMemberById(event.getUser().getId()).complete(); }
+        catch (Exception ex) { hook.sendMessage("Unable to verify your current permissions. No action taken.").queue(); return; }
+        if (!DiscordModerationAuthorization.allowed(actorMember, target, net.dv8tion.jda.api.Permission.BAN_MEMBERS))
+        {
+            hook.sendMessage("Your current permission or role hierarchy does not allow this ban.").queue();
+            return;
+        }
         String actor = actorMember != null
             ? actorMember.getEffectiveName()
             : event.getUser().getName();
@@ -1997,7 +2072,14 @@ public class ScarletDiscordUI
         net.dv8tion.jda.api.entities.UserSnowflake snowflake =
             target != null ? target : net.dv8tion.jda.api.entities.UserSnowflake.fromId(targetId);
 
-        Runnable doBan = () -> guild.ban(snowflake, 0, java.util.concurrent.TimeUnit.DAYS)
+        Runnable doBan = () -> {
+            if (!this.discord.scarlet.discordKickBanEnabled.get()
+                || !DiscordModerationAuthorization.allowed(guild.getMemberById(actorMember.getId()), guild.getMemberById(finalTargetId), net.dv8tion.jda.api.Permission.BAN_MEMBERS))
+            {
+                hook.sendMessage("Permissions or member hierarchy changed while confirming; no ban performed.").queue();
+                return;
+            }
+            guild.ban(snowflake, 0, java.util.concurrent.TimeUnit.DAYS)
             .reason(finalAuditReason)
             .queue(
                 success -> {
@@ -2016,6 +2098,7 @@ public class ScarletDiscordUI
                     hook.sendMessageFormat("Failed to ban **%s**: %s",
                         MarkdownSanitizer.escape(finalName), error.getMessage()).queue();
                 });
+        };
 
         if (target != null)
         {
@@ -2072,16 +2155,23 @@ public class ScarletDiscordUI
             event.replyFormat("%s isn't a valid audit log event type", auditType0).setEphemeral(true).queue();
             return;
         }
+        if (event.getValues().stream().anyMatch(name -> !this.discord.scarletAuxWh2webhookUrl.containsKey(name)))
+        {
+            event.reply("One of the selected webhooks no longer exists. Open a new selector and try again. Nothing changed.").setEphemeral(true).queue();
+            return;
+        }
         if (event.getValues().isEmpty())
         {
-            event.replyFormat("Removing auxiliary webhooks for %s", auditType0).setEphemeral(true).queue();
             this.discord.auditType2scarletAuxWh.remove(auditType0);
+            this.discord.save();
+            event.replyFormat("Removing auxiliary webhooks for %s", auditType0).setEphemeral(true).queue();
         }
         else
         {
+            this.discord.auditType2scarletAuxWh.put(auditType0, new UniqueStrings(event.getValues()));
+            this.discord.save();
             event.replyFormat("Setting auxiliary webhooks for %s:\n%s", auditType0,
                 event.getValues().stream().collect(Collectors.joining(", "))).setEphemeral(true).queue();
-            this.discord.auditType2scarletAuxWh.put(auditType0, new UniqueStrings(event.getValues()));
         }
     }
 

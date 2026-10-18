@@ -24,7 +24,7 @@ public class DaveSessionInstance implements Closeable
         this.handle = handle;
     }
 
-    final DaveLibrary.DAVESessionHandle handle;
+    volatile DaveLibrary.DAVESessionHandle handle;
     DaveLibrary.DAVEMLSFailureCallback _callback;
 
     public boolean _isHandleValid()
@@ -33,9 +33,11 @@ public class DaveSessionInstance implements Closeable
     }
 
     @Override
-    public void close()
+    public synchronized void close()
     {
-        DaveLibrary.INSTANCE.daveSessionDestroy(this.handle);
+        DaveLibrary.DAVESessionHandle previous = this.handle;
+        this.handle = null;
+        if (previous != null) DaveLibrary.INSTANCE.daveSessionDestroy(previous);
     }
 
     public void init(short version, long groupId, String selfUserId)

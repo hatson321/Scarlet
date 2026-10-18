@@ -1007,7 +1007,7 @@ public class HttpURLInputStream extends FilterInputStream
             SSLContext sslContext = SSLContext.getInstance("TLS");
             sslContext.init(null, new TrustManager[] { composite }, null);
             compatSocketFactory = sslContext.getSocketFactory();
-            Scarlet.LOG.warn("Using KozyBlake/Scarlet's bundled HTTPS compatibility certificates for legacy Java trust stores");
+            Scarlet.LOG.warn("Using Hatson321/Scarlet Logger's bundled HTTPS compatibility certificates for legacy Java trust stores");
         }
         catch (Exception ex)
         {

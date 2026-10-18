@@ -7,6 +7,7 @@ import java.awt.GraphicsEnvironment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
@@ -74,6 +75,7 @@ public class TtsPackageInstallDialogs
         ALREADY_INSTALLED,
         INSTALL_APPROVED_SUCCESS,
         INSTALL_APPROVED_FAILED,
+        INSTALL_UNAVAILABLE,
         INSTALL_DECLINED,
         HEADLESS_MODE
     }
@@ -85,12 +87,18 @@ public class TtsPackageInstallDialogs
             showInfo("TTS Package Status",
                 "<h2 style='color:#4CAF50;'>&#10003; Package Already Installed</h2>" +
                 "<p style='margin-top:10px;'>" + getPackageDisplayName() + " is already installed.</p>" +
-                "<p style='margin-top:10px;color:#888;'>KozyBlake/Scarlet's text-to-speech functionality is ready to use.</p>");
+                "<p style='margin-top:10px;color:#888;'>Hatson321/Scarlet Logger's text-to-speech functionality is ready to use.</p>");
             return InstallDialogResult.ALREADY_INSTALLED;
         }
 
         if (GraphicsEnvironment.isHeadless())
             return handleHeadlessMode();
+
+        if (LinuxPackageManagerDetector.getPrimaryTtsPackageManager() == null)
+        {
+            showNoPackageManagerDialog();
+            return InstallDialogResult.INSTALL_UNAVAILABLE;
+        }
 
         if (!showDownloadConsentDialog())
         {
@@ -109,7 +117,7 @@ public class TtsPackageInstallDialogs
         showInfo("TTS Package Status",
             "<h2 style='color:#4CAF50;'>&#10003; Package Already Installed</h2>" +
             "<p style='margin-top:10px;'>" + getPackageDisplayName() + " is already installed.</p>" +
-            "<p style='margin-top:10px;color:#888;'>KozyBlake/Scarlet's text-to-speech functionality is ready to use.</p>");
+            "<p style='margin-top:10px;color:#888;'>Hatson321/Scarlet Logger's text-to-speech functionality is ready to use.</p>");
     }
 
     public void showOptionalPackageInstallDialog()
@@ -131,9 +139,7 @@ public class TtsPackageInstallDialogs
             LinuxPackageManagerDetector.detectAllTtsPackageManagers();
         if (managers.isEmpty())
         {
-            showError("No Package Manager Detected",
-                "<h3 style='color:#F44336;'>&#10007; No Package Manager Detected</h3>" +
-                "<p style='margin-top:10px;'>Could not detect a package manager with known TTS packages.</p>");
+            showNoPackageManagerDialog();
             return;
         }
 
@@ -150,6 +156,7 @@ public class TtsPackageInstallDialogs
             JLabel header = new JLabel("<html><div style='width:520px;'>" +
                 "<h3>Install extra Linux TTS voices</h3>" +
                 "<p>Choose exactly which additional command-line TTS engines Scarlet should ask your package manager to install. Nothing here is installed automatically.</p>" +
+                atomicInstallNoticeHtml() +
                 "</div></html>");
             panel.add(header, BorderLayout.NORTH);
 
@@ -248,11 +255,14 @@ public class TtsPackageInstallDialogs
 
         List<LinuxPackageManagerDetector.PackageManager> managers = LinuxPackageManagerDetector.detectAllTtsPackageManagers();
         LinuxPackageManagerDetector.PackageManager primary = managers.isEmpty() ? null : managers.get(0);
-        String installCmd = primary != null
-            ? primary.getInstallCommand()
-            : getLinuxInstallCommand();
+        if (primary == null)
+        {
+            showNoPackageManagerDialog();
+            return false;
+        }
+        String installCmd = primary.getInstallCommand();
 
-        StringBuilder pmInfo = new StringBuilder();
+        StringBuilder pmInfo = new StringBuilder(atomicInstallNoticeHtml());
         if (managers.size() > 1)
         {
             pmInfo.append("<p style='margin-top:10px;'><b>Detected package managers:</b><br>");
@@ -275,14 +285,14 @@ public class TtsPackageInstallDialogs
         panel.add(header, BorderLayout.NORTH);
         panel.add(new JLabel(String.format(
             "<html><div style='width:450px;padding:5px;'>" +
-            "<p style='margin-bottom:10px;'>KozyBlake/Scarlet needs a local <b>%s</b> package for Linux text-to-speech.</p>" +
+            "<p style='margin-bottom:10px;'>Hatson321/Scarlet Logger needs a local <b>%s</b> package for Linux text-to-speech.</p>" +
             "<p style='margin-bottom:10px;'>%s</p>" +
             "<p style='margin-bottom:10px;'><b>The following command will be executed:</b></p>" +
             "<pre style='background-color:#2d2d2d;padding:10px;border-radius:5px;font-family:monospace;'>%s</pre>" +
             "%s" +
             "<p style='margin-top:10px;color:#FF9800;'>&#9888; This will download and install software from your system's package manager.</p>" +
             "</div></html>",
-            getPackageDisplayName(), LINUX_PACKAGE_DESCRIPTION.replace("\n", "<br>"), installCmd, pmInfo
+            getPackageDisplayName(), LINUX_PACKAGE_DESCRIPTION.replace("\n", "<br>"), html(installCmd), pmInfo
         )), BorderLayout.CENTER);
         panel.add(new JLabel("<html><div style='margin-top:10px;padding-top:10px;border-top:1px solid #444;'>" +
             "<b>Yes</b> - Install the package (a progress window will show output; password prompt if needed)<br>" +
@@ -302,8 +312,8 @@ public class TtsPackageInstallDialogs
     {
         if (GraphicsEnvironment.isHeadless())
         {
-            System.out.println("[KozyBlake/Scarlet/TTS] TTS package installation declined. TTS features will be disabled.");
-            System.out.println("[KozyBlake/Scarlet/TTS] You can manually install " + getPackageDisplayName() + " later to enable TTS functionality.");
+            System.out.println("[Hatson321/Scarlet Logger/TTS] TTS package installation declined. TTS features will be disabled.");
+            System.out.println("[Hatson321/Scarlet Logger/TTS] You can manually install " + getPackageDisplayName() + " later to enable TTS functionality.");
             return;
         }
 
@@ -314,7 +324,7 @@ public class TtsPackageInstallDialogs
             cmdsHtml.append("<p style='margin-top:15px;'><b>You can install the package later by running one of:</b></p>")
                     .append("<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>");
             for (int i = 0; i < Math.min(3, commands.size()); i++)
-                cmdsHtml.append(commands.get(i)).append("\n");
+                cmdsHtml.append(html(commands.get(i))).append("\n");
             cmdsHtml.append("</pre>");
         }
 
@@ -327,7 +337,7 @@ public class TtsPackageInstallDialogs
                 "<ul style='margin-top:5px;'>" +
                 "<li>Text-to-speech notifications will not be available</li>" +
                 "<li>Audio announcements in Discord will be disabled</li>" +
-                "<li>Other KozyBlake/Scarlet features will continue to work normally</li>" +
+                "<li>Other Hatson321/Scarlet Logger features will continue to work normally</li>" +
                 "</ul>%s</div></html>",
                 getPackageDisplayName(), cmdsHtml
             ));
@@ -353,10 +363,7 @@ public class TtsPackageInstallDialogs
         if (pm == null)
         {
             LOG.error("No package manager detected");
-            showError("No Package Manager Detected",
-                "<h3 style='color:#F44336;'>&#10007; No Package Manager Detected</h3>" +
-                "<p style='margin-top:10px;'>Could not detect a package manager on your system.</p>" +
-                "<p style='margin-top:10px;'>Please install <b>" + getPackageDisplayName() + "</b> manually.</p>");
+            showNoPackageManagerDialog();
             return false;
         }
         return performInstallationWithManager(pm);
@@ -472,18 +479,15 @@ public class TtsPackageInstallDialogs
         String installCmd = pm.getInstallCommand();
         LOG.info("Attempting to install {} using {}", LINUX_PACKAGE_DISPLAY_NAME, pm.displayName);
 
-        if (Platform.isTermux())
-            return performTermuxInstallation(installCmd);
-
         // Preferred path: run as Scarlet's own child process with a progress dialog and reliable
         // exit code. Root package managers use pkexec; user-space managers stay as the user.
         int installExit = runInstaller(pm, installCmd);
-        if (installExit == 0 && isAnyLinuxTtsEngineInstalled())
+        if (installationSucceeded(installExit, TtsPackageInstallDialogs::isAnyLinuxTtsEngineInstalled))
         {
             showInfo("Installation Complete",
                 "<h2 style='color:#4CAF50;'>&#10003; Installation Successful</h2>" +
                 "<p style='margin-top:10px;'>" + getPackageDisplayName() + " has been installed successfully!</p>" +
-                "<p style='margin-top:10px;'>KozyBlake/Scarlet's text-to-speech functionality is now ready to use.</p>");
+                "<p style='margin-top:10px;'>Hatson321/Scarlet Logger's text-to-speech functionality is now ready to use.</p>");
             return true;
         }
         // pkexec unavailable (-1) or no polkit agent (127) can fall through to a terminal. For
@@ -498,12 +502,13 @@ public class TtsPackageInstallDialogs
             LOG.info("Embedded terminal install exited with code: {}", exit);
             // The embedded terminal has a reliable exit code, but still verify the engine Scarlet
             // actually needs before declaring the install complete.
-            if (Sys.waitForCondition(TtsPackageInstallDialogs::isAnyLinuxTtsEngineInstalled, 180_000L, 1000L))
+            if (installationSucceeded(exit,
+                () -> Sys.waitForCondition(TtsPackageInstallDialogs::isAnyLinuxTtsEngineInstalled, 180_000L, 1000L)))
             {
                 showInfo("Installation Complete",
                     "<h2 style='color:#4CAF50;'>&#10003; Installation Successful</h2>" +
                     "<p style='margin-top:10px;'>" + getPackageDisplayName() + " has been installed successfully!</p>" +
-                    "<p style='margin-top:10px;'>KozyBlake/Scarlet's text-to-speech functionality is now ready to use.</p>");
+                    "<p style='margin-top:10px;'>Hatson321/Scarlet Logger's text-to-speech functionality is now ready to use.</p>");
                 return true;
             }
             showInstallationFailedDialog();
@@ -517,7 +522,7 @@ public class TtsPackageInstallDialogs
                 "<p style='margin-top:10px;'>An error occurred during installation:</p>" +
                 "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + ex.getMessage() + "</pre>" +
                 "<p style='margin-top:10px;'>Please try installing manually:</p>" +
-                "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + getLinuxInstallCommand() + "</pre>");
+                "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + html(getLinuxInstallCommand()) + "</pre>");
             return false;
         }
     }
@@ -550,7 +555,8 @@ public class TtsPackageInstallDialogs
                 "<p><b>" + names + "</b></p>" +
                 "<p style='margin-top:8px;'>Command:</p>" +
                 "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" +
-                installCmd + "</pre>" +
+                html(installCmd) + "</pre>" +
+                atomicInstallNoticeHtml() +
                 "<p style='margin-top:8px;color:#FF9800;'>&#9888; Scarlet will show progress and may ask for your password.</p>" +
                 "</div></html>")),
             "Install selected TTS packages?",
@@ -598,9 +604,6 @@ public class TtsPackageInstallDialogs
 
     private boolean runInstallCommand(LinuxPackageManagerDetector.PackageManager pm, String installCmd)
     {
-        if (Platform.isTermux())
-            return runDirectInstallCommand(installCmd);
-
         int installExit = runInstaller(pm, installCmd);
         if (installExit == 0)
             return true;
@@ -623,24 +626,7 @@ public class TtsPackageInstallDialogs
                 "<p style='margin-top:10px;'>An error occurred during installation:</p>" +
                 "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + ex.getMessage() + "</pre>" +
                 "<p style='margin-top:10px;'>Please try installing manually:</p>" +
-                "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + installCmd + "</pre>");
-            return false;
-        }
-    }
-
-    private boolean runDirectInstallCommand(String installCmd)
-    {
-        try
-        {
-            ProcessBuilder pb = new ProcessBuilder("sh", "-c", installCmd);
-            pb.inheritIO();
-            int exit = pb.start().waitFor();
-            LOG.info("Direct TTS package install command exited with code: {}", exit);
-            return exit == 0;
-        }
-        catch (Exception ex)
-        {
-            LOG.error("Exception during direct TTS package installation", ex);
+                "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + html(installCmd) + "</pre>");
             return false;
         }
     }
@@ -668,50 +654,18 @@ public class TtsPackageInstallDialogs
         return PkexecInstaller.run(this.parentComponent, "Installing " + getPackageDisplayName(), installCmd);
     }
 
-    private boolean performTermuxInstallation(String installCmd)
-    {
-        LOG.info("Running Termux install command directly: {}", installCmd);
-        try
-        {
-            ProcessBuilder pb = new ProcessBuilder("sh", "-c", installCmd);
-            pb.inheritIO();
-            int exit = pb.start().waitFor();
-            LOG.info("Termux install command exited with code: {}", exit);
-            if (exit == 0 && isAnyLinuxTtsEngineInstalled())
-            {
-                showInfo("Installation Complete",
-                    "<h2 style='color:#4CAF50;'>&#10003; Installation Successful</h2>" +
-                    "<p style='margin-top:10px;'>" + getPackageDisplayName() + " has been installed successfully!</p>" +
-                    "<p style='margin-top:10px;'>KozyBlake/Scarlet's text-to-speech functionality is now ready to use.</p>");
-                return true;
-            }
-            showInstallationFailedDialog();
-            return false;
-        }
-        catch (Exception ex)
-        {
-            LOG.error("Exception during Termux installation", ex);
-            showError("Installation Error",
-                "<h3 style='color:#F44336;'>&#10007; Installation Error</h3>" +
-                "<p style='margin-top:10px;'>An error occurred during installation:</p>" +
-                "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + ex.getMessage() + "</pre>" +
-                "<p style='margin-top:10px;'>Please try installing manually:</p>" +
-                "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + installCmd + "</pre>");
-            return false;
-        }
-    }
-
     private void showInstallationFailedDialog()
     {
         List<String> commands = LinuxPackageManagerDetector.getAllTtsInstallCommands();
         StringBuilder cmds = new StringBuilder();
         for (int i = 0; i < Math.min(3, commands.size()); i++)
-            cmds.append(commands.get(i)).append("\n");
+            cmds.append(html(commands.get(i))).append("\n");
         showError("Installation Failed",
             "<h3 style='color:#F44336;'>&#10007; Installation Failed</h3>" +
             "<p style='margin-top:10px;'>The installation of <b>" + getPackageDisplayName() + "</b> did not complete successfully.</p>" +
             "<p style='margin-top:10px;'>Please try installing manually:</p>" +
-            "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + cmds + "</pre>");
+            "<pre style='background-color:#2d2d2d;padding:8px;border-radius:5px;font-family:monospace;'>" + cmds + "</pre>" +
+            "<p>" + html(LinuxPackageManagerDetector.getTtsInstallGuidance()) + "</p>");
     }
 
     // -------------------------------------------------------------------------
@@ -722,12 +676,13 @@ public class TtsPackageInstallDialogs
     {
         List<LinuxPackageManagerDetector.PackageManager> managers = LinuxPackageManagerDetector.detectAllTtsPackageManagers();
         System.out.println("\n========================================");
-        System.out.println("[KozyBlake/Scarlet/TTS] TTS Package Required");
+        System.out.println("[Hatson321/Scarlet Logger/TTS] TTS Package Required");
         System.out.println("========================================");
-        System.out.println("KozyBlake/Scarlet requires " + getPackageDisplayName() + " for text-to-speech functionality.");
+        System.out.println("Hatson321/Scarlet Logger requires " + getPackageDisplayName() + " for text-to-speech functionality.");
         System.out.println("\nDetected package managers:");
         for (LinuxPackageManagerDetector.PackageManager pm : managers)
             System.out.println("  \u2022 " + pm.displayName + ": " + pm.getInstallCommand());
+        System.out.println(LinuxPackageManagerDetector.getTtsInstallGuidance());
         System.out.println("\nTTS features will be disabled until the package is installed.");
         System.out.println("========================================\n");
         return InstallDialogResult.HEADLESS_MODE;
@@ -736,11 +691,12 @@ public class TtsPackageInstallDialogs
     private boolean handleHeadlessConsent()
     {
         List<LinuxPackageManagerDetector.PackageManager> managers = LinuxPackageManagerDetector.detectAllTtsPackageManagers();
-        System.out.println("\n[KozyBlake/Scarlet/TTS] " + getPackageDisplayName() + " is not installed.");
-        System.out.println("[KozyBlake/Scarlet/TTS] Detected package managers:");
+        System.out.println("\n[Hatson321/Scarlet Logger/TTS] " + getPackageDisplayName() + " is not installed.");
+        System.out.println("[Hatson321/Scarlet Logger/TTS] Detected package managers:");
         for (LinuxPackageManagerDetector.PackageManager pm : managers)
             System.out.println("  " + pm.displayName + ": " + pm.getInstallCommand());
-        System.out.println("[KozyBlake/Scarlet/TTS] TTS features will be disabled until the package is installed.\n");
+        System.out.println(LinuxPackageManagerDetector.getTtsInstallGuidance());
+        System.out.println("[Hatson321/Scarlet Logger/TTS] TTS features will be disabled until the package is installed.\n");
         return false;
     }
 
@@ -748,8 +704,9 @@ public class TtsPackageInstallDialogs
     {
         List<LinuxPackageManagerDetector.PackageManager> managers = LinuxPackageManagerDetector.detectAllTtsPackageManagers();
         System.out.println("\n========================================");
-        System.out.println("[KozyBlake/Scarlet/TTS] Optional Linux TTS Packages");
+        System.out.println("[Hatson321/Scarlet Logger/TTS] Optional Linux TTS Packages");
         System.out.println("========================================");
+        System.out.println(LinuxPackageManagerDetector.getTtsInstallGuidance());
         if (managers.isEmpty())
         {
             System.out.println("No package manager with known TTS packages was detected.");
@@ -770,12 +727,38 @@ public class TtsPackageInstallDialogs
     // Shared dialog helpers
     // -------------------------------------------------------------------------
 
+    private void showNoPackageManagerDialog()
+    {
+        showInfo("Manual TTS setup needed",
+            "<h3>No supported automatic TTS installer is available</h3><p>" +
+            html(LinuxPackageManagerDetector.getTtsInstallGuidance()) + "</p>");
+    }
+
+    private static String atomicInstallNoticeHtml()
+    {
+        return LinuxPackageManagerDetector.isAtomicHost()
+            ? "<p><b>Atomic Linux:</b> Uses existing Homebrew as your user. No host DNF/YUM, " +
+              "OS package layering, or automatic reboot. Homebrew must be writable by your account.</p>"
+            : "";
+    }
+
+    static String html(String text)
+    {
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\"", "&quot;").replace("'", "&#39;");
+    }
+
+    static boolean installationSucceeded(int exit, BooleanSupplier verifyEngine)
+    {
+        return exit == 0 && verifyEngine.getAsBoolean();
+    }
+
     /** Show an informational JOptionPane, or print to stdout in headless mode. */
     private void showInfo(String title, String bodyHtml)
     {
         if (GraphicsEnvironment.isHeadless())
         {
-            System.out.println("[KozyBlake/Scarlet/TTS] " + title);
+            System.out.println("[Hatson321/Scarlet Logger/TTS] " + title);
             return;
         }
         Swing.invokeWait(() -> JOptionPane.showMessageDialog(
@@ -791,7 +774,7 @@ public class TtsPackageInstallDialogs
     {
         if (GraphicsEnvironment.isHeadless())
         {
-            System.err.println("[KozyBlake/Scarlet/TTS] " + title);
+            System.err.println("[Hatson321/Scarlet Logger/TTS] " + title);
             return;
         }
         Swing.invokeWait(() -> JOptionPane.showMessageDialog(
