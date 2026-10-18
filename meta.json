@@ -1,11 +1,12 @@
 {
-  "latest_release": "0.4.20",
-  "latest_build": "0.4.20",
+  "latest_release": "0.6.0",
+  "latest_build": "0.6.0",
   "announcement": {
-    "id": "20260926-000000-0420-tagging",
-    "severity": "warning",
-    "title": "0.4.20 — tagging kicks, bans and warns is fixed",
-    "message": "Sorry: in 0.4.19, tagging moderation events from Discord was broken. Searching for tags after clicking Edit tags was refused for everyone who isn't a server admin.\n\n0.4.20 fixes it with no setup needed:\n• Edit tags is back to the familiar dropdowns of every tag with descriptions.\n• New /tag add and /tag remove, used inside a moderation thread, search every tag as you type.\n• If your role can post in the moderation thread, you can tag. Instance hosts who warn and kick can now tag too.\n• Timed ban and group join-request buttons also work for moderators by default now.\n\nCan't update yet? A server admin can unlock tag search on 0.4.19 by running these once (use your moderator role):\n/scarlet-discord-permissions set target:@Moderators type:Modal Submit name:tag-search value:Allow\n/scarlet-discord-permissions set target:@Moderators type:String Select name:select-tags-search value:Allow\n\nFull details are in the 0.4.20 release notes.",
-    "expires": "2026-10-26T00:00:00Z"
+    "id": "release-0.6.0-stable-20261018",
+    "severity": "urgent",
+    "title": "URGENT update please update your scarlet build from 0.4.20 to the new release!",
+    "message": "Scarlet 0.6.0 — stable release\n\nScarlet 0.6.0 brings the current fixes into the stable release series.\n\nWhat's improved:\n• Moderation summaries use saved local history and run in the background.\n• Audit delivery retries and API request pacing have been improved.\n• Close-instance commands handle full links and explain outcomes more clearly.\n• Saving and permission checks have stronger protections.\n• Automatic relaunch requires verified client ownership and normal shutdown.\n\nBefore updating:\n• Keep an independent backup and close the old Scarlet process.\n• Java 21 is recommended.\n• If login fails temporarily, do not choose to reset your saved data.\n• Read the release notes for requirements, known issues, and test limits.\n\nUse Open link for the release notes and downloads.",
+    "url": "https://github.com/hatson321/Scarlet/releases/tag/0.6.0",
+    "expires": "2026-11-18T00:00:00Z"
   }
 }
