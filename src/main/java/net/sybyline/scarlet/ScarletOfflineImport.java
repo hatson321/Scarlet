@@ -41,6 +41,7 @@ public final class ScarletOfflineImport
             + "Data files: " + options.importDataFiles + "; credentials: " + options.importCredentials
             + "; keep channel routes: " + options.keepChannels;
         boolean confirmed;
+        System.out.println("[Import] Waiting for import confirmation; no data has been imported yet.");
         if (GraphicsEnvironment.isHeadless())
         {
             if (console == null) throw new IOException("Offline import requires an interactive console or desktop confirmation");
@@ -48,26 +49,47 @@ public final class ScarletOfflineImport
         }
         else confirmed = JOptionPane.showConfirmDialog(null, Swing.dialogMessage(warning), "Offline Scarlet import",
             JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) == JOptionPane.OK_OPTION;
-        if (!confirmed) return false;
+        if (!confirmed)
+        {
+            System.out.println("[Import] Cancelled. No import was started.");
+            return false;
+        }
         char[] pin = null;
         try
         {
             if (ScarletMigration.isEncryptedBundle(bundle))
             {
+                System.out.println("[Import] Waiting for the bundle PIN; no data has been imported yet.");
                 if (GraphicsEnvironment.isHeadless()) pin = console.readPassword("Bundle PIN: ");
                 else
                 {
                     JPasswordField field = new JPasswordField(24);
-                    if (JOptionPane.showConfirmDialog(null, field, "Bundle PIN", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return false;
+                    if (JOptionPane.showConfirmDialog(null, field, "Bundle PIN", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION)
+                    {
+                        System.out.println("[Import] Cancelled. No import was started.");
+                        return false;
+                    }
                     pin = field.getPassword();
                 }
                 if (pin == null || pin.length == 0) throw new IOException("A bundle PIN is required");
             }
-            ScarletMigration.ImportResult result = ScarletMigration.importBundle(bundle,
-                options, pin);
+            ScarletMigration.ImportResult result;
+            try (ScarletImportConsole progress = new ScarletImportConsole(System.out))
+            {
+                try { result = ScarletMigration.importBundle(bundle, options, pin, progress); }
+                catch (IOException | RuntimeException failure)
+                {
+                    progress.failed();
+                    throw failure;
+                }
+                // Only the returned result confirms files, credentials, and outer cleanup finished.
+                progress.complete(result.summary, result.backupFile);
+            }
             String message = "Import complete: " + result.summary + "\nBackup: " + result.backupFile + "\nRestart Scarlet to load imported state.";
-            if (GraphicsEnvironment.isHeadless()) console.printf("%s%n", message);
-            else JOptionPane.showMessageDialog(null, Swing.dialogMessage(message), "Offline import complete", JOptionPane.INFORMATION_MESSAGE);
+            // Keep a desktop-only fallback for javaw/double-click launches without a console.
+            // Redirected/inherited stdout still receives all progress and the final result first.
+            if (console == null && !GraphicsEnvironment.isHeadless())
+                JOptionPane.showMessageDialog(null, Swing.dialogMessage(message), "Offline import complete", JOptionPane.INFORMATION_MESSAGE);
             return true;
         }
         finally { if (pin != null) Arrays.fill(pin, '\0'); }

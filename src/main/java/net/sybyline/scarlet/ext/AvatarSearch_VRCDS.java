@@ -10,10 +10,10 @@ import net.sybyline.scarlet.util.HttpURLInputStream;
 public interface AvatarSearch_VRCDS
 {
 
-    public static final String API_ROOT = "https://avtr.nekosunevr.co.uk";
+    public static final String API_ROOT = AvatarSearch_NSVR.API_ROOT;
     /** The search endpoint moved hosts: the old {@code avtr.} subdomain no longer serves
      *  {@code /vrcx_search} directly (it responds with a redirect/notice that broke parsing). */
-    public static final String SEARCH_ROOT = "https://vrcavatarsearch.nekosunevr.co.uk";
+    public static final String SEARCH_ROOT = AvatarSearch_NSVR.API_ROOT_SEARCH;
 
     public static class PutAvatarExternalRequest
     {
