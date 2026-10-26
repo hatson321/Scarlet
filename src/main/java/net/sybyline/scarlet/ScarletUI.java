@@ -49,6 +49,7 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import javax.swing.AbstractAction;
@@ -219,12 +220,8 @@ public class ScarletUI implements IScarletUI
 
     public synchronized void playerJoin(boolean initialPreamble, String id, String name, LocalDateTime joined, String advisory, Color text_color, int priority, boolean isRejoinFromPrev)
     {
-        User user = this.scarlet.vrc.getUser(id);
-        Period period = null;
-        if (user != null)
-        {
-            period = user.getDateJoined().until(LocalDate.now(ZoneOffset.UTC));
-        }
+        // The observed row must not wait for profile/avatar network requests.
+        // Background enrichment supplies these optional details after the row exists.
         
         Map<String, ConnectedPlayer> map = this.trainingView && !isTrainingId(id) ? this.parkedPlayers : this.connectedPlayers;
         boolean visible = map == this.connectedPlayers;
@@ -236,14 +233,14 @@ public class ScarletUI implements IScarletUI
             {
                 player.joined = joined;
             }
-            player.acctdays = period;
+            player.acctdays = null;
             player.left = null;
             player.setBaseAdvisory(advisory, text_color, priority);
-            player.ageVerificationStatus = user == null ? null : user.getAgeVerificationStatus();
-            player.trustRank = user == null ? TrustRank.UNKNOWN : TrustRank.of(user.getTags());
+            player.ageVerificationStatus = null;
+            player.trustRank = TrustRank.UNKNOWN;
             player.avatarInfo = this.scarlet.eventListener.clientLocation_userDisplayName2avatarBundleInfo.get(name);
-            player.pronouns = user == null ? null : user.getPronouns();
-            player.pronounsFlagged = this.scarlet.eventListener.getShowSuspiciousPronounAdvisory() && PronounValidator.isFlagged(player.pronouns);
+            player.pronouns = null;
+            player.pronounsFlagged = false;
             this.updatePending(id, player);
             if (visible && !initialPreamble)
             {
@@ -259,13 +256,13 @@ public class ScarletUI implements IScarletUI
             {
                 player.joined = joined;
             }
-            player.acctdays = period;
+            player.acctdays = null;
             player.setBaseAdvisory(advisory, text_color, priority);
-            player.ageVerificationStatus = user == null ? null : user.getAgeVerificationStatus();
-            player.trustRank = user == null ? TrustRank.UNKNOWN : TrustRank.of(user.getTags());
+            player.ageVerificationStatus = null;
+            player.trustRank = TrustRank.UNKNOWN;
             player.avatarInfo = this.scarlet.eventListener.clientLocation_userDisplayName2avatarBundleInfo.get(name);
-            player.pronouns = user == null ? null : user.getPronouns();
-            player.pronounsFlagged = this.scarlet.eventListener.getShowSuspiciousPronounAdvisory() && PronounValidator.isFlagged(player.pronouns);
+            player.pronouns = null;
+            player.pronounsFlagged = false;
             this.updatePending(id, player);
             map.put(id, player);
             if (visible)
@@ -284,6 +281,31 @@ public class ScarletUI implements IScarletUI
         {
             this.fireSort();
             this.updateStatusBar();
+        }
+    }
+
+    @Override
+    public synchronized void playerEnrich(String id, User user, String advisory, Color textColor, int priority, BooleanSupplier stillCurrent)
+    {
+        if (stillCurrent == null || !stillCurrent.getAsBoolean())
+            return;
+        Map<String, ConnectedPlayer> map = this.trainingView && !isTrainingId(id) ? this.parkedPlayers : this.connectedPlayers;
+        ConnectedPlayer player = map.get(id);
+        if (player == null || player.left != null)
+            return;
+        if (user != null)
+        {
+            player.acctdays = user.getDateJoined() == null ? null : user.getDateJoined().until(LocalDate.now(ZoneOffset.UTC));
+            player.ageVerificationStatus = user.getAgeVerificationStatus();
+            player.trustRank = TrustRank.of(user.getTags());
+            player.pronouns = user.getPronouns();
+            player.pronounsFlagged = this.scarlet.eventListener.getShowSuspiciousPronounAdvisory() && PronounValidator.isFlagged(player.pronouns);
+        }
+        player.setBaseAdvisory(advisory, textColor, priority);
+        if (map == this.connectedPlayers)
+        {
+            this.propstable.updateEntry(player);
+            this.fireSort();
         }
     }
 
@@ -363,6 +385,7 @@ public class ScarletUI implements IScarletUI
         if (this.trainingView)
         {
             this.parkedPlayers.clear();
+            this.pendingUpdates.keySet().removeIf(id -> !isTrainingId(id));
             return;
         }
         this.clearInstanceManual();
@@ -375,6 +398,10 @@ public class ScarletUI implements IScarletUI
     synchronized void clearInstanceManual()
     {
         this.connectedPlayers.clear();
+        if (this.trainingView)
+            this.pendingUpdates.keySet().removeIf(ScarletUI::isTrainingId);
+        else
+            this.pendingUpdates.clear();
         this.propstable.clearEntries();
         this.updateStatusBar();
     }
@@ -382,6 +409,7 @@ public class ScarletUI implements IScarletUI
     public synchronized void fireSort()
     {
         this.propstable.sortEntries(COMPARE);
+        this.updateStatusBar();
     }
 
     @Override
@@ -404,16 +432,31 @@ public class ScarletUI implements IScarletUI
         });
     }
 
-    /** Updates the status-bar player count. Must be called from a synchronized context or after writes. */
+    /** Last observed world, kept separately from the asynchronously enriched rows. */
+    private String observedInstanceLocation;
+
+    @Override
+    public synchronized void instanceLocation(String location)
+    {
+        this.observedInstanceLocation = location;
+        this.updateStatusBar();
+    }
+
+    static String emptyPlayerListStatusKey(String location)
+    {
+        return location == null ? "ui.statusNoInstance" : "ui.statusWaitingForPlayers";
+    }
+
     private void updateStatusBar()
     {
         long present = this.connectedPlayers.values().stream().filter(p -> p.left == null).count();
         long total   = this.connectedPlayers.size();
         boolean training = this.trainingView;
+        String emptyStatus = emptyPlayerListStatusKey(this.observedInstanceLocation);
         Swing.invokeLater(() ->
         {
             String text = total == 0
-                ? " " + I18n.tr("ui.statusNoInstance")
+                ? " " + I18n.tr(training ? "ui.statusNoPlayers" : emptyStatus)
                 : I18n.tr("ui.statusBar", present, total - present, total);
             if (training)
                 text = " " + I18n.tr("sim.statusTag") + text;
@@ -1588,8 +1631,8 @@ public class ScarletUI implements IScarletUI
                 }
                 catch (Exception ex)
                 {
-                    LOG.warn("Failed to launch VRChat instance {}", location, ex);
-                    launchError = ex.getMessage();
+                    LOG.warn("VRChat launch status: {}", ScarletStartupFailure.describe(ex));
+                    launchError = ScarletStartupFailure.describe(ex);
                 }
             }
 
@@ -1845,7 +1888,7 @@ public class ScarletUI implements IScarletUI
             message.append(world == null || MiscUtils.blank(world.getName()) ? I18n.tr("ui.theInstance") : world.getName());
             message.append('.');
             if (launchError != null)
-                message.append("\n\n" + I18n.tr("ui.createdButCouldNotOpen") + "\n").append(launchError);
+                message.append("\n\n" + I18n.tr("ui.launchStatus") + "\n").append(launchError);
             panel.add(new JLabel("<html>"+message.toString().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")+"</html>"), BorderLayout.NORTH);
             if (webLink != null)
             {
@@ -1913,8 +1956,8 @@ public class ScarletUI implements IScarletUI
                     }
                     catch (Exception ex)
                     {
-                        LOG.warn("Failed to launch VRChat instance {}", location, ex);
-                        this.showInstanceWizardError(I18n.tr("ui.couldNotOpenVrchat") + "\n" + ex.getMessage(), I18n.tr("ui.openInVrchat"));
+                        LOG.warn("VRChat launch status: {}", ScarletStartupFailure.describe(ex));
+                        this.showInstanceWizardError(I18n.tr("ui.launchStatus") + "\n" + ScarletStartupFailure.describe(ex), I18n.tr("ui.openInVrchat"));
                     }
                 });
             }
@@ -3481,7 +3524,8 @@ public class ScarletUI implements IScarletUI
           "training_mode_enabled" },
 
         { "Appearance",
-          "Theme preset", "Accent colour", "UI scale", "ui_left_player_dim_percent", "ui_accent_headers" },
+          "Theme preset", "Accent colour", "UI scale", "ui_left_player_dim_percent", "ui_accent_headers",
+          "windows_rendering_compatibility" },
 
         { "Interface",
           "ui_confirm_group_invite", "ui_alert_update", "ui_alert_update_preview",
@@ -3592,6 +3636,9 @@ public class ScarletUI implements IScarletUI
     {
         if (id == null)
             return false;
+        if (ScarletRenderingCompatibility.SETTING_KEY.equals(id)
+            && !net.sybyline.scarlet.util.Platform.CURRENT.isNT())
+            return true;
         if (!Features.DISCORD_KICK_BAN_ENABLED && "discord_kick_ban_enabled".equals(id))
             return true;
         if (!Features.WATCHED_AVATARS_ENABLED
@@ -4771,6 +4818,8 @@ public class ScarletUI implements IScarletUI
         BoolSetting(ScarletSettings.FileValued<Boolean> setting)
         {
             super(setting, new JCheckBox(null, null, setting.get()));
+            if (ScarletRenderingCompatibility.SETTING_KEY.equals(setting.id()))
+                this.render.setToolTipText(I18n.tr("setting.windows_rendering_compatibility.tooltip"));
             this.render.addActionListener($ -> {
                 this.accept();
             });

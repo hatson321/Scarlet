@@ -101,7 +101,62 @@ class ScarletVersionTest
         assertTrue(MiscUtils.isValidVersion("0.6.1-a2"));
         assertTrue(MiscUtils.isPreviewVersion("0.6.1-a2"));
         assertTrue(MiscUtils.compareScarletVersion("0.6.1-a2", "0.6.1-a1") > 0);
-        assertEquals("0.6.1-a2", Scarlet.VERSION);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a3"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a3"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a3", "0.6.1-a2") > 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a4"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a4"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a4", "0.6.1-a3") > 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a5"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a5"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a5", "0.6.1-a4") > 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a6"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a6"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a6", "0.6.1-a5") > 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a7"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a7"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a7", "0.6.1-a6") > 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a8"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a8"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a8", "0.6.1-a7") > 0);
+        assertEquals("0.6.1-a9", Scarlet.VERSION);
+    }
+
+    @Test void publicAlphaCandidateOrdersAfterDeliveredAlphasAndBeforeStable() throws Exception
+    {
+        String candidate = "0.6.1-a9";
+        assertTrue(MiscUtils.isValidVersion(candidate));
+        assertTrue(MiscUtils.isPreviewVersion(candidate));
+        assertTrue(MiscUtils.compareScarletVersion(candidate, "0.6.0") > 0);
+        for (int iteration = 1; iteration <= 8; iteration++)
+        {
+            String previous = "0.6.1-a" + iteration;
+            assertTrue(MiscUtils.compareScarletVersion(candidate, previous) > 0);
+            assertTrue(MiscUtils.compareScarletVersion(previous, candidate) < 0);
+        }
+        assertTrue(MiscUtils.compareScarletVersion(candidate, "0.6.1-a10") < 0);
+        assertTrue(MiscUtils.compareScarletVersion(candidate, "0.6.1") < 0);
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1", candidate) > 0);
+        Matcher accepted = Pattern.compile("-cnotmatch '([^']+)'")
+            .matcher(read("scripts/windows/build-and-verify.ps1"));
+        assertTrue(accepted.find());
+        assertTrue(candidate.matches(accepted.group(1)), "Windows packaging must accept lowercase a9");
+    }
+
+    @Test void testBuildsSortAfterAlphaBuildsAndBeforeTheStableRelease()
+    {
+        String[] ordered = {"0.6.0", "0.6.1-a8", "0.6.1-T1", "0.6.1-T2", "0.6.1-T9", "0.6.1-T10", "0.6.1", "0.6.2-T1"};
+        for (int i = 0; i < ordered.length; i++)
+        {
+            assertTrue(MiscUtils.isValidVersion(ordered[i]));
+            for (int j = i + 1; j < ordered.length; j++)
+            {
+                assertTrue(MiscUtils.compareScarletVersion(ordered[i], ordered[j]) < 0);
+                assertTrue(MiscUtils.compareScarletVersion(ordered[j], ordered[i]) > 0);
+            }
+        }
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-T1"));
+        assertFalse(MiscUtils.isPreviewVersion("0.6.1"));
     }
 
     @Test void iterationNumbersOrderNumericallyAcrossDigitBoundaries()

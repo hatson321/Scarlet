@@ -160,6 +160,7 @@ import net.sybyline.scarlet.ScarletData.AuditEntryMetadata;
 import net.sybyline.scarlet.ScarletData.InstanceEmbedMessage;
 import net.sybyline.scarlet.ext.AvatarSearch;
 import net.sybyline.scarlet.ext.VrcLaunch;
+import net.sybyline.scarlet.ext.ManagedVrcClient;
 import net.sybyline.scarlet.server.discord.LDaveSessionFactory;
 import net.sybyline.scarlet.server.discord.DCommands;
 import net.sybyline.scarlet.server.discord.DInteractions;
@@ -205,6 +206,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.appendTemplateFooter = scarlet.settings.new FileValuedBoolean("vrchat_report_template_footer", "Append footer to template", true);
         this.bundleModerations_instanceKick2userBan = scarlet.settings.new FileValuedBoolean("discord_bundle_instance_kick_with_user_ban", "Discord: Bundle Instance Kicks with causing User Ban", true);
         this.moderationSummary_onlyActivity = scarlet.settings.new FileValuedBoolean("moderation_summary_only_activity", "Moderation summary: only list staff with activity", true);
+        this.instanceJoinLeaveThumbnails = scarlet.settings.new FileValuedBoolean("discord_instance_join_leave_thumbnails", "Discord: Small profile thumbnails in instance join/leave logs", true);
         this.pingOnModeration_instanceWarn = scarlet.settings.new FileValuedBoolean("discord_ping_instance_warn", "Discord: Ping on Instance Warn", false);
         this.pingOnModeration_instanceKick = scarlet.settings.new FileValuedBoolean("discord_ping_instance_kick", "Discord: Ping on Instance Kick", false);
         this.pingOnModeration_memberRemove = scarlet.settings.new FileValuedBoolean("discord_ping_member_remove", "Discord: Ping on Member Remove", true);
@@ -215,7 +217,9 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.pingOnOutstandingModeration_memberRemove = scarlet.settings.new FileValuedBoolean("discord_ping_outstanding_member_remove", "Discord: Ping on outstanding Member Remove", false);
         this.pingOnOutstandingModeration_userBan = scarlet.settings.new FileValuedBoolean("discord_ping_outstanding_user_ban", "Discord: Ping on outstanding User Ban", true);
         this.pingOnOutstandingModeration_userUnban = scarlet.settings.new FileValuedBoolean("discord_ping_outstanding_user_unban", "Discord: Ping on outstanding User Unban", false);
-        this.vrchatClient_launchOnInstanceCreate = scarlet.settings.new FileValuedBoolean("vrchat_client_launch_on_instance_create", "VRChat Client: Launch on Instance Create", false);
+        this.vrchatClient_launchOnInstanceCreate = scarlet.settings.new FileValuedBoolean("vrchat_client_launch_on_instance_create", "VRChat Client: Launch on Instance Create / Startup", false);
+        this.vrchatClient_recoverStalledStartup = scarlet.settings.new FileValuedBoolean("vrchat_client_recover_stalled_startup", "VRChat Client: Recover stalled auto-launch", false);
+        this.vrchatClient_forceStalledStartup = scarlet.settings.new FileValuedBoolean("vrchat_client_force_stalled_startup", "VRChat Client: Force-close stalled startup if normal close times out (Windows)", false);
         this.evidenceEnabled = scarlet.settings.new FileValuedBoolean("evidence_enabled", "Evidence submission", false);
         this.selectEvidenceRoot = scarlet.settings.new FileValuedVoid("Evidence root folder", "Select", this::selectEvidenceRoot);
         this.evidenceFilePathFormat = scarlet.settings.new FileValuedStringPattern("evidence_file_path_format", "Evidence file path format", "", ".+", false);
@@ -227,7 +231,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.load();
         // Stored denials must be readable before connecting a bot that can receive interactions.
         this.perms = new DPerms(permsFile);
-        this.perms.registerOther(ScarletPermission.GROUPEX_BANS_MANAGE.id, ScarletPermission.GROUPEX_TAGS_EDIT.id);
+        this.perms.registerOther(ScarletPermission.GROUPEX_BANS_MANAGE.id, ScarletPermission.GROUPEX_TAGS_EDIT.id,
+            ScarletExitOperatorDiscord.PERMISSION);
         this.perms.load();
         this.interactions = new DInteractions(false, scarlet.exec);
         this.interactions.setModalAuthorization(this::authorizeModalSession);
@@ -492,6 +497,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
     final ScarletSettings.FileValued<Boolean> appendTemplateFooter,
                                      bundleModerations_instanceKick2userBan,
                                      moderationSummary_onlyActivity,
+                                     instanceJoinLeaveThumbnails,
                                      pingOnModeration_instanceWarn,
                                      pingOnModeration_instanceKick,
                                      pingOnModeration_memberRemove,
@@ -503,6 +509,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                                      pingOnOutstandingModeration_userBan,
                                      pingOnOutstandingModeration_userUnban,
                                      vrchatClient_launchOnInstanceCreate,
+                                     vrchatClient_recoverStalledStartup,
+                                     vrchatClient_forceStalledStartup,
                                      evidenceEnabled,
                                      avatarSearchProvidersEnabled;
     final ScarletSettings.FileValuedConsentBoolean avatarSearchExternalLookupsEnabled;
@@ -1015,7 +1023,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
      */
     void manageAvatarSearchProviders()
     {
-        String[] effective = this.getAvatarSearchProviders();
+        String[] effective = AvatarSearch.selectedProviders(this.avatarSearchProvidersEnabled.get(),
+            this.avatarSearchProviders.get(), BLOCKED_AVATAR_SEARCH_HOST);
         java.util.Set<String> effectiveSet = new java.util.LinkedHashSet<>(java.util.Arrays.asList(effective));
         java.util.LinkedHashSet<String> known = new java.util.LinkedHashSet<>(java.util.Arrays.asList(AvatarSearch.URL_ROOTS));
         String[] stored = this.avatarSearchProviders.get();
@@ -1103,6 +1112,10 @@ public class ScarletDiscordJDA implements ScarletDiscord
             if (check.isSelected())
                 selected.add(url);
         });
+        if (allowLookups.isSelected() && selected.isEmpty())
+            JOptionPane.showMessageDialog(panel,
+                "No avatar providers are selected. Watched-avatar matching will remain unavailable until you select a provider.",
+                "Avatar search providers", JOptionPane.WARNING_MESSAGE);
         java.util.Set<String> defaults = new java.util.LinkedHashSet<>(java.util.Arrays.asList(AvatarSearch.URL_ROOTS));
         // Keep requests disabled while committing the selected destinations, then apply permission last.
         this.avatarSearchExternalLookupsEnabled.set(Boolean.FALSE, "manage-providers");
@@ -1909,6 +1922,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         @Override
         public void onButtonInteraction(ButtonInteractionEvent event)
         {
+            if (ScarletDiscordJDA.this.exitOperator.handle(event)) return;
             if (!ScarletDiscordJDA.this.perms.check(event))
             {
                 this.interactionPerms(event);
@@ -2262,6 +2276,14 @@ public class ScarletDiscordJDA implements ScarletDiscord
             // Ops alerts are best-effort; never let them break the caller.
             LOG.warn("Exception emitting ops alert", ex);
         }
+    }
+
+    final ScarletExitOperatorDiscord exitOperator = new ScarletExitOperatorDiscord(this);
+
+    @Override public void emitClientExitConflict(String token, String counts)
+    {
+        try { this.exitOperator.emit(token, counts); }
+        catch (RuntimeException ex) { LOG.warn("Client-exit operator alert unavailable"); }
     }
 
     TextChannel getDiscordActionLogChannel()
@@ -3656,7 +3678,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         {
             this.emitAuxWh(entryMeta, embed.setImage(worldImageUrl)::build, IncomingWebhookClient::sendMessageEmbeds);
         });
-        this.launchClientIntoInstanceIfEnabled(location);
+        this.followInstanceCreation(location, entryMeta.entry.getCreatedAt());
     }
 
     // Dedup guard shared by the audit-driven path (emitInstanceCreate) and the fast
@@ -3666,6 +3688,87 @@ public class ScarletDiscordJDA implements ScarletDiscord
     static final long RELAUNCH_SUPPRESS_MILLIS = 5L * 60L * 1000L;
     private ScarletClientLaunchWorker clientLaunchWorker;
     private volatile boolean clientLaunchClosed;
+    private volatile ScarletStartupInstanceJoin startupInstanceJoin;
+    private ScarletStartupInstanceJoin.Environment startupInstanceEnvironment;
+    private final ScarletDeferredInstanceFollow startupDeferredFollow = new ScarletDeferredInstanceFollow();
+    private final ScarletStartupRecovery startupRecovery = new ScarletStartupRecovery();
+
+    synchronized void followInstanceCreation(String location, OffsetDateTime createdAt)
+    {
+        ScarletStartupInstanceJoin startup = this.startupInstanceJoin;
+        // Deliver historical messages normally, but never replay their launch side-effect.
+        if (startup == null || !startup.isAfterCutoff(createdAt)) return;
+        if (this.startupRecovery != null) this.startupRecovery.cancelForDifferentDestination(location);
+        if (startup.isPending() || this.startupDeferredFollow.peek() != null)
+        {
+            this.startupDeferredFollow.record(location, createdAt);
+            if (!startup.isPending()) this.drainStartupFollow();
+        }
+        else if (!this.queueClientLaunch(location, true))
+            this.startupDeferredFollow.record(location, createdAt);
+    }
+
+    private void drainStartupFollow()
+    {
+        ScarletDeferredInstanceFollow.Event event = this.startupDeferredFollow.peek();
+        if (event == null) return;
+        if (!this.startupInstanceEnvironment.allowed() || !this.startupInstanceJoin.shouldFollowCreationAudit(event.createdAt)
+            || this.queueClientLaunch(event.location, false))
+            this.startupDeferredFollow.clearIfSame(event);
+    }
+
+    @Override
+    public synchronized void maybeJoinActiveInstanceOnStartup()
+    {
+        if (this.clientLaunchClosed) return;
+        if (this.startupInstanceJoin == null)
+        {
+            final String group = this.scarlet.vrc.groupId, user = this.scarlet.vrc.currentUserId;
+            final long generation = net.sybyline.scarlet.ext.ExtendedUserAgent.currentAuthenticationGeneration();
+            this.startupInstanceJoin = new ScarletStartupInstanceJoin(group == null ? "" : group, OffsetDateTime.now(ZoneOffset.UTC));
+            java.util.function.BooleanSupplier allowed = () -> !this.clientLaunchClosed && this.scarlet.running
+                && !this.scarlet.staffMode && this.vrchatClient_launchOnInstanceCreate.get()
+                && group != null && !group.isEmpty() && user != null && Objects.equals(user, this.scarlet.vrc.currentUserId)
+                && Objects.equals(group, this.scarlet.vrc.groupId)
+                && net.sybyline.scarlet.ext.ExtendedUserAgent.isPrimaryAuthenticationStable(generation)
+                && !Thread.currentThread().isInterrupted();
+            this.startupInstanceEnvironment = new ScarletStartupInstanceJoin.Environment() {
+                public boolean allowed() { return allowed.getAsBoolean(); }
+                public boolean clientRunning() { return VrcLaunch.isVrChatRunning(); }
+                public java.util.List<String> activeLocations() throws Exception {
+                    return ScarletDiscordJDA.this.scarlet.vrc.getStartupGroupInstances(group, allowed);
+                }
+                public ScarletStartupInstanceJoin.AuditPage creationPage(OffsetDateTime from, OffsetDateTime to, int offset) throws Exception {
+                    return ScarletDiscordJDA.this.scarlet.vrc.getStartupInstanceCreationPage(group, from, to, offset, allowed);
+                }
+                public void launch(String location) throws Exception {
+                    if (!allowed()) return;
+                    ScarletDiscordJDA.this.runStartupClientLaunch(location, allowed);
+                }
+                public void log(String message) { LOG.info("Startup instance join: {}", message); }
+            };
+            if (!allowed.getAsBoolean()) this.startupInstanceJoin.cancel();
+        }
+        if (!this.startupInstanceEnvironment.allowed()) this.startupInstanceJoin.cancel();
+        if (!this.startupInstanceJoin.isPending())
+        {
+            this.drainStartupFollow();
+            if (this.startupRecovery != null && this.startupRecovery.active() && this.clientLaunchWorker != null)
+                this.clientLaunchWorker.submit(this.startupRecovery::tick);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!this.startupInstanceJoin.isDue(now)) return;
+        if (this.clientLaunchWorker == null) this.clientLaunchWorker = new ScarletClientLaunchWorker();
+        this.clientLaunchWorker.submit(() -> this.startupInstanceJoin.attempt(this.startupInstanceEnvironment, now));
+    }
+
+    @Override
+    public boolean isStartupInstanceJoinPending()
+    {
+        ScarletStartupInstanceJoin startup = this.startupInstanceJoin;
+        return startup == null || startup.isPending();
+    }
 
     private void closeClientLaunchWorker() throws IOException
     {
@@ -3673,6 +3776,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
         synchronized (this)
         {
             this.clientLaunchClosed = true;
+            if (this.startupRecovery != null) this.startupRecovery.cancel();
+            if (this.startupInstanceJoin != null) this.startupInstanceJoin.cancel();
             worker = this.clientLaunchWorker;
         }
         if (worker != null) worker.close();
@@ -3687,26 +3792,58 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public synchronized void launchClientIntoInstanceIfEnabled(String location)
     {
-        if (location == null || this.clientLaunchClosed || !this.vrchatClient_launchOnInstanceCreate.get())
-            return;
+        this.queueClientLaunch(location, true);
+    }
+
+    /** Returns true only once this request was accepted or deliberately suppressed, never while busy. */
+    synchronized boolean queueClientLaunch(String location, boolean reportBusy)
+    {
+        if (location == null || this.clientLaunchClosed || this.isStartupInstanceJoinPending()
+            || !this.vrchatClient_launchOnInstanceCreate.get())
+            return true;
         long now = System.currentTimeMillis();
         Long prev = this.recentlyLaunchedLocations.get(location);
         this.recentlyLaunchedLocations.values().removeIf(t -> now - t.longValue() > RELAUNCH_SUPPRESS_MILLIS);
         if (prev != null && now - prev.longValue() < RELAUNCH_SUPPRESS_MILLIS)
-            return; // already cold-booted into this instance very recently
+            return true; // already cold-booted into this instance very recently
         if (this.clientLaunchWorker == null)
             this.clientLaunchWorker = new ScarletClientLaunchWorker();
         ScarletClientLaunchWorker.Submission result = this.clientLaunchWorker.submit(() -> this.runClientLaunch(location));
         if (result == ScarletClientLaunchWorker.Submission.ACCEPTED)
             this.recentlyLaunchedLocations.put(location, now);
-        else
+        else if (reportBusy)
             LOG.info("VRChat auto-launch skipped: launch worker is {} (no launch queued)", result);
+        return result != ScarletClientLaunchWorker.Submission.BUSY;
+    }
+
+    private void runStartupClientLaunch(String location, java.util.function.BooleanSupplier allowed) throws Exception
+    {
+        if (!allowed.getAsBoolean()) return;
+        // Known pre-launch lookup failures may retry; uncertain OS launches must never be replayed.
+        String shortName = this.scarlet.vrc.getStartupInstanceSecureName(this.scarlet.vrc.groupId, location, allowed);
+        if (shortName == null) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.SECURE_NAME_MISSING);
+        if (!allowed.getAsBoolean()) return;
+        this.recentlyLaunchedLocations.put(location, System.currentTimeMillis());
+        ScarletStartupRecovery.LogState before = this.scarlet.logs.startupLogState();
+        try
+        {
+            VrcLaunch.launchIfNotRunning(this.scarlet.vrc.currentUserId, location, shortName, VrcLaunch.LaunchMode.DESKTOP, allowed);
+            this.watchAutomaticStartup(location, before, allowed);
+        }
+        catch (InterruptedException ex) { Thread.currentThread().interrupt(); throw ex; }
+        catch (Exception ex)
+        {
+            LOG.warn("Startup VRChat launch status: {} No automatic launch retry was made.", ScarletStartupFailure.describe(ex));
+        }
     }
 
     private void runClientLaunch(String location)
     {
+        if (this.startupRecovery != null) this.startupRecovery.cancel();
         if (this.clientLaunchClosed || Thread.currentThread().isInterrupted() || !this.vrchatClient_launchOnInstanceCreate.get())
             return;
+        java.util.function.BooleanSupplier allowed = this.automaticLaunchContext(false);
+        if (!allowed.getAsBoolean()) return;
         try
         {
             // Resolve the instance's short/secure name so non-public (group,
@@ -3737,11 +3874,13 @@ public class ScarletDiscordJDA implements ScarletDiscord
             }
             catch (Exception ex)
             {
-                LOG.warn("Could not resolve instance secure name for auto-launch of {}: {}", location, ex.getMessage());
+                LOG.warn("Could not resolve secure join information for VRChat auto-launch: {}", ScarletStartupFailure.describe(ex));
             }
             if (this.clientLaunchClosed || Thread.currentThread().isInterrupted() || !this.vrchatClient_launchOnInstanceCreate.get())
                 return;
-            VrcLaunch.launch(this.scarlet.vrc.currentUserId, location, shortName, VrcLaunch.LaunchMode.DESKTOP);
+            ScarletStartupRecovery.LogState before = this.scarlet.logs.startupLogState();
+            VrcLaunch.launchAutomatic(this.scarlet.vrc.currentUserId, location, shortName, allowed);
+            this.watchAutomaticStartup(location, before, allowed);
         }
         catch (InterruptedException ex)
         {
@@ -3750,8 +3889,57 @@ public class ScarletDiscordJDA implements ScarletDiscord
         }
         catch (Exception ex)
         {
-            LOG.warn("VRChat auto-launch did not complete: {}", ex.getMessage());
+            LOG.warn("VRChat auto-launch status: {}", ScarletStartupFailure.describe(ex));
         }
+    }
+
+    private java.util.function.BooleanSupplier automaticLaunchContext(boolean recovery)
+    {
+        final String group = this.scarlet.vrc.groupId, user = this.scarlet.vrc.currentUserId;
+        final long generation = net.sybyline.scarlet.ext.ExtendedUserAgent.currentAuthenticationGeneration();
+        return () -> !this.clientLaunchClosed && this.scarlet.running && !this.scarlet.staffMode
+            && !this.scarlet.trainingMode.get() && this.vrchatClient_launchOnInstanceCreate.get()
+            && (!recovery || this.vrchatClient_recoverStalledStartup.get())
+            && group != null && user != null && Objects.equals(group, this.scarlet.vrc.groupId)
+            && Objects.equals(user, this.scarlet.vrc.currentUserId)
+            && net.sybyline.scarlet.ext.ExtendedUserAgent.isPrimaryAuthenticationStable(generation)
+            && !Thread.currentThread().isInterrupted();
+    }
+
+    private void watchAutomaticStartup(String location, ScarletStartupRecovery.LogState before,
+        java.util.function.BooleanSupplier originalContext)
+    {
+        if (this.startupRecovery == null || !this.vrchatClient_recoverStalledStartup.get()) return;
+        final java.util.function.BooleanSupplier recoveryContext = this.automaticLaunchContext(true);
+        final java.util.function.BooleanSupplier context = () -> originalContext.getAsBoolean() && recoveryContext.getAsBoolean();
+        final String group = this.scarlet.vrc.groupId, user = this.scarlet.vrc.currentUserId;
+        ManagedVrcClient.Client client = VrcLaunch.managedClient();
+        if (client == null || !Objects.equals(client.requestedLocation(), location)) return;
+        this.startupRecovery.start(new ScarletStartupRecovery.Environment() {
+            public boolean allowed() { return context.getAsBoolean(); }
+            public String user() { return user; }
+            public long now() { return System.nanoTime(); }
+            public ScarletStartupRecovery.LogState logs() { return ScarletDiscordJDA.this.scarlet.logs.startupLogState(); }
+            private void verifyTarget(java.util.function.BooleanSupplier allowed) throws Exception {
+                ScarletStartupInstanceJoin.parseLocation(location, group);
+                if (!allowed.getAsBoolean() || !ScarletDiscordJDA.this.scarlet.vrc.getStartupGroupInstances(group, allowed).contains(location))
+                    throw new IOException("Startup recovery target is no longer active or allowed");
+            }
+            public ScarletStartupRecovery.Launch recover(ManagedVrcClient.Client expected,
+                java.util.function.BooleanSupplier allowed, java.util.function.BooleanSupplier closeAllowed) throws Exception {
+                verifyTarget(allowed);
+                java.util.concurrent.atomic.AtomicReference<ScarletStartupRecovery.LogState> baseline = new java.util.concurrent.atomic.AtomicReference<>();
+                VrcLaunch.recoverManagedClient(expected, user, allowed, closeAllowed,
+                    () -> ScarletDiscordJDA.this.vrchatClient_forceStalledStartup.get(), () -> {
+                    verifyTarget(allowed);
+                    String secureName = ScarletDiscordJDA.this.scarlet.vrc.getStartupInstanceSecureName(group, location, allowed);
+                    baseline.set(logs());
+                    return secureName;
+                });
+                return new ScarletStartupRecovery.Launch(VrcLaunch.managedClient(), baseline.get());
+            }
+            public void log(String reason) { LOG.info("VRChat startup recovery: {}", reason); }
+        }, new ScarletStartupRecovery.Launch(client, before));
     }
 
     @Override
@@ -3987,12 +4175,21 @@ public class ScarletDiscordJDA implements ScarletDiscord
         });
     }
 
+    EmbedBuilder instanceJoinLeaveEmbed(String userId)
+    {
+        // Optional decoration must never turn a join/leave log into a blocking API lookup.
+        return ScarletJoinLeaveThumbnail.apply(new EmbedBuilder(),
+            this.instanceJoinLeaveThumbnails != null && this.instanceJoinLeaveThumbnails.get()
+                && ScarletJoinLeaveThumbnail.isUserId(userId),
+            () -> this.scarlet.vrc.cachedPublicProfiles.get(userId));
+    }
+
     @Override
     public void emitExtendedStaffJoin(Scarlet scarlet, LocalDateTime timestamp, String location, String userId, String displayName)
     {
         this.condEmitEx(GroupAuditTypeEx.STAFF_JOIN, false, false, location, (channelSf, guild, channel) ->
         {
-            return channel.sendMessageEmbeds(new EmbedBuilder()
+            channel.sendMessageEmbeds(this.instanceJoinLeaveEmbed(userId)
                     .setDescription(String.format("### [%s](https://vrchat.com/home/user/%s) joined [a group instance](https://vrchat.com/home/launch?worldId=%s)",
                             MarkdownSanitizer.escape(displayName), userId, location.replace(":", "&instanceId=")))
 //                    .setTitle(MarkdownSanitizer.escape(displayName)+" joined a group instance", "https://vrchat.com/home/user/"+userId)
@@ -4001,7 +4198,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
                     .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC))
                     .build())
-                .complete();
+                .queue(ignored -> {}, failure -> LOG.warn("A staff join log could not be delivered to Discord; local player tracking continues"));
+            return null;
         });
     }
 
@@ -4010,7 +4208,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
     {
         this.condEmitEx(GroupAuditTypeEx.STAFF_LEAVE, false, false, location, (channelSf, guild, channel) ->
         {
-            return channel.sendMessageEmbeds(new EmbedBuilder()
+            channel.sendMessageEmbeds(this.instanceJoinLeaveEmbed(userId)
                     .setDescription(String.format("### [%s](https://vrchat.com/home/user/%s) left [a group instance](https://vrchat.com/home/launch?worldId=%s)",
                             MarkdownSanitizer.escape(displayName), userId, location.replace(":", "&instanceId=")))
 //                    .setTitle(MarkdownSanitizer.escape(displayName)+" left a group instance", "https://vrchat.com/home/user/"+userId)
@@ -4019,7 +4217,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
                     .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC))
                     .build())
-                .complete();
+                .queue(ignored -> {}, failure -> LOG.warn("A staff leave log could not be delivered to Discord; local player tracking continues"));
+            return null;
         });
     }
 
@@ -4028,7 +4227,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
     {
         this.condEmitEx(ScarletSimulation.isTrainingId(userId), GroupAuditTypeEx.USER_JOIN, false, false, location, (channelSf, guild, channel) ->
         {
-            return channel.sendMessageEmbeds(new EmbedBuilder()
+            channel.sendMessageEmbeds(this.instanceJoinLeaveEmbed(userId)
                     .setDescription(String.format("### [%s](https://vrchat.com/home/user/%s) joined [a group instance](https://vrchat.com/home/launch?worldId=%s)",
                             MarkdownSanitizer.escape(displayName), userId, location.replace(":", "&instanceId=")))
                     .addField("User ID", "`"+userId+"`", false)
@@ -4042,7 +4241,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     Button.danger("vrchat-user-ban:"+userId, "Ban user"),
                     Button.success("vrchat-user-unban:"+userId, "Unban user")
                 ))
-                .complete();
+                .queue(ignored -> {}, failure -> LOG.warn("A user join log could not be delivered to Discord; local player tracking continues"));
+            return null;
         });
     }
 
@@ -4051,7 +4251,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
     {
         this.condEmitEx(ScarletSimulation.isTrainingId(userId), GroupAuditTypeEx.USER_LEAVE, false, false, location, (channelSf, guild, channel) ->
         {
-            return channel.sendMessageEmbeds(new EmbedBuilder()
+            channel.sendMessageEmbeds(this.instanceJoinLeaveEmbed(userId)
                     .setDescription(String.format("### [%s](https://vrchat.com/home/user/%s) left [a group instance](https://vrchat.com/home/launch?worldId=%s)",
                             MarkdownSanitizer.escape(displayName), userId, location.replace(":", "&instanceId=")))
                     .addField("User ID", "`"+userId+"`", false)
@@ -4065,7 +4265,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     Button.danger("vrchat-user-ban:"+userId, "Ban user"),
                     Button.success("vrchat-user-unban:"+userId, "Unban user")
                 ))
-                .complete();
+                .queue(ignored -> {}, failure -> LOG.warn("A user leave log could not be delivered to Discord; local player tracking continues"));
+            return null;
         });
     }
 

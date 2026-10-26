@@ -193,27 +193,52 @@ help distinguish preparation, primary delivery, and background follow-up time.
 
 ### Optional VRChat client exit
 
-In Settings, enable **VRChat Client: Exit when instance is closed and empty
-(Scarlet-launched clients only)** (`vrchat_client_exit_closed_empty`). It is off by default.
-Enable it before launching the client through Scarlet; process discovery is limited to
-the first two minutes after that launch request.
-This is separate from the existing setting that closes the bot's own instance remotely.
+In Settings, enable **VRChat Client: Exit when instance is closed and empty**
+(`vrchat_client_exit_closed_empty`). It is off by default and separate from the
+setting that closes the bot's own instance remotely. Saving the toggle takes effect
+without restarting Scarlet.
 
-The new option requests a normal exit of a local client launched by this Scarlet session
-only after its exact monitored group instance is confirmed closed and the live player
-list contains only that client's authenticated account. An open empty instance never
-qualifies. Scarlet waits 30 seconds and checks fresh server instance information before
-sending the exit request. A scheduled future closure is not treated as already closed.
-Scarlet itself stays running, and this option does not close the instance on the server.
+This option can close the **only verified running VRChat client for the same OS user,
+including a manually launched client**. It requires a matching current-session group
+instance closure audit and a healthy, caught-up local output-log roster containing
+only the authenticated client account. An empty but still-open instance does not
+qualify. Scarlet waits a full 30-second healthy grace period and rechecks the roster,
+session and exact process identity before requesting normal exit. Scarlet stays running;
+this option does not itself close an instance on the server.
 
-The client must have been newly launched through Scarlet; an already-running or manually
-started client is not deliberately adopted. Launch tracking correlates new process identity
-with Scarlet's launch request, not a guaranteed Steam process ancestry chain. Ambiguous
-processes, stale/incomplete logs, missing audit or server proof, another player, a world or
-account change, or unavailable process metadata leave the client running. Linux/Wine
-configurations that hide the executable or start time may therefore not support this option.
-No administrator elevation, forced termination, or name-wide process termination is used
-by this feature. A normal-exit request may be declined by the client; there is no force fallback.
+Client exit no longer waits for an independent VRChat API occupancy response. This
+avoids delays from stale server counts, but local logs are not infallible. Missing self,
+unread/stale logs, another player, changed account/world/session, uncertain process
+identity or multiple running clients prevent closing. Multiple clients also produce a
+rate-limited warning in the configured `/set-ops-alert-channel`; no button bypasses
+that ambiguity. Close-audit delivery delays can still delay exit. The older API-count
+override buttons are inactive in this mode. Startup target selection and idle server
+instance closing retain their own API checks.
+
+Normal exit is attempted first. Only definitely-unsent transient failures receive
+bounded retries; uncertain dispatch is not blindly repeated. A **separate, default-off
+Windows force-close setting** can allow exact-process termination after at least
+15 seconds for normal exit and fresh safety checks. Force close can lose unsaved client
+state. It never uses a blanket process-name kill or requests administrator elevation.
+Linux/Wine configurations that hide executable identity or start time may not support
+automatic client exit. Windows force fallback is not available on Linux.
+
+### Optional startup recovery
+
+**VRChat Client: Recover stalled auto-launch** is a separate opt-in. It watches only
+verified Scarlet-owned automatic launches, never adopts a manually launched client,
+and allows at most two replacement launches. It waits at least three minutes after
+each launch. Recovery needs either the guarded quiet-log condition (two minutes without
+new lines) or three separately spaced, explicit paired connection-failure/reset cycles
+in the current launch's log. Ordinary errors or historical catch-up do not qualify.
+The watch expires after ten minutes per attempt, and a world join stops it.
+
+Scarlet attempts normal close, verifies the old process has exited, rechecks the active
+target and obtains fresh secure join information before replacement. It will not open
+a second client while the original is still running. Startup recovery has its own
+separate, default-off Windows force-close option, with the same minimum normal-close
+grace and exact-process safeguards. These options do not recover arbitrary later
+in-game freezes, and do not bypass instance access or age-verification requirements.
 
 The existing snapshot-privacy and timed-ban safeguards from 0.5.0-a3 remain:
 

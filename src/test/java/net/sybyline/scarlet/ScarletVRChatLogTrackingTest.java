@@ -33,10 +33,19 @@ class ScarletVRChatLogTrackingTest
         long now = TimeUnit.SECONDS.toNanos(100);
         boolean alive;
         File target;
+        int pauses;
+        Runnable onPause = () -> {};
+        Runnable onLocate = () -> {};
         TestLogs(Listener listener) { super(listener); }
         @Override long trackingNowNanos() { return this.now; }
         @Override boolean trackingThreadAlive() { return this.alive; }
-        @Override File locateTarget() { return this.target; }
+        @Override File locateTarget() { this.onLocate.run(); return this.target; }
+        @Override void trackingPause() throws InterruptedException
+        {
+            this.pauses++;
+            this.now += TimeUnit.MILLISECONDS.toNanos(20);
+            this.onPause.run();
+        }
     }
 
     final class Fixture implements AutoCloseable
@@ -47,8 +56,11 @@ class ScarletVRChatLogTrackingTest
         final File file;
         boolean failListener;
         Fixture() throws Exception
+        { this(null); }
+        Fixture(String logName) throws Exception
         {
-            this.file = Files.createTempFile(temporary, "synthetic-log-", ".txt").toFile();
+            this.file = logName == null ? Files.createTempFile(temporary, "synthetic-log-", ".txt").toFile()
+                : Files.createFile(Files.createTempDirectory(temporary, "synthetic-session-").resolve(logName)).toFile();
             ScarletVRChatLogs.Listener listener = (ScarletVRChatLogs.Listener) Proxy.newProxyInstance(
                 getClass().getClassLoader(), new Class<?>[]{ScarletVRChatLogs.Listener.class},
                 (proxy, method, args) -> {
@@ -87,9 +99,251 @@ class ScarletVRChatLogTrackingTest
         field.set(target, value);
     }
 
+    @Test void startupObservationCountsAllLinesAndJoinsWithoutUsingOldWallClockTimes() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); ScarletStartupRecovery.LogState before = f.logs.startupLogState();
+            assertTrue(before.healthy); assertEquals(USER, before.user);
+            f.tail.on_line(false, "plain continuation text"); f.tail.on_eof(); f.tail.on_loop();
+            assertTrue(f.logs.startupLogState().progress > before.progress);
+            f.accept(true, "[Behaviour] Joining wrld_synthetic:1"); f.tail.on_loop();
+            assertTrue(f.logs.startupLogState().joins > before.joins);
+            f.tail.invalidateTracking(); assertFalse(f.logs.startupLogState().healthy);
+        }
+    }
+
+    @Test void emptyDirectoryObservationRequiresFreshSuccessfulScanAndLiveReader() throws Exception
+    {
+        TestLogs logs = new TestLogs((ScarletVRChatLogs.Listener) Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{ScarletVRChatLogs.Listener.class}, (p,m,a) -> null));
+        try
+        {
+            logs.alive = true;
+            assertFalse(logs.startupLogState().healthy);
+            set(logs, "startupTargetScan", logs.now); assertTrue(logs.startupLogState().healthy);
+            logs.now += TimeUnit.SECONDS.toNanos(13); assertFalse(logs.startupLogState().healthy);
+            set(logs, "startupTargetScan", logs.now); logs.alive = false; assertFalse(logs.startupLogState().healthy);
+        }
+        finally { logs.close(); }
+    }
+
+    @Test void livePairedRegionResetsReachRecoverySnapshotButPreambleDoesNot() throws Exception
+    {
+        for (boolean preamble : new boolean[]{true,false}) try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            for (int second : new int[]{0,35,70})
+            {
+                f.logs.now = TimeUnit.SECONDS.toNanos(100 + second);
+                String prefix = "2026.10.12 " + java.time.LocalTime.of(12, 0).plusSeconds(second)
+                    .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")) + " Debug      -  ";
+                f.tail.isInPreamble = preamble;
+                f.tail.on_line(preamble, prefix + ScarletStartupFailureLoop.FAILURE);
+                f.tail.on_line(preamble, prefix + ScarletStartupFailureLoop.RESET);
+                f.tail.on_eof(); f.tail.on_loop();
+            }
+            ScarletStartupRecovery.LogState state = f.logs.startupLogState();
+            assertSame(f.tail, state.session);
+            assertEquals(!preamble, state.failures.repeated(f.logs.now));
+        }
+    }
+    @Test void successfulRoomMarkersAlsoDisarmRecovery() throws Exception
+    {
+        for (String marker : new String[]{"[Behaviour] Successfully joined room", "[Behaviour] Finished entering world."})
+            try (Fixture f = new Fixture())
+            {
+                f.healthy(); long before = f.logs.startupLogState().joins;
+                f.accept(false, marker); f.tail.on_loop();
+                assertEquals(before + 1, f.logs.startupLogState().joins);
+            }
+    }
+    @Test void syntheticLiveParserDrivesRecoveryOnlyWithoutSuccess() throws Exception
+    {
+        for (boolean connected : new boolean[]{false,true}) try (Fixture f = new Fixture("output_log_2026-10-12_12-00-00.txt"))
+        {
+            ScarletStartupRecovery recovery = new ScarletStartupRecovery();
+            java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+            java.time.Instant requested = LocalDateTime.of(2026, 10, 12, 11, 59, 50)
+                .atZone(java.time.ZoneId.systemDefault()).toInstant();
+            net.sybyline.scarlet.ext.ManagedVrcClient.Client client = new net.sybyline.scarlet.ext.ManagedVrcClient.Client(
+                1, "synthetic-destination", requested, 1, requested, "synthetic-os-user");
+            recovery.start(new ScarletStartupRecovery.Environment() {
+                public boolean allowed() { return true; }
+                public String user() { return USER; }
+                public long now() { return f.logs.now; }
+                public ScarletStartupRecovery.LogState logs() { return f.logs.startupLogState(); }
+                public void log(String reason) {}
+                public ScarletStartupRecovery.Launch recover(net.sybyline.scarlet.ext.ManagedVrcClient.Client expected,
+                    java.util.function.BooleanSupplier allowed, java.util.function.BooleanSupplier closeAllowed)
+                {
+                    assertSame(client, expected); assertTrue(allowed.getAsBoolean()); assertTrue(closeAllowed.getAsBoolean());
+                    attempts.incrementAndGet(); return null; // No process or real launch transport.
+                }
+            }, new ScarletStartupRecovery.Launch(client, new ScarletStartupRecovery.LogState(0, 0, 0, null, true)));
+            f.healthy();
+            for (int second : new int[]{110,145,180})
+            {
+                f.logs.now = TimeUnit.SECONDS.toNanos(100 + second);
+                String prefix = LocalDateTime.of(2026, 10, 12, 12, 0).plusSeconds(second)
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyy.MM.dd HH:mm:ss")) + " Debug      -  ";
+                f.tail.on_line(false, prefix + ScarletStartupFailureLoop.FAILURE);
+                f.tail.on_line(false, prefix + ScarletStartupFailureLoop.RESET);
+                if (connected && second == 180) f.tail.on_line(false, prefix + "[Behaviour] OnConnectedToMaster");
+                f.tail.on_eof(); f.tail.on_loop(); recovery.tick();
+            }
+            assertEquals(connected ? 0 : 1, attempts.get());
+        }
+    }
+    @Test void startupFileTimestampRequiresCanonicalLogName()
+    {
+        assertEquals(LocalDateTime.of(2026, 10, 25, 20, 10, 53),
+            ScarletVRChatLogs.startupFileTime(new File("output_log_2026-10-25_20-10-53.txt")));
+        assertNull(ScarletVRChatLogs.startupFileTime(new File("other.txt")));
+        assertNull(ScarletVRChatLogs.startupFileTime(new File("output_log_2026-99-25_20-10-53.txt")));
+    }
+
+    @Test void boundedCatchupWaitAllowsPendingReadButNeverInventsHealth() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            f.tail.on_line(false, PREFIX + "ordinary background log text");
+            assertFalse(f.logs.clientExitTrackingHealthy());
+            f.logs.onPause = () -> { f.tail.on_eof(); f.tail.on_loop(); };
+            f.logs.awaitClientExitTracking();
+            assertEquals(1, f.logs.pauses);
+            assertTrue(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void appendFinishingAfterOldHalfSecondBudgetCanRecoverWithFreshProof() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.tail.on_line(false, PREFIX + "ordinary pending line");
+            f.logs.onPause = () -> { if (f.logs.pauses == 50) { f.tail.on_eof(); f.tail.on_loop(); } };
+            f.logs.awaitClientExitTracking();
+            assertEquals(50, f.logs.pauses); assertTrue(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void longerWaitStillAbortsAsSoonAsPriorHeartbeatBecomesStale() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.tail.on_line(false, PREFIX + "pending line");
+            f.logs.now += TimeUnit.MILLISECONDS.toNanos(1800);
+            f.logs.awaitClientExitTracking();
+            assertTrue(f.logs.pauses <= 11); assertFalse(f.logs.clientExitTrackingHealthy());
+            assertEquals("tracking-awaiting-completed-loop", f.logs.clientExitTrackingFailure());
+        }
+    }
+
+    @Test void healthyLoopTimestampIsTakenAfterSlowTargetDiscovery() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.logs.now += TimeUnit.SECONDS.toNanos(11);
+            f.logs.onLocate = () -> f.logs.now += TimeUnit.SECONDS.toNanos(3);
+            assertFalse(f.logs.clientExitTrackingHealthy());
+            f.tail.on_loop();
+            assertEquals(f.logs.now, f.tail.completedLoopNanos);
+            assertTrue(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void slowTargetDiscoveryCannotHideAnUnreadAppend() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.logs.now += TimeUnit.SECONDS.toNanos(11);
+            f.logs.onLocate = () -> {
+                f.logs.now += TimeUnit.SECONDS.toNanos(3);
+                try { Files.write(f.file.toPath(), new byte[]{65}, StandardOpenOption.APPEND); }
+                catch (IOException ex) { throw new AssertionError(ex); }
+            };
+            f.tail.on_loop();
+            assertFalse(f.logs.clientExitTrackingHealthy());
+            assertEquals("tracking-unread-bytes-or-file-unavailable", f.logs.clientExitTrackingFailure());
+        }
+    }
+
+    @Test void failureDetailsDistinguishReadHeartbeatAndInvalidationWithoutPaths() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.tail.readInProgress = true;
+            assertEquals("tracking-read-in-progress", f.logs.clientExitTrackingFailure());
+            f.tail.readInProgress = false; f.tail.completeRead = false;
+            assertEquals("tracking-incomplete-line-or-read", f.logs.clientExitTrackingFailure());
+            f.tail.completeRead = true; f.logs.now += TimeUnit.SECONDS.toNanos(3);
+            assertEquals("tracking-reader-heartbeat-stale", f.logs.clientExitTrackingFailure());
+            f.tail.invalidateTracking();
+            assertEquals("tracking-session-invalidated", f.logs.clientExitTrackingFailure());
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void unresolvedReadWaitIsBoundedAndRemainsUnhealthy() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            f.tail.on_line(false, PREFIX + "pending text");
+            f.logs.awaitClientExitTracking();
+            assertEquals(75, f.logs.pauses);
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void staleFailedStoppedAndPreambleReadersDoNotGetCatchupAllowance() throws Exception
+    {
+        for (int kind = 0; kind < 6; kind++) try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            if (kind == 0) f.logs.now += TimeUnit.SECONDS.toNanos(2) + 1;
+            if (kind == 1) f.tail.invalidateTracking();
+            if (kind == 2) f.tail.stop();
+            if (kind == 3) f.tail.isInPreamble = true;
+            if (kind == 4) f.logs.alive = false;
+            if (kind == 5) f.logs.now--;
+            f.logs.awaitClientExitTracking();
+            assertEquals(0, f.logs.pauses, "kind=" + kind);
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void tailReplacementDuringCatchupStopsWaiting() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.tail.on_line(false, PREFIX + "pending text");
+            f.logs.onPause = () -> {
+                try { set(f.logs, "currentTail", f.logs.new VRChatLogTail(f.file)); }
+                catch (Exception ex) { throw new AssertionError(ex); }
+            };
+            f.logs.awaitClientExitTracking();
+            assertEquals(1, f.logs.pauses);
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void interruptedCatchupNeverWaits() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.tail.on_line(false, PREFIX + "pending text");
+            Thread.currentThread().interrupt();
+            try { f.logs.awaitClientExitTracking(); assertTrue(Thread.currentThread().isInterrupted()); }
+            finally { Thread.interrupted(); }
+            assertEquals(0, f.logs.pauses);
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
     @Test void knownAuthenticationPrefixesDispatchStrictIdentityAndTimestamp() throws Exception
     {
-        for (String text : new String[]{"[Behaviour] User Authenticated: " + AUTH,
+        for (String text : new String[]{"User Authenticated: " + AUTH, "[Behaviour] User Authenticated: " + AUTH,
             "[User Authenticated: " + AUTH + "]", "[Behaviour] [User Authenticated: " + AUTH + "]"})
         {
             try (Fixture fixture = new Fixture())
@@ -117,6 +371,12 @@ class ScarletVRChatLogTrackingTest
     @Test void malformedAuthenticationNeverInventsAnIdentityAndInvalidatesTracking() throws Exception
     {
         for (String text : new String[]{
+            "User Authenticated: Synthetic (usr_invalid)",
+            "User Authenticated: Synthetic (grp_00000000-0000-0000-0000-000000000001)",
+            "User Authenticated: Synthetic (" + USER + ") trailing text",
+            "User Authenticated: (" + USER + ")",
+            "User Authenticated:   (" + USER + ")",
+            "User Authenticated: Synthetic " + USER,
             "[Behaviour] User Authenticated: Synthetic (usr_invalid)",
             "[Behaviour] User Authenticated: Synthetic (" + USER + ") trailing text",
             "[Behaviour] User Authenticated: (" + USER + ")",
@@ -138,15 +398,45 @@ class ScarletVRChatLogTrackingTest
         }
     }
 
-    @Test void unrelatedEmbeddedOrUnprefixedAuthenticationIsNotTrusted() throws Exception
+    @Test void unrelatedEmbeddedOrAlteredAuthenticationPrefixIsNotTrusted() throws Exception
     {
         try (Fixture fixture = new Fixture())
         {
-            fixture.accept(false, "User Authenticated: " + AUTH);
+            fixture.accept(false, "Some text User Authenticated: " + AUTH);
             fixture.accept(false, "[API] User Authenticated: " + AUTH);
             fixture.accept(false, "[Behaviour] Some text [User Authenticated: " + AUTH + "]");
             fixture.accept(false, "[Behaviour] User Authenticated:Fake " + AUTH);
             assertTrue(fixture.authentication.isEmpty());
+        }
+    }
+
+    @Test void plainAuthenticationPreservesPreambleAndEnablesHealthyLiveTracking() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.logs.alive = true;
+            fixture.accept(true, "User Authenticated: " + AUTH);
+            fixture.accept(false, "User Authenticated: " + AUTH);
+            fixture.tail.on_loop();
+            assertEquals(2, fixture.authentication.size());
+            assertEquals(true, fixture.authentication.get(0)[0]);
+            assertEquals(false, fixture.authentication.get(1)[0]);
+            assertEquals(USER, fixture.authentication.get(1)[3]);
+            assertTrue(fixture.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void malformedPlainAuthenticationCannotPreserveEarlierTrustedTracking() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            fixture.accept(false, "User Authenticated: Synthetic (usr_not-a-uuid)");
+            fixture.accept(false, "User Authenticated: " + AUTH);
+            fixture.tail.on_loop();
+            assertEquals(2, fixture.authentication.size());
+            assertFalse(fixture.tail.trackingValid);
+            assertFalse(fixture.logs.clientExitTrackingHealthy());
         }
     }
 

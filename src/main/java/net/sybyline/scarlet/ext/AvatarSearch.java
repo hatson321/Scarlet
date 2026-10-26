@@ -87,6 +87,12 @@ public interface AvatarSearch
     {
         if (!featureEnabled || !Boolean.TRUE.equals(consent))
             return new String[0];
+        return selectedProviders(customEnabled, configured, blockedHost);
+    }
+
+    /** Settings selection is independent of consent; this does not authorize any request. */
+    static String[] selectedProviders(Boolean customEnabled, String[] configured, String blockedHost)
+    {
         String[] selected = Boolean.TRUE.equals(customEnabled) ? configured : URL_ROOTS;
         if (selected == null)
             return new String[0];

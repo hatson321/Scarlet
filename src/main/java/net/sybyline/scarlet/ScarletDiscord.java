@@ -32,6 +32,9 @@ public interface ScarletDiscord extends Closeable
      */
     default void emitOpsAlert(String title, String detail, int color) {}
 
+    /** Current-session operator request; token is opaque, expiring and not a join link. */
+    default void emitClientExitConflict(String token, String counts) {}
+
 
     // U+2727 White Four Pointed Star (the character separating the footer and timestamp differs by client platform...)
     String FOOTER_PREFIX = String.format("%s %s \u2727 ", Scarlet.APP_NAME, Scarlet.VERSION);
@@ -480,6 +483,14 @@ public interface ScarletDiscord extends Closeable
     /** Cold-launch the VRChat client into {@code location} when the auto-launch feature is on; deduplicated so the same instance is only launched into once. */
     public default void launchClientIntoInstanceIfEnabled(String location)
     {
+    }
+    /** Background, bounded startup recovery; never restarts a pre-existing VRChat client. */
+    public default void maybeJoinActiveInstanceOnStartup()
+    {
+    }
+    public default boolean isStartupInstanceJoinPending()
+    {
+        return false;
     }
     public default void processInstanceCreate(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta)
     {

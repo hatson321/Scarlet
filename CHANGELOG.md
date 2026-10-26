@@ -1,6 +1,86 @@
 
 # Changelog
 
+## 0.6.1-a9 (unpublished pre-release candidate)
+
+This candidate consolidates the 0.6.1 alpha and local test-build work. See
+[0.6.1-a9 release notes](RELEASE_NOTES_0.6.1-a9.md) for current behavior and test limits.
+Historical T entries below remain a record of intermediate behavior, not the final policy.
+
+- Add console import progress and completion reporting; update optional avatar-provider support.
+- Join the newest eligible active group instance at startup, support age-gated join links, and keep optional avatar/profile work off the live roster path. Add toggleable small Discord join/leave thumbnails.
+- Restore Staff Mode watched-avatar/vote-to-kick eligibility without requiring a configured group; improve speech fallback, advisories and first-run prompts.
+- Add a persistent Windows rendering-compatibility setting.
+- Improve client tracking, shutdown diagnostics and bounded retries. Closed/empty exit now relies on a matching closure audit plus healthy local logs rather than API occupancy. A sole verified manually launched client is eligible when the exit toggle is enabled; multiple clients block it.
+- Add opt-in bounded startup recovery, explicit repeated-connection-failure detection and separate Windows force-close opt-ins for startup and closed/empty exit. Normal close and exact-process safety checks remain first.
+- Correct current shutdown documentation and synchronize runtime, build and launcher versions to lowercase `0.6.1-a9`. Add regression coverage for earlier alpha upgrades, numeric alpha ordering, stable-release precedence and Windows build acceptance. Do not change the published update feed or announcement.
+- Make the Linux rendering-metadata regression account for Java's own font-cache initialization before taking its unchanged-data baseline; retain the complete settings/credentials filesystem comparison.
+
+## 0.6.1-T10 (local test build)
+
+- Startup recovery also detects three live, separately spaced region-connection failures in the Disconnecting state, each paired with VRChat's explicit network-region game-flow reset. Ordinary log activity no longer hides this specific failed-startup loop. Requires three cycles within two minutes, at least 20 seconds apart, with the latest within 45 seconds. Historical catch-up, duplicated entries and unrelated errors do not count.
+- Keep the existing recovery opt-in, at least three minutes per startup, a ten-minute watch per attempt and at most two replacements. Require a new current-launch log, expected account authentication, healthy caught-up tracking and fresh loop evidence at close dispatch. Connection success clears failure evidence; world joins, account/context changes or a changed tracked log session prevent recovery.
+- Reuse the existing exact Scarlet-owned process, normal-close-first transport, separately enabled Windows force fallback, verified exit before replacement, active-target authorization and fresh secure join lookup. No blanket process killing or adoption of manually launched clients for startup recovery. Closed/empty-instance shutdown is unchanged.
+
+## 0.6.1-T9 (local test build)
+
+- The existing closed/empty-instance exit toggle now permits shutdown of the only verified running VRChat client, including a manually launched client or one whose Scarlet launch ownership was not established. The setting remains off by default; its saved key is unchanged. Startup recovery still requires Scarlet launch ownership and cannot use this shutdown-only receipt.
+- Retain the matching current-session closure audit, healthy caught-up live logs, known self with no other players, full 30-second grace, same Windows/Linux user, exact process identity and fresh single-client rechecks at dispatch. Multiple clients, inaccessible identity or ambiguous inventory prevent shutdown. No instance API occupancy request is restored.
+- Multiple running clients produce a rate-limited warning in the configured ops-alert channel when the monitored instance is closed and locally empty. No action button can bypass this ambiguity. Notifications contain no join links or player identities.
+- Windows shutdown inventory reads the full executable-name inventory but requests detailed identity only for VRChat candidates, avoiding unrelated process churn. Normal close remains first; forced termination still requires the separate existing opt-in and its bounded fresh checks.
+
+## 0.6.1-T8 (local test build)
+
+- Automatic VRChat client shutdown now uses Scarlet's healthy, caught-up output-log roster instead of making a fresh instance API request. Stale server player counts, missing instance responses and occupancy retry backoff no longer delay this shutdown path. This deliberately removes independent server occupancy confirmation; it is not a claim that local logs are infallible.
+- Keep the matching group-instance close audit, current log session, verified Scarlet-owned client, sole-self roster, full 30-second healthy grace, final tracking/identity checks and bounded normal-close retries. An empty but still-open instance is not enough. Closure audit delivery can still be delayed.
+- The separate opt-in Windows force-close fallback also uses fresh local tracking checks rather than the instance API, after at least 15 seconds for normal exit. Player arrivals, changed sessions, unhealthy logs or uncertain process identity still veto it. Old server-count override actions are inactive in this shutdown mode.
+- Startup target authorization and idle server-instance closing retain their existing API checks. No publishing or live game/process actions during verification.
+
+## 0.6.1-T7 (local test build)
+
+- Add opt-in "VRChat Client: Recover stalled auto-launch". Watch only verified Scarlet-owned automatic launches, wait at least three minutes after each launch and two minutes without new log lines, and allow at most two replacement launches. Stop watching on any new world-join entry, a changed account/context, or a ten-minute observation limit per attempt. Ordinary later freezes/disconnects are not recovery triggers.
+- Require a functioning, caught-up log reader (or a recently successful empty-directory scan); unreadable logs and parser failures are not evidence of a frozen client. Revalidate quiet-log evidence immediately before normal close. Never launch a second client while the original remains running.
+- Reuse exact managed process ownership and verified quiet shutdown before replacement. Recheck the active target and obtain fresh secure join information after shutdown. Changed ownership, uncertain close or launch, settings/account changes and exhausted retries stop recovery. Explicit Windows close rejections permit only the separately enabled, guarded force fallback. All work runs on the existing serialized background launch worker.
+- Add two separate, default-off Windows force-close opt-ins: stalled startup recovery, and closed/empty-instance shutdown. Allow 15 seconds for normal shutdown first. Forced termination uses an OS handle pinned to the verified Scarlet-owned process, never a name-based blanket kill; identity, settings and applicable startup/closed-empty evidence are checked again. Closed-empty fallback obtains a new server response and requires the same uninterrupted roster/session/grace observation; operator occupancy overrides cannot authorize force-close. One force opportunity only, with no replay after an uncertain result. Force-close may lose unsaved client state.
+- Keep T6 server occupancy, log-health and process-ownership requirements. No publication or live game actions during verification.
+
+## 0.6.1-T6 (local test build)
+
+- Distinguish native close stages: window enumeration, no visible window, multiple visible windows, changed window/process identity, final safety veto, Windows access denial, rejected close message, and uncertain dispatch. Final guard diagnostics identify mode, group, session, operator permission, stale server proof or log-health failures. Recheck server-proof age after slow native process checks. Failed Windows posts include a numeric error only.
+- Permit at most two additional automatic attempts after explicitly classified, definitely-unsent transient window/guard failures. Each retry starts a fresh full 30-second healthy grace period and requires a new server response and all process/session/roster checks. Audit replays and roster changes do not refill the retry budget. Sent, rejected, unknown or identity-changing outcomes remain terminal; no force-close fallback exists.
+- Operator confirmations remain one-shot and never turn an occupancy override into an unattended retry. Preserve the existing server occupancy and log-health acceptance rules, permissions, API backoff and launch ownership checks.
+
+## 0.6.1-T5 (local test build)
+
+- Move potentially slow native process verification before bounded log catch-up and outside the roster lock. Reject session changes across that work; retain fresh health, full grace, final process identity and server proof requirements.
+- Use a bounded, primary-account, no-cache instance read for client-exit proof, without the legacy world-instance fallback. Add rate-limited numeric count and cache-source diagnostics; existing logs cannot establish the cause of VRChat's inconsistent count.
+- After at least five minutes of locally observed sole-self occupancy, report a fresh occupancy-only server disagreement to the configured operations channel. Reports expire after ten minutes and are bounded to one per ten minutes for the same observation. Any intervening player/session change invalidates the control.
+- Add a separate `vrchat-client-exit-override` Other permission (owner/admin by default; explicitly grant to trusted staff). Two-step, actor-bound confirmation expires after sixty seconds. It may bypass only a fresh API occupancy disagreement to request normal exit of the same Scarlet-owned VRChat client. Closed-instance proof, healthy sole-self roster, full grace, operating mode and final ownership checks remain mandatory; no force-kill or instance mutation is performed. Results go to operations logging.
+
+## 0.6.1-T4 (local test build)
+
+- After a fresh server rejection involving only occupancy, retry after 15 seconds and then 30 seconds, before returning to 60-second intervals. Missing, invalid, stale or failed responses retain a 60-second backoff and consume the faster retry allowance for that session. Audit replays do not refill it; existing API-wide rate limiting remains in place.
+- Allow a recently healthy log reader up to 1.5 seconds to complete an append, with the same two-second freshness limit and fresh health checks. Timestamp healthy loop completion after filesystem target discovery instead of before it. Add fixed, rate-limited tracking failure reasons to distinguish unfinished reads, stale heartbeats and invalidated sessions.
+- Preserve the complete 30-second grace period, exact session/process ownership, server closure and sole-self checks, final revalidation and graceful-only exit. Genuine tracking failures still reset the countdown. Live-device timing needs retesting; no report or publication was requested.
+
+## 0.6.1-T3 (local test build)
+
+- Added exact, rate-limited automatic-exit server rejection diagnostics for response availability, ID/world/instance matching, closure timestamp and individual occupancy fields. Multiple failing fields are reported without exposing account IDs, instance links or raw response bodies.
+- Kept the server acceptance predicate, process/session checks, log health, 30-second grace, 60-second server retry backoff and graceful-only exit behavior unchanged. Diagnostics do not make additional API requests or authorize a close.
+
+## 0.6.1-T2 (local test build)
+
+- Before automatic client-exit checks, allow a recently healthy log reader up to 500 ms to finish an ordinary append instead of immediately resetting the 30-second countdown. Waiting happens outside the roster lock; fresh health, exact session/process ownership, roster, closure and server checks remain required. Stale, failed or incomplete tracking still blocks exit and resets the grace period.
+- Suppress group-audit permission, missing-group and Discord moderation opt-in startup prompts in Staff Mode. Group-bot permission checks remain enabled, and Staff Mode does not consume the Discord opt-in preference.
+
+## 0.6.1-T1 (local test build)
+
+- Added privacy-safe, rate-limited automatic VRChat exit diagnostics without changing the ownership, current-session, closed/empty, grace-period or graceful-exit safeguards.
+- Bounded speech synthesis waits and pending work, handled failed/null/cancelled voices with distinct bounded fallback attempts, and saved fallback selections only after successful synthesis. A still-busy native provider is not given more queued requests; restart Scarlet if the provider remains stuck.
+- Separated watched-avatar matching from optional avatar-detail hydration. Refreshed present-player advisories after catch-up/provider changes without replaying historical speech, and stopped rejoin checks from trusting an avatar retained from an earlier visit.
+- Preserved avatar-provider selections independently of consent, warned on empty selections, and corrected the consent setting documentation. Existing consent, Advisory/TTS switches, silent flags, departed-player guards and Staff Mode group isolation remain enforced.
+- Recognized uppercase T builds as previews, ordered them numerically after the prior A builds and before stable 0.6.1. No update feed or announcement was changed.
+
 ## 0.5.0 (prepared locally; not yet published)
 
 See [0.5.0 release notes](RELEASE_NOTES_0.5.0.md) for the cumulative desktop maintenance changes and remaining limitations. The build, runtime fallback, local update metadata, and launcher version marker now agree on `0.5.0`; historical release entries below keep their original numbers.

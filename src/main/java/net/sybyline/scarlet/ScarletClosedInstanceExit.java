@@ -190,10 +190,11 @@ final class ScarletClosedInstanceExit
     }
 
     /**
-     * Integration must freshly verify actual server closure before this call.
+     * Integration must freshly verify tracking and its selected evidence policy before this call.
      * The callback must perform its own final managed-process check and issue only
      * a short, nonblocking graceful-close request. Marking before callback ensures
-     * a denied/failed request cannot cause a retry storm. No forced exit fallback.
+     * a denied/failed request cannot cause a retry storm. Any force fallback is
+     * separately opted in and revalidated by the integration, never granted here.
      */
     synchronized boolean commit(Attempt attempt, long nowNanos, Runnable gracefulClose)
     {
@@ -205,11 +206,43 @@ final class ScarletClosedInstanceExit
         return true;
     }
 
+    /** Rearm only an explicit, definitely-unsent outcome from the same committed observation. */
+    synchronized boolean retryUnsent(Attempt attempt, net.sybyline.scarlet.ext.ManagedVrcClient.CloseResult result)
+    {
+        if (result == null || !result.retryableBeforeDispatch() || attempt == null || attempt.owner != this
+            || attempt.generation != this.generation || attempt.revision != this.revision
+            || !this.attempted || !this.eligible()) return false;
+        this.attempted = false;
+        this.counting = false;
+        ++this.revision; // Old server/observation proof cannot be committed again.
+        return true;
+    }
+
+    /** A force fallback may only reuse the continuously valid observation of a committed normal attempt. */
+    synchronized boolean committedObservation(Attempt attempt, long nowNanos)
+    {
+        return attempt != null && attempt.owner == this && attempt.generation == this.generation
+            && attempt.revision == this.revision && this.attempted && this.counting && this.eligible()
+            && nowNanos - this.eligibleSince >= GRACE_NANOS;
+    }
+
     private boolean eligible()
     {
         return this.enabled && this.location != null && this.sessionStartedAt != null
             && this.closedAt != null && this.liveCaughtUp && this.selfUserId != null
             && this.roster.size() == 1 && this.roster.contains(this.selfUserId);
+    }
+
+    /** Read-only explanation; never advances the countdown or changes permission to exit. */
+    synchronized String waitingReason()
+    {
+        if (!this.enabled) return "policy-disabled-or-group-unconfigured";
+        if (this.location == null || this.sessionStartedAt == null) return "no-valid-group-session";
+        if (!this.liveCaughtUp || this.selfUserId == null) return "waiting-for-live-self-roster";
+        if (this.closedAt == null) return "waiting-for-matching-close-audit";
+        if (this.roster.size() != 1 || !this.roster.contains(this.selfUserId)) return "other-players-present";
+        if (this.attempted) return "exit-already-attempted-no-repeat";
+        return "waiting-for-30-second-grace";
     }
 
     private boolean matchesEvent(String groupId, String location, Instant eventAt, Instant observedAt)

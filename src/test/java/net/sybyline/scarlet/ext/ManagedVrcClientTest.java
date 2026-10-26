@@ -321,7 +321,7 @@ class ManagedVrcClientTest
     @Test void freshStateVetoPreventsAnyCloseAttempt()
     {
         Client client = managed();
-        assertEquals(CloseResult.CANCELLED, this.tracker.close(client, () -> false));
+        assertEquals(CloseResult.FINAL_GUARD_VETO, this.tracker.close(client, () -> false));
         assertEquals(CloseResult.CANCELLED, this.tracker.close(client, null));
         assertEquals(0, this.processes.attempts);
     }

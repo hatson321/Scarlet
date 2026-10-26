@@ -1,4 +1,4 @@
-# Scarlet 0.5.0 closed-beta acceptance
+# Scarlet 0.6.1 pre-release acceptance
 
 The priority remediation changes require both repeatable offline tests and an
 operator-supervised acceptance pass. A successful build is not a declaration that
@@ -56,6 +56,19 @@ live credentials, external moderation actions, voice sessions or privileged
 installer executions are required by the offline suite.
 
 ## Recovery and compatibility notes
+
+For the 0.6.1-a9 candidate, also record supervised checks of Staff Mode watched
+alerts and vote-to-kick speech, newest-instance selection with multiple open
+instances, persisted Windows rendering compatibility and the optional startup
+recovery/force-close paths. Offline tests do not establish live acceptance.
+
+Closed/empty client exit now uses a matching close audit and the healthy local
+log roster, not independent server occupancy confirmation. Test unknown self,
+unread logs, another player, changed sessions and multiple local clients as vetoes.
+The exit opt-in can apply to a sole verified manually launched client; startup
+recovery still requires Scarlet launch ownership. Force close is a separate
+Windows opt-in, after normal exit is attempted. See README for the current policy;
+historical test-build changelog entries describe earlier policies.
 
 Imports are staged and validated before application, with verified rollback for
 ordinary failures and an independent pre-import backup. Replacing multiple files

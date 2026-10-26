@@ -573,6 +573,13 @@ public interface MiscUtils
                    rx = rm.group("kind");
             // Inverted vs. compareSemVer: a suffix means "ahead of the
             // bare release" instead of "pre-release of it".
+            // Starting with 0.6.1, previews precede the final stable release.
+            // Preserve legacy ordering for previously delivered release series.
+            boolean previewSeries = Integer.parseInt(lm.group("major")) > 0
+                || Integer.parseInt(lm.group("minor")) > 6
+                || Integer.parseInt(lm.group("minor")) == 6 && Integer.parseInt(lm.group("patch")) >= 1;
+            if (previewSeries && (lx == null || rx == null) && !Objects.equals(lx, rx))
+                return lx == null ? 1 : -1;
             cmp = lx == null
                 ? rx == null
                     ? 0
@@ -601,6 +608,8 @@ public interface MiscUtils
     /** Compare Scarlet suffix labels and their trailing iteration numbers. */
     static int compareScarletVersionKind(String l, String r)
     {
+        boolean lt = l.matches("T[0-9]+"), rt = r.matches("T[0-9]+");
+        if (lt != rt) return lt ? 1 : -1;
         int li = l.length(), ri = r.length();
         while (li > 0 && l.charAt(li - 1) >= '0' && l.charAt(li - 1) <= '9') li--;
         while (ri > 0 && r.charAt(ri - 1) >= '0' && r.charAt(ri - 1) <= '9') ri--;

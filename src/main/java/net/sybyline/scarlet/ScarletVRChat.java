@@ -2136,6 +2136,17 @@ finally
         return this.idleInstanceRequest(location, false, allowed);
     }
 
+    private long lastClientExitEvidence;
+
+    /** Shutdown proof uses one fresh primary-account endpoint, not the legacy world fallback. */
+    Instance readClientExitInstance(String location, java.util.function.BooleanSupplier allowed)
+    {
+        JsonElement raw = this.idleInstanceRequest(location, false, allowed, true);
+        if (raw == null) return null;
+        try { return JSON.getGson().fromJson(raw, Instance.class); }
+        catch (RuntimeException ex) { LOG.debug("Client exit instance response could not be decoded"); return null; }
+    }
+
     /** Optional unattended closure never requests a hard close and never retries a mutation. */
     boolean softCloseIdleInstance(String location, java.util.function.BooleanSupplier allowed)
     {
@@ -2143,6 +2154,11 @@ finally
     }
 
     private JsonElement idleInstanceRequest(String location, boolean close, java.util.function.BooleanSupplier allowed)
+    {
+        return this.idleInstanceRequest(location, close, allowed, false);
+    }
+
+    private JsonElement idleInstanceRequest(String location, boolean close, java.util.function.BooleanSupplier allowed, boolean exitEvidence)
     {
         final String group = this.groupId, user = this.currentUserId;
         final long generation = ExtendedUserAgent.currentAuthenticationGeneration();
@@ -2158,6 +2174,7 @@ finally
         {
             Map<String, String> headers = new HashMap<>();
             headers.put("Accept", "application/json");
+            if (exitEvidence) headers.put("Cache-Control", "no-cache, no-store");
             Request request = this.client.buildCall(null, "/instances/" + location, close ? "DELETE" : "GET",
                 new ArrayList<>(), new ArrayList<>(), null, headers, new HashMap<>(), new HashMap<>(),
                 new String[]{"authCookie"}, null).request();
@@ -2173,6 +2190,15 @@ finally
                 response.body().source().request(2L * 1024L * 1024L + 1L);
                 if (response.body().source().buffer().size() > 2L * 1024L * 1024L) return null;
                 JsonElement result = parseBanResponse(response.body().string());
+                if (exitEvidence && valid.getAsBoolean()) synchronized (this)
+                {
+                    long now = System.nanoTime();
+                    if (this.lastClientExitEvidence == 0L || now - this.lastClientExitEvidence >= java.util.concurrent.TimeUnit.SECONDS.toNanos(60))
+                    {
+                        this.lastClientExitEvidence = now;
+                        LOG.info("Client exit instance evidence: {}", ScarletExitInstanceEvidence.describe(result, response));
+                    }
+                }
                 return valid.getAsBoolean() ? result : null;
             }
         }
@@ -2339,6 +2365,110 @@ finally
                 LOG.error("Error during get group instances: "+apiex.getMessage());
             return null;
         }
+    }
+
+    /** Startup follow reads are optional, bounded and isolated from mutable login contexts. */
+    private JsonElement startupFollowRead(String expectedGroup, String path, List<io.github.vrchatapi.Pair> query,
+        java.util.function.BooleanSupplier allowed) throws IOException
+    {
+        SnapshotIdentity identity = new SnapshotIdentity(this);
+        java.util.function.BooleanSupplier valid = () -> allowed.getAsBoolean() && identity.valid()
+            && Objects.equals(expectedGroup, this.groupId) && this.currentUserId != null
+            && !Thread.currentThread().isInterrupted()
+            && ScarletVRChatCookieJar._context.get() == null && ScarletVRChatCookieJar._context2.get() == null;
+        if (expectedGroup == null || !net.sybyline.scarlet.util.VrcIds.id_group.matcher(expectedGroup).matches()
+            || this.cookies == null || !valid.getAsBoolean())
+            throw new ScarletStartupFailure(ScarletStartupFailure.Kind.CANCELLED);
+        try
+        {
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Accept", "application/json");
+            Request request = this.client.buildCall(null, path, "GET", query, new ArrayList<>(), null,
+                headers, new HashMap<>(), new HashMap<>(), new String[]{"authCookie"}, null).request()
+                .newBuilder().removeHeader("Authorization").removeHeader("Cookie")
+                .tag(SnapshotIdentity.class, identity).build();
+            // Reuse the guarded, five-second, no-retry transport; all audit/global pacing remains active.
+            OkHttpClient http = idleCloseHttpClient(this.client.getHttpClient(), this.cookies.copy(), valid);
+            if (!valid.getAsBoolean()) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.CANCELLED);
+            try (Response response = http.newCall(request).execute())
+            {
+                if (!response.isSuccessful()) throw ScarletStartupFailure.http(response.code());
+                if (!valid.getAsBoolean()) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.CANCELLED);
+                if (response.body() == null) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+                response.body().source().request(2L * 1024L * 1024L + 1L);
+                if (response.body().source().buffer().size() > 2L * 1024L * 1024L)
+                    throw new ScarletStartupFailure(ScarletStartupFailure.Kind.RESPONSE_TOO_LARGE);
+                JsonElement result;
+                try { result = parseBanResponse(response.body().string()); }
+                catch (RuntimeException ex) { throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE); }
+                if (!valid.getAsBoolean()) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.CANCELLED);
+                if (result == null) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+                return result;
+            }
+        }
+        catch (ApiException | RuntimeException ex)
+        {
+            // Never include cookies, secure join tokens or response bodies in this optional diagnostic.
+            throw new ScarletStartupFailure(ScarletStartupFailure.Kind.REQUEST_FAILED);
+        }
+    }
+
+    List<String> getStartupGroupInstances(String group, java.util.function.BooleanSupplier allowed) throws IOException
+    {
+        JsonElement body = this.startupFollowRead(group, "/groups/" + group + "/instances", new ArrayList<>(), allowed);
+        if (!body.isJsonArray()) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+        List<String> locations = new ArrayList<>();
+        for (JsonElement item : body.getAsJsonArray())
+        {
+            if (!item.isJsonObject()) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+            JsonElement location = item.getAsJsonObject().get("location");
+            if (location == null || !location.isJsonPrimitive() || !location.getAsJsonPrimitive().isString())
+                throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+            locations.add(location.getAsString());
+        }
+        return locations;
+    }
+
+    ScarletStartupInstanceJoin.AuditPage getStartupInstanceCreationPage(String group, OffsetDateTime from,
+        OffsetDateTime to, int offset, java.util.function.BooleanSupplier allowed) throws IOException
+    {
+        if (offset < 0 || offset >= 500 || offset % 100 != 0 || from == null || to == null)
+            throw new ScarletStartupFailure(ScarletStartupFailure.Kind.REQUEST_FAILED);
+        List<io.github.vrchatapi.Pair> query = new ArrayList<>();
+        query.addAll(this.client.parameterToPair("n", 100));
+        query.addAll(this.client.parameterToPair("offset", offset));
+        query.addAll(this.client.parameterToPair("startDate", from));
+        query.addAll(this.client.parameterToPair("endDate", to));
+        query.addAll(this.client.parameterToPair("eventTypes", "group.instance.create"));
+        JsonElement body = this.startupFollowRead(group, "/groups/" + group + "/auditLogs", query, allowed);
+        if (!body.isJsonObject()) throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+        JsonObject object = body.getAsJsonObject();
+        JsonElement next = object.get("hasNext"), results = object.get("results");
+        if (next == null || !next.isJsonPrimitive() || !next.getAsJsonPrimitive().isBoolean()
+            || results == null || !results.isJsonArray() || results.getAsJsonArray().size() > 100)
+            throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE);
+        try
+        {
+            PaginatedGroupAuditLogEntryList page = JSON.getGson().fromJson(body, PaginatedGroupAuditLogEntryList.class);
+            return new ScarletStartupInstanceJoin.AuditPage(ScarletAuditData.entries(page), next.getAsBoolean());
+        }
+        catch (RuntimeException ex) { throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_RESPONSE); }
+    }
+
+    String getStartupInstanceSecureName(String group, String location, java.util.function.BooleanSupplier allowed) throws IOException
+    {
+        Location parsed;
+        try { parsed = ScarletStartupInstanceJoin.parseLocation(location, group); }
+        catch (IllegalArgumentException ex) { throw new ScarletStartupFailure(ScarletStartupFailure.Kind.INVALID_LOCATION); }
+        JsonElement body = this.startupFollowRead(group, "/instances/" + parsed.world + ":" + parsed.instance + "/shortName", new ArrayList<>(), allowed);
+        if (!body.isJsonObject()) return null;
+        for (String field : new String[]{"secureName", "shortName"})
+        {
+            JsonElement name = body.getAsJsonObject().get(field);
+            if (name != null && name.isJsonPrimitive() && name.getAsJsonPrimitive().isString()
+                && !name.getAsString().trim().isEmpty()) return name.getAsString();
+        }
+        return null;
     }
 
     public List<LimitedUserGroups> getUserGroups(String userId)

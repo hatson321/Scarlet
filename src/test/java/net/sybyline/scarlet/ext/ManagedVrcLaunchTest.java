@@ -64,6 +64,8 @@ class ManagedVrcLaunchTest
         String user = "synthetic-user";
         boolean failSnapshot, failFind, denyClose, exitOnClose;
         int closeAttempts, closeSignals;
+        int forceAttempts, forceSignals;
+        boolean forceExits = true;
         ProcessInfo closeTarget;
         Runnable atClose = () -> {};
         public String currentUser() { return this.user; }
@@ -86,6 +88,14 @@ class ManagedVrcLaunchTest
             this.closeSignals++;
             if (this.exitOnClose) this.entries.remove(expected.pid());
             return true;
+        }
+        public ManagedVrcClient.ForceResult forceClose(ProcessInfo expected, BooleanSupplier guard)
+        {
+            forceAttempts++;
+            if (!guard.getAsBoolean()) return ManagedVrcClient.ForceResult.GUARD_VETO;
+            forceSignals++;
+            if (forceExits) entries.remove(expected.pid());
+            return ManagedVrcClient.ForceResult.REQUESTED;
         }
     }
 
@@ -142,6 +152,31 @@ class ManagedVrcLaunchTest
         }
     }
 
+    @Test void explicitForceRejectsUnownedChangedOrMultipleClientsAndRevokedGuard()
+    {
+        Harness empty = new Harness();
+        assertEquals(ManagedVrcClient.ForceResult.NOT_MANAGED, empty.tracker.forceClose(null, () -> true));
+        for (int kind = 0; kind < 5; kind++)
+        {
+            Harness h = new Harness(); Client owned = h.managed();
+            if (kind == 0) h.processes.entries.put(40L, h.client(40, 90)); // Same PID, new start time.
+            if (kind == 1) h.processes.entries.put(42L, h.client(42, 90));
+            if (kind == 2) h.processes.user = "different-user";
+            if (kind == 3) h.processes.failSnapshot = true;
+            final boolean allowed = kind != 4;
+            assertNotEquals(ManagedVrcClient.ForceResult.REQUESTED, h.tracker.forceClose(owned, () -> allowed));
+            assertEquals(0, h.processes.forceSignals);
+        }
+    }
+
+    @Test void unknownNormalCloseFailureNeverArmsStartupForce()
+    {
+        Harness h = new Harness(); Client owned = h.managed(); h.processes.denyClose = true;
+        assertThrows(IOException.class, () -> h.tracker.launch(LOCATION, true, guard -> h.start(), owned,
+            () -> true, () -> true, () -> true));
+        assertEquals(0, h.processes.forceAttempts); assertEquals(0, h.starts);
+    }
+
     @Test void emptyInventoryLaunchesOnceAndWaitsForStableOwnedStartup() throws Exception
     {
         Harness h = new Harness();
@@ -151,6 +186,59 @@ class ManagedVrcLaunchTest
         assertTrue(h.pausedMillis >= 3_000);
         assertNotNull(h.tracker.current());
         assertEquals(41, h.tracker.current().pid());
+    }
+
+    @Test void stalledRecoveryRetainsExactClientAndWaitsForNormalExit() throws Exception
+    {
+        Harness h = new Harness(); Client owned = h.managed(); h.processes.exitOnClose = true;
+        h.tracker.launch(LOCATION, true, guard -> { guard.check(); return h.start(); }, owned, () -> true, () -> true, null);
+        assertEquals(1, h.processes.closeSignals); assertEquals(0, h.processes.forceAttempts); assertEquals(1, h.starts);
+    }
+
+    @Test void startupForceRequiresExplicitOptInAndFifteenSecondNormalWait() throws Exception
+    {
+        Harness h = new Harness(); Client owned = h.managed(); long started = h.clock.nanos;
+        h.tracker.launch(LOCATION, true, guard -> { guard.check(); return h.start(); }, owned, () -> true, () -> true, () -> true);
+        assertTrue(h.clock.nanos - started >= Tracker.CLOSE_NANOS + Tracker.QUIET_NANOS);
+        assertEquals(1, h.processes.closeSignals); assertEquals(1, h.processes.forceSignals); assertEquals(1, h.starts);
+        Harness denied = new Harness(); Client other = denied.managed();
+        assertThrows(IOException.class, () -> denied.tracker.launch(LOCATION, true, guard -> denied.start(), other, () -> true, () -> true, () -> false));
+        assertEquals(0, denied.processes.forceAttempts); assertEquals(0, denied.starts);
+    }
+
+    @Test void forceCannotLaunchReplacementUntilExitIsActuallyObserved()
+    {
+        Harness h = new Harness(); Client owned = h.managed(); h.processes.forceExits = false;
+        assertThrows(IOException.class, () -> h.tracker.launch(LOCATION, true, guard -> h.start(), owned, () -> true, () -> true, () -> true));
+        assertEquals(1, h.processes.forceSignals); assertEquals(0, h.starts);
+    }
+
+    @Test void startupProgressOrOwnershipChangeDuringGracePreventsForce()
+    {
+        for (int kind = 0; kind < 2; kind++)
+        {
+            Harness h = new Harness(); Client owned = h.managed(); boolean[] valid = {true};
+            if (kind == 0) h.onPause = millis -> valid[0] = false;
+            else h.onPause = millis -> h.processes.entries.put(40L, h.client(40, 90));
+            assertThrows(IOException.class, () -> h.tracker.launch(LOCATION, true, guard -> h.start(), owned, () -> true, () -> valid[0], () -> true));
+            assertEquals(0, h.processes.forceSignals); assertEquals(0, h.starts);
+        }
+    }
+
+    @Test void differentOwnedClientOrDestinationCannotBeRecovered()
+    {
+        Harness h = new Harness(); Client owned = h.managed();
+        Client forged = new Client(owned.launchToken(), LOCATION, owned.requestedAt(), owned.pid(), owned.startedAt(), owned.user());
+        assertThrows(IOException.class, () -> h.tracker.launch(LOCATION, true, guard -> h.start(), forged, () -> true, () -> true, () -> true));
+        assertThrows(IOException.class, () -> h.tracker.launch(LOCATION + "other", true, guard -> h.start(), owned, () -> true, () -> true, () -> true));
+        assertEquals(0, h.starts); assertEquals(0, h.processes.closeAttempts); assertEquals(0, h.processes.forceAttempts);
+    }
+
+    @Test void manuallyExitedStartupRequiresQuietInventoryButNoTermination() throws Exception
+    {
+        Harness h = new Harness(); Client owned = h.managed(); h.processes.entries.remove(owned.pid());
+        h.tracker.launch(LOCATION, true, guard -> h.start(), owned, () -> true, () -> true, () -> true);
+        assertEquals(1, h.starts); assertEquals(0, h.processes.forceAttempts); assertEquals(0, h.processes.closeAttempts);
     }
 
     @Test void unownedExistingClientIsNeitherClosedNorLaunchedOver()
@@ -295,7 +383,10 @@ class ManagedVrcLaunchTest
     {
         Harness h = new Harness();
         h.createClient = false;
-        refused(h::launch, "startup could not be verified within two minutes");
+        IOException failure = refused(h::launch, "could not verify process ownership within two minutes");
+        ManagedVrcClient.LaunchFailure known = assertInstanceOf(ManagedVrcClient.LaunchFailure.class, failure);
+        assertEquals(ManagedVrcClient.LaunchFailure.Kind.REQUESTED_BUT_UNVERIFIED, known.kind());
+        assertTrue(known.description().contains("does not say whether an instance was joined"));
         assertEquals(1, h.starts);
         assertTrue(h.pausedMillis >= TimeUnit.NANOSECONDS.toMillis(Tracker.QUIET_NANOS + Tracker.STARTUP_NANOS));
         h.processes.entries.put(41L, h.client(41, 100));
@@ -312,7 +403,7 @@ class ManagedVrcLaunchTest
         Harness h = new Harness();
         h.createClient = false;
         h.onPause = millis -> { if (h.starts > 0) h.processes.entries.putIfAbsent(77L, h.client(77, 900)); };
-        refused(h::launch, "startup could not be verified within two minutes");
+        refused(h::launch, "could not verify process ownership within two minutes");
         assertEquals(1, h.starts);
         assertEquals(0, h.processes.closeAttempts);
         assertNull(h.tracker.current());
@@ -322,7 +413,7 @@ class ManagedVrcLaunchTest
     {
         Harness h = new Harness();
         h.createClient = false;
-        refused(h::launch, "startup could not be verified within two minutes");
+        refused(h::launch, "could not verify process ownership within two minutes");
         assertTrue(h.processes.entries.containsKey(100L));
         assertTrue(h.tracker.hasClientsOrPending(), "A still-live known launcher can produce a late client after the deadline");
         refused(h::launch, "previous VRChat startup is still unresolved");
@@ -334,7 +425,7 @@ class ManagedVrcLaunchTest
     {
         Harness h = new Harness();
         h.createClient = false;
-        refused(h::launch, "startup could not be verified within two minutes");
+        refused(h::launch, "could not verify process ownership within two minutes");
         h.processes.entries.clear();
         assertFalse(h.tracker.hasClientsOrPending());
         h.createClient = true;
@@ -348,7 +439,7 @@ class ManagedVrcLaunchTest
     {
         Harness h = new Harness();
         h.createClient = false;
-        refused(h::launch, "startup could not be verified within two minutes");
+        refused(h::launch, "could not verify process ownership within two minutes");
         h.processes.failFind = true;
         assertTrue(h.tracker.hasClientsOrPending());
         assertInstanceOf(SecurityException.class, refused(h::launch, "process state could not be verified").getCause());
@@ -365,7 +456,7 @@ class ManagedVrcLaunchTest
             ProcessInfo partial = new ProcessInfo(100, null, "synthetic-user", "/synthetic/launch.exe", List.of());
             h.processes.entries.put(100L, partial);
             return partial;
-        }), "startup could not be verified within two minutes");
+        }), "could not verify process ownership within two minutes");
         assertNull(h.tracker.current());
         assertTrue(h.tracker.hasClientsOrPending());
         refused(h::launch, "previous VRChat startup is still unresolved");
@@ -382,7 +473,7 @@ class ManagedVrcLaunchTest
             if (h.starts > 0) h.processes.entries.putIfAbsent(200L,
                 new ProcessInfo(200, h.clock.instant(), "synthetic-user", "/synthetic/bootstrap.exe", List.of(), 100));
         };
-        refused(h::launch, "startup could not be verified within two minutes");
+        refused(h::launch, "could not verify process ownership within two minutes");
         h.processes.entries.remove(100L);
         assertTrue(h.tracker.hasClientsOrPending());
         refused(h::launch, "previous VRChat startup is still unresolved");
@@ -474,12 +565,53 @@ class ManagedVrcLaunchTest
         {
             h.starts++;
             throw new IllegalStateException("synthetic start failure");
-        }), "startup could not be verified within two minutes");
+        }), "launch dispatch or process ownership could not be confirmed within two minutes");
+        ManagedVrcClient.LaunchFailure known = assertInstanceOf(ManagedVrcClient.LaunchFailure.class, failure);
+        assertEquals(ManagedVrcClient.LaunchFailure.Kind.DISPATCH_UNCERTAIN, known.kind());
+        assertFalse(known.description().contains("launch was requested"));
         assertInstanceOf(IllegalStateException.class, failure.getCause());
         assertEquals("synthetic start failure", failure.getCause().getMessage());
         h.processes.entries.put(41L, h.client(41, 100));
         h.clock.advance(10_000);
         assertNull(h.tracker.current());
+        assertEquals(1, h.starts);
+        assertEquals(0, h.processes.closeAttempts);
+    }
+
+    @Test void singletonHandoffRemainsUnownedButReportsRequestedLaunchTruthfully()
+    {
+        Harness h = new Harness();
+        ManagedVrcClient.LaunchFailure failure = assertThrows(ManagedVrcClient.LaunchFailure.class,
+            () -> h.tracker.launch(LOCATION, false, () ->
+            {
+                h.starts++;
+                h.processes.entries.put(41L, h.client(41, 900));
+                return null;
+            }));
+        assertEquals(ManagedVrcClient.LaunchFailure.Kind.REQUESTED_BUT_UNVERIFIED, failure.kind());
+        assertNull(h.tracker.current());
+        assertTrue(h.tracker.hasClientsOrPending());
+        assertEquals(1, h.starts);
+        assertEquals(0, h.processes.closeAttempts);
+        assertEquals(0, h.processes.closeSignals);
+    }
+
+    @Test void vanishedParentCannotAuthorizeAChildFirstSeenAfterItExited()
+    {
+        Harness h = new Harness();
+        h.createClient = false;
+        h.onPause = millis ->
+        {
+            if (h.starts > 0)
+            {
+                h.processes.entries.remove(100L);
+                h.processes.entries.putIfAbsent(41L, h.client(41, 100));
+            }
+        };
+        ManagedVrcClient.LaunchFailure failure = assertThrows(ManagedVrcClient.LaunchFailure.class, h::launch);
+        assertEquals(ManagedVrcClient.LaunchFailure.Kind.REQUESTED_BUT_UNVERIFIED, failure.kind());
+        assertNull(h.tracker.current());
+        assertTrue(h.tracker.hasClientsOrPending());
         assertEquals(1, h.starts);
         assertEquals(0, h.processes.closeAttempts);
     }

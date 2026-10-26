@@ -74,7 +74,77 @@ public final class ManagedVrcClient
 
     public enum CloseResult
     {
-        REQUESTED, NOT_MANAGED, IDENTITY_CHANGED, CANCELLED, UNSUPPORTED_OR_DENIED
+        REQUESTED, NOT_MANAGED, IDENTITY_CHANGED, CANCELLED, UNSUPPORTED_OR_DENIED,
+        WINDOW_ENUMERATION_FAILED, WINDOW_NOT_FOUND, WINDOW_AMBIGUOUS, WINDOW_IDENTITY_CHANGED,
+        WINDOW_CHECK_UNAVAILABLE, FINAL_GUARD_VETO, WINDOWS_ACCESS_DENIED, WINDOWS_POST_REJECTED,
+        DISPATCH_UNCERTAIN, PLATFORM_UNSUPPORTED;
+
+        /** Only these outcomes prove that no native close dispatch was attempted. */
+        public boolean retryableBeforeDispatch()
+        {
+            return this == WINDOW_ENUMERATION_FAILED || this == WINDOW_NOT_FOUND
+                || this == WINDOW_AMBIGUOUS || this == FINAL_GUARD_VETO;
+        }
+    }
+
+    public enum ForceResult { REQUESTED, NOT_MANAGED, IDENTITY_CHANGED, GUARD_VETO, DENIED, UNCERTAIN, UNSUPPORTED }
+
+    /** Closed, privacy-safe launch diagnostics; these are not world-join outcomes. */
+    public static final class LaunchFailure extends IOException
+    {
+        private static final long serialVersionUID = 1L;
+
+        public enum Kind
+        {
+            REQUESTED_BUT_UNVERIFIED("VRChat launch was requested, but Scarlet could not verify process ownership within two minutes. "
+                + "This does not say whether an instance was joined. Any opened client was left running; startup recovery will not close or restart it. The enabled closed/empty-instance exit setting is independent."),
+            DISPATCH_UNCERTAIN("VRChat launch dispatch or process ownership could not be confirmed within two minutes. "
+                + "Check VRChat directly; any opened client was left running; startup recovery will not close or restart it. The enabled closed/empty-instance exit setting is independent.");
+
+            private final String description;
+            Kind(String description) { this.description = description; }
+        }
+
+        private final Kind kind;
+        private final String description;
+
+        public LaunchFailure(Kind kind)
+        {
+            this(kind, null);
+        }
+
+        private LaunchFailure(Kind kind, DiscoveryIssue issue)
+        {
+            super(Objects.requireNonNull(kind, "kind").description
+                + (issue == null ? "" : " Tracking check: " + issue.description));
+            this.kind = kind;
+            this.description = getMessage();
+        }
+
+        public Kind kind() { return this.kind; }
+        public String description() { return this.description; }
+    }
+
+    /** Fixed descriptions only: never include commands, join links, account names or process IDs. */
+    private enum DiscoveryIssue
+    {
+        WAITING("No verifiable client completed startup before the deadline."),
+        LAUNCHER_IDENTITY("The returned launcher identity was unavailable; no other process was substituted."),
+        PARENTAGE("The client could not be linked to the original launcher. A missing or unobserved handoff remains untrusted."),
+        AMBIGUOUS("More than one client was observed; ownership was refused."),
+        IDENTITY("A client had an unexpected, pre-existing or incomplete identity; ownership was refused."),
+        INVENTORY("Windows/Linux process metadata could not be read consistently; ownership was refused."),
+        CLOCK("The discovery time window was invalid or expired."),
+        BOUND("The launcher handoff exceeded the bounded tracking capacity.");
+        final String description;
+        DiscoveryIssue(String description) { this.description = description; }
+    }
+
+    /** A read-only OS reference, never a right to terminate a process. */
+    interface ProcessLease extends AutoCloseable
+    {
+        boolean provesParent(ProcessInfo parent, ProcessInfo child, Instant now);
+        @Override void close();
     }
 
     static final class ProcessInfo
@@ -84,6 +154,7 @@ public final class ManagedVrcClient
         private final String user, executable;
         private final List<String> arguments;
         private final long parentPid;
+        private final ProcessLease launchLease;
 
         ProcessInfo(long pid, Instant startedAt, String user, String executable, List<String> arguments)
         {
@@ -92,12 +163,19 @@ public final class ManagedVrcClient
 
         ProcessInfo(long pid, Instant startedAt, String user, String executable, List<String> arguments, long parentPid)
         {
+            this(pid, startedAt, user, executable, arguments, parentPid, null);
+        }
+
+        ProcessInfo(long pid, Instant startedAt, String user, String executable, List<String> arguments,
+                    long parentPid, ProcessLease launchLease)
+        {
             this.pid = pid;
             this.startedAt = startedAt;
             this.user = user;
             this.executable = executable;
             this.arguments = arguments == null ? List.of() : List.copyOf(arguments);
             this.parentPid = parentPid;
+            this.launchLease = launchLease;
         }
 
         long pid() { return this.pid; }
@@ -112,8 +190,16 @@ public final class ManagedVrcClient
     {
         String currentUser();
         List<ProcessInfo> snapshot();
+        default List<ProcessInfo> clientSnapshot() { return this.snapshot(); }
         ProcessInfo find(long pid);
         boolean requestClose(ProcessInfo expected, BooleanSupplier revalidate);
+        default CloseResult requestCloseDetailed(ProcessInfo expected, BooleanSupplier revalidate)
+        {
+            // Legacy transports cannot prove why false was returned; never retry it.
+            return this.requestClose(expected, revalidate) ? CloseResult.REQUESTED : CloseResult.UNSUPPORTED_OR_DENIED;
+        }
+        default ProcessLease retain(ProcessInfo expected) { return null; }
+        default ForceResult forceClose(ProcessInfo expected, BooleanSupplier revalidate) { return ForceResult.UNSUPPORTED; }
     }
 
     @FunctionalInterface interface LaunchAction { ProcessInfo start() throws Exception; }
@@ -133,6 +219,7 @@ public final class ManagedVrcClient
         private final Clock clock;
         private final LongSupplier nanos;
         private final Pause pause;
+        private final SingleVrcClient shutdownClients;
         private final AtomicBoolean launching = new AtomicBoolean();
         private final AtomicBoolean stopped = new AtomicBoolean();
         private final AtomicLong cancellation = new AtomicLong();
@@ -142,6 +229,8 @@ public final class ManagedVrcClient
         private Attempt attempt;
         private Client managed;
         private long nextToken;
+        private DiscoveryIssue discoveryIssue = DiscoveryIssue.WAITING;
+        private static final int MAX_PROVENANCE = 128;
 
         public Tracker()
         {
@@ -159,6 +248,27 @@ public final class ManagedVrcClient
             this.clock = clock;
             this.nanos = nanos;
             this.pause = pause;
+            this.shutdownClients = new SingleVrcClient(processes, clock);
+        }
+
+        /** Explicit exit-toggle authority, separate from launch/recovery ownership. */
+        public synchronized SingleVrcClient.Selection shutdownClient(String location, Instant joinedAt)
+        {
+            if (this.launching.get() || this.stopped.get())
+                return new SingleVrcClient.Selection(null, SingleVrcClient.Status.LAUNCH_BUSY);
+            return this.shutdownClients.select(location, joinedAt);
+        }
+
+        public synchronized CloseResult closeShutdownClient(Client expected, BooleanSupplier allowed)
+        {
+            return this.shutdownClients.close(expected, () -> !this.launching.get() && !this.stopped.get()
+                && allowed != null && allowed.getAsBoolean());
+        }
+
+        public synchronized ForceResult forceShutdownClient(Client expected, BooleanSupplier allowed)
+        {
+            return this.shutdownClients.force(expected, () -> !this.launching.get() && !this.stopped.get()
+                && allowed != null && allowed.getAsBoolean());
         }
 
         /** Process metadata only. Uncertainty must never be interpreted as an empty machine. */
@@ -193,13 +303,25 @@ public final class ManagedVrcClient
             catch (RuntimeException | LinkageError unknown) { return List.of(); }
         }
 
-        public void cancelPendingLaunches() { this.cancellation.incrementAndGet(); }
+        public void cancelPendingLaunches()
+        {
+            this.cancellation.incrementAndGet();
+            synchronized (this)
+            {
+                if (this.managed == null)
+                {
+                    if (!this.launching.get()) this.clearAttempt();
+                    else if (this.attempt != null) this.attempt.releaseLeases();
+                }
+            }
+        }
 
         /** Scarlet shutdown only cancels launcher work; it never closes a game by itself. */
         public void stopLaunching()
         {
             this.stopped.set(true);
             this.cancellation.incrementAndGet();
+            synchronized (this) { this.clearAttempt(); }
             Thread active = this.launchThread;
             if (active != null) active.interrupt();
         }
@@ -256,16 +378,28 @@ public final class ManagedVrcClient
 
         void launch(String location, boolean allowManagedRestart, GuardedLaunchAction starter) throws Exception
         {
+            this.launch(location, allowManagedRestart, starter, null, () -> true, () -> true, null);
+        }
+
+        void launch(String location, boolean allowManagedRestart, GuardedLaunchAction starter, Client recoveryExpected,
+            BooleanSupplier allowed, BooleanSupplier closeAllowed, BooleanSupplier forceAllowed) throws Exception
+        {
             if (location == null || location.isBlank())
                 throw new IOException("A concrete destination is required; no VRChat client was stopped or launched.");
-            if (!this.launching.compareAndSet(false, true))
-                throw new IOException("A VRChat launch or restart is already in progress. Wait for it to finish.");
+            synchronized (this)
+            {
+                if (!this.launching.compareAndSet(false, true))
+                    throw new IOException("A VRChat launch or restart is already in progress. Wait for it to finish.");
+            }
             this.launchThread = Thread.currentThread();
             long generation = this.cancellation.get();
             long token = 0L;
             boolean success = false;
             try
             {
+                if (!allowed.getAsBoolean()) throw new InterruptedException("Automatic launch context changed");
+                if (recoveryExpected != null && !Objects.equals(location, recoveryExpected.requestedLocation()))
+                    throw new IOException("Recovery destination changed; no client was stopped");
                 if (this.beforeUnresolvedDeadline())
                     throw new IOException("A previous VRChat startup is still unresolved. Wait before requesting another launch.");
                 this.checkCancelled(generation);
@@ -274,6 +408,13 @@ public final class ManagedVrcClient
                 List<ProcessInfo> clients = this.checkedSnapshot().stream().filter(ManagedVrcClient::isClient).collect(Collectors.toList());
                 Client existing;
                 synchronized (this) { existing = this.currentInternal(); }
+                if (recoveryExpected != null)
+                {
+                    if (existing != null && existing != recoveryExpected)
+                        throw new IOException("Recovery process ownership changed; no client was stopped");
+                    if (clients.isEmpty() && this.processes.find(recoveryExpected.pid()) != null)
+                        throw new IOException("Recovery process exit cannot be verified");
+                }
                 if (!clients.isEmpty())
                 {
                     if (!allowManagedRestart)
@@ -283,15 +424,25 @@ public final class ManagedVrcClient
                     CloseResult result;
                     synchronized (this)
                     {
-                        result = this.closeInternal(existing, () -> this.validGeneration(generation));
+                        result = this.closeInternal(existing, () -> this.validGeneration(generation)
+                            && allowed.getAsBoolean() && closeAllowed.getAsBoolean());
                     }
                     if (result != CloseResult.REQUESTED)
-                        throw new IOException("The verified VRChat client could not be asked to exit normally (" + result + "). No replacement was launched.");
-                    this.awaitQuiet(existing, generation);
+                    {
+                        if (recoveryExpected != null) org.slf4j.LoggerFactory.getLogger("Scarlet/VrcLaunch")
+                            .info("Startup recovery close-stage: {}", result);
+                        boolean definiteRejection = result == CloseResult.WINDOW_NOT_FOUND || result == CloseResult.WINDOW_AMBIGUOUS
+                            || result == CloseResult.WINDOWS_ACCESS_DENIED || result == CloseResult.WINDOWS_POST_REJECTED;
+                        if (recoveryExpected == null || forceAllowed == null || !definiteRejection || !forceAllowed.getAsBoolean())
+                            throw new IOException("The verified VRChat client could not be asked to exit normally (" + result + "). No replacement was launched.");
+                    }
+                    this.awaitQuiet(existing, generation, recoveryExpected == null || forceAllowed == null ? null
+                        : () -> allowed.getAsBoolean() && closeAllowed.getAsBoolean() && forceAllowed.getAsBoolean());
                 }
-                else this.awaitQuiet(null, generation);
+                else this.awaitQuiet(recoveryExpected, generation);
 
                 this.checkCancelled(generation);
+                if (!allowed.getAsBoolean()) throw new InterruptedException("Automatic launch context changed");
                 token = this.beginLaunch(location);
                 if (token == 0L)
                     throw new IOException("VRChat process ownership could not be established. No launch was requested; check existing clients and process access.");
@@ -318,7 +469,10 @@ public final class ManagedVrcClient
                     }
                     this.pause.pause(100L);
                 }
-                throw new IOException("VRChat startup could not be verified within two minutes. Any client that opened remains unowned; no further launch or forced shutdown was attempted.", startFailure);
+                LaunchFailure failure = new LaunchFailure(startFailure == null
+                    ? LaunchFailure.Kind.REQUESTED_BUT_UNVERIFIED : LaunchFailure.Kind.DISPATCH_UNCERTAIN, this.discoveryIssue);
+                if (startFailure != null) failure.initCause(startFailure);
+                throw failure;
             }
             catch (InterruptedException interrupted)
             {
@@ -349,9 +503,15 @@ public final class ManagedVrcClient
 
         private void awaitQuiet(Client closing, long generation) throws Exception
         {
+            this.awaitQuiet(closing, generation, null);
+        }
+
+        private void awaitQuiet(Client closing, long generation, BooleanSupplier forceAllowed) throws Exception
+        {
             long started = this.nanos.getAsLong(), quietSince = 0L;
-            boolean quiet = false;
-            while (this.nanos.getAsLong() - started < CLOSE_NANOS + QUIET_NANOS)
+            boolean quiet = false, forceRequested = false;
+            long limit = CLOSE_NANOS + QUIET_NANOS + (forceAllowed == null ? 0 : CLOSE_NANOS);
+            while (this.nanos.getAsLong() - started < limit)
             {
                 this.checkCancelled(generation);
                 List<ProcessInfo> clients = this.checkedSnapshot().stream().filter(ManagedVrcClient::isClient).collect(Collectors.toList());
@@ -372,8 +532,16 @@ public final class ManagedVrcClient
                     if (closing == null || clients.size() != 1 || !matches(closing, clients.get(0)))
                         throw new IOException("Another or changed VRChat process appeared. Restart was cancelled without stopping it.");
                     quiet = false;
-                    if (this.nanos.getAsLong() - started >= CLOSE_NANOS)
-                        throw new IOException("VRChat did not finish its normal exit. Scarlet did not force-close it or launch a replacement.");
+                    if (this.nanos.getAsLong() - started >= (forceRequested ? CLOSE_NANOS * 2 : CLOSE_NANOS))
+                    {
+                        if (forceRequested || forceAllowed == null || !forceAllowed.getAsBoolean())
+                            throw new IOException("VRChat did not finish its normal exit. No replacement was launched.");
+                        ForceResult result;
+                        synchronized (this) { result = this.forceInternal(closing, () -> this.validGeneration(generation) && forceAllowed.getAsBoolean()); }
+                        org.slf4j.LoggerFactory.getLogger("Scarlet/VrcLaunch").warn("Startup recovery force-close result: {}", result);
+                        if (result != ForceResult.REQUESTED) throw new IOException("Startup force-close was refused or uncertain; no replacement was launched");
+                        forceRequested = true;
+                    }
                 }
                 this.pause.pause(100L);
             }
@@ -400,6 +568,8 @@ public final class ManagedVrcClient
                         return 0;
                 }
                 long token = ++this.nextToken;
+                this.clearAttempt();
+                this.discoveryIssue = DiscoveryIssue.WAITING;
                 this.attempt = new Attempt(token, location, requested, user, existing);
                 this.managed = null;
                 return token;
@@ -417,6 +587,13 @@ public final class ManagedVrcClient
 
         synchronized void launchCompleted(long token, ProcessInfo launcher)
         {
+            if (this.attempt != null && this.attempt.token == token && this.attempt.ready)
+            {
+                if (launcher != null && this.attempt.leases.get(launcher.pid()) != launcher.launchLease)
+                    releaseLease(launcher.launchLease);
+                return;
+            }
+            boolean retained = false;
             if (this.attempt != null && this.attempt.token == token)
             {
                 this.attempt.ready = true;
@@ -425,16 +602,25 @@ public final class ManagedVrcClient
                 if (launcher != null && completeIdentity(launcher) && this.attempt.user.equals(launcher.user())
                     && !this.attempt.existing.contains(launcher.pid()) && !launcher.startedAt().isBefore(this.attempt.requested)
                     && !launcher.startedAt().isAfter(this.clock.instant()))
+                {
                     this.attempt.provenance.put(launcher.pid(), launcher);
+                    ProcessLease lease = launcher.launchLease != null ? launcher.launchLease : this.processes.retain(launcher);
+                    if (lease != null)
+                    {
+                        this.attempt.leases.put(launcher.pid(), lease);
+                        retained = lease == launcher.launchLease;
+                    }
+                }
+                else this.discoveryIssue = DiscoveryIssue.LAUNCHER_IDENTITY;
             }
+            if (!retained && launcher != null) releaseLease(launcher.launchLease);
         }
 
         public synchronized void launchFailed(long token)
         {
             if (this.attempt != null && this.attempt.token == token)
             {
-                this.attempt = null;
-                this.managed = null;
+                this.clearAttempt();
             }
         }
 
@@ -451,8 +637,7 @@ public final class ManagedVrcClient
                 {
                     if (!matchesManaged(this.managed, this.processes.find(this.managed.pid())) || !uniqueManaged(this.managed))
                     {
-                        this.managed = null;
-                        this.attempt = null;
+                        this.clearAttempt();
                     }
                     return this.managed;
                 }
@@ -462,7 +647,8 @@ public final class ManagedVrcClient
                 Instant now = this.clock.instant();
                 if (now.isBefore(pending.requested) || now.isAfter(pending.requested.plus(DISCOVERY_LIMIT)))
                 {
-                    this.attempt = null;
+                    this.discoveryIssue = DiscoveryIssue.CLOCK;
+                    this.clearAttempt();
                     return null;
                 }
                 List<ProcessInfo> snapshot = this.checkedSnapshot();
@@ -473,7 +659,8 @@ public final class ManagedVrcClient
                         candidates.add(process);
                 if (candidates.size() > 1)
                 {
-                    this.attempt = null; // Permanent ambiguity for this launch, not just a retry.
+                    this.discoveryIssue = DiscoveryIssue.AMBIGUOUS;
+                    this.clearAttempt(); // Permanent ambiguity for this launch, not just a retry.
                     return null;
                 }
                 if (candidates.isEmpty())
@@ -487,7 +674,13 @@ public final class ManagedVrcClient
                     || candidate.startedAt().isBefore(pending.requested) || candidate.startedAt().isAfter(now)
                     || !pending.user.equals(candidate.user()) || !sameProcess(pending.provenance.get(candidate.pid()), candidate))
                 {
-                    this.attempt = null;
+                    if (pending.existing.contains(candidate.pid()) || !completeIdentity(candidate)
+                        || candidate.startedAt().isBefore(pending.requested) || candidate.startedAt().isAfter(now)
+                        || !pending.user.equals(candidate.user()))
+                        this.discoveryIssue = DiscoveryIssue.IDENTITY;
+                    else if (this.discoveryIssue != DiscoveryIssue.LAUNCHER_IDENTITY)
+                        this.discoveryIssue = DiscoveryIssue.PARENTAGE;
+                    this.clearAttempt();
                     return null;
                 }
                 if (!sameProcess(pending.candidate, candidate))
@@ -500,13 +693,15 @@ public final class ManagedVrcClient
                     return null;
                 this.managed = new Client(pending.token, pending.location, pending.requested,
                     candidate.pid(), candidate.startedAt(), candidate.user());
+                // Provenance is now fixed. No OS handles need to survive discovery.
+                pending.releaseLeases();
                 if (!this.launching.get()) this.unresolvedProcesses.clear();
                 return this.managed;
             }
             catch (RuntimeException | LinkageError ex)
             {
-                this.attempt = null;
-                this.managed = null;
+                if (this.discoveryIssue != DiscoveryIssue.BOUND) this.discoveryIssue = DiscoveryIssue.INVENTORY;
+                this.clearAttempt();
                 return null;
             }
         }
@@ -515,8 +710,9 @@ public final class ManagedVrcClient
         {
             Map<Long, ProcessInfo> live = new HashMap<>();
             for (ProcessInfo process : snapshot) live.put(process.pid(), process);
-            // A new descendant needs its known parent still alive with the same identity.
-            // A dead/reused parent PID cannot extend ownership to a later unrelated process.
+            // Windows can finish a launcher before the next poll. An OS reference
+            // retained while that exact parent was alive proves its lifetime after exit.
+            // Without it, keep the original live-parent rule (including Linux).
             for (int pass = 0; pass < 64; pass++)
             {
                 boolean changed = false;
@@ -525,11 +721,22 @@ public final class ManagedVrcClient
                     if (pending.provenance.containsKey(child.pid()) || pending.existing.contains(child.pid())
                         || !completeIdentity(child) || !pending.user.equals(child.user())) continue;
                     ProcessInfo parent = pending.provenance.get(child.parentPid());
-                    if (parent != null && sameProcess(parent, live.get(parent.pid()))
+                    ProcessInfo observedParent = parent == null ? null : live.get(parent.pid());
+                    ProcessLease lease = parent == null ? null : pending.leases.get(parent.pid());
+                    boolean retainedParent = lease != null && (observedParent == null || sameProcess(parent, observedParent))
+                        && lease.provesParent(parent, child, this.clock.instant());
+                    if (parent != null && (retainedParent || sameProcess(parent, observedParent))
                         && !child.startedAt().isBefore(parent.startedAt()) && !child.startedAt().isAfter(this.clock.instant()))
                     {
+                        if (pending.provenance.size() >= MAX_PROVENANCE)
+                        {
+                            this.discoveryIssue = DiscoveryIssue.BOUND;
+                            throw new IllegalStateException("Bounded launcher provenance exhausted");
+                        }
                         pending.provenance.put(child.pid(), child);
                         this.unresolvedProcesses.put(child.pid(), child);
+                        ProcessLease childLease = this.processes.retain(child);
+                        if (childLease != null) pending.leases.put(child.pid(), childLease);
                         changed = true;
                     }
                 }
@@ -547,6 +754,29 @@ public final class ManagedVrcClient
             return this.closeInternal(expected, revalidate);
         }
 
+        /** Separate opt-in path; ordinary close() and launch() never invoke forced termination. */
+        public synchronized ForceResult forceClose(Client expected, BooleanSupplier revalidate)
+        {
+            if (this.launching.get() || this.stopped.get()) return ForceResult.GUARD_VETO;
+            return this.forceInternal(expected, revalidate);
+        }
+
+        private ForceResult forceInternal(Client expected, BooleanSupplier revalidate)
+        {
+            if (expected == null || expected != this.managed) return ForceResult.NOT_MANAGED;
+            try
+            {
+                ProcessInfo info = this.processes.find(expected.pid());
+                if (!matchesManaged(expected, info) || !expected.user().equals(this.processes.currentUser()) || !uniqueManaged(expected))
+                    return ForceResult.IDENTITY_CHANGED;
+                if (this.stopped.get() || revalidate == null || !revalidate.getAsBoolean()) return ForceResult.GUARD_VETO;
+                return this.processes.forceClose(info, () -> !this.stopped.get() && expected == this.managed
+                    && matchesManaged(expected, this.processes.find(expected.pid()))
+                    && expected.user().equals(this.processes.currentUser()) && uniqueManaged(expected) && revalidate.getAsBoolean());
+            }
+            catch (RuntimeException | LinkageError ex) { return ForceResult.UNCERTAIN; }
+        }
+
         private CloseResult closeInternal(Client expected, BooleanSupplier revalidate)
         {
             if (this.stopped.get()) return CloseResult.CANCELLED;
@@ -558,17 +788,23 @@ public final class ManagedVrcClient
                 if (!matchesManaged(expected, process) || !expected.user().equals(this.processes.currentUser())
                     || !uniqueManaged(expected))
                 {
-                    this.managed = null;
-                    this.attempt = null;
+                    this.clearAttempt();
                     return CloseResult.IDENTITY_CHANGED;
                 }
-                if (revalidate == null || !revalidate.getAsBoolean())
-                    return CloseResult.CANCELLED;
-                boolean requested = this.processes.requestClose(process, () ->
-                    !this.stopped.get() && expected.equals(this.managed) && matchesManaged(expected, this.processes.find(expected.pid()))
-                    && expected.user().equals(this.processes.currentUser()) && uniqueManaged(expected)
-                    && revalidate.getAsBoolean());
-                return requested ? CloseResult.REQUESTED : CloseResult.UNSUPPORTED_OR_DENIED;
+                if (revalidate == null) return CloseResult.CANCELLED;
+                if (!revalidate.getAsBoolean()) return CloseResult.FINAL_GUARD_VETO;
+                java.util.concurrent.atomic.AtomicReference<CloseResult> veto = new java.util.concurrent.atomic.AtomicReference<>();
+                CloseResult result = this.processes.requestCloseDetailed(process, () -> {
+                    if (this.stopped.get()) { veto.set(CloseResult.CANCELLED); return false; }
+                    if (!expected.equals(this.managed) || !matchesManaged(expected, this.processes.find(expected.pid()))
+                        || !expected.user().equals(this.processes.currentUser()) || !uniqueManaged(expected))
+                    { veto.set(CloseResult.IDENTITY_CHANGED); return false; }
+                    if (!revalidate.getAsBoolean()) { veto.set(CloseResult.FINAL_GUARD_VETO); return false; }
+                    return true;
+                });
+                // Only refine the explicit pre-dispatch veto. Legacy/unknown failures
+                // remain terminal, even if a transport happened to invoke the guard.
+                return result == CloseResult.FINAL_GUARD_VETO && veto.get() != null ? veto.get() : result;
             }
             catch (RuntimeException | LinkageError ex)
             {
@@ -591,8 +827,7 @@ public final class ManagedVrcClient
                     {
                         if (!matchesManaged(client, process) || ++count > 1)
                         {
-                            this.managed = null;
-                            this.attempt = null;
+                            this.clearAttempt();
                             return false;
                         }
                     }
@@ -604,9 +839,15 @@ public final class ManagedVrcClient
                 // Losing process enumeration also loses evidence that the current log
                 // belongs to our only client. Do not reacquire this launch afterward.
             }
-            this.managed = null;
-            this.attempt = null;
+            this.clearAttempt();
             return false;
+        }
+
+        private void clearAttempt()
+        {
+            if (this.attempt != null) this.attempt.releaseLeases();
+            this.attempt = null;
+            this.managed = null;
         }
     }
 
@@ -617,6 +858,7 @@ public final class ManagedVrcClient
         final Instant requested;
         final Set<Long> existing;
         final Map<Long, ProcessInfo> provenance = new HashMap<>();
+        final Map<Long, ProcessLease> leases = new HashMap<>();
         boolean ready;
         ProcessInfo candidate;
         Instant candidateSince;
@@ -629,6 +871,19 @@ public final class ManagedVrcClient
             this.user = user;
             this.existing = Set.copyOf(existing);
         }
+
+        void releaseLeases()
+        {
+            for (ProcessLease lease : this.leases.values()) releaseLease(lease);
+            this.leases.clear();
+        }
+    }
+
+    private static void releaseLease(ProcessLease lease)
+    {
+        if (lease != null)
+            try { lease.close(); }
+            catch (RuntimeException | LinkageError unavailable) { /* Continue releasing the remaining handles. */ }
     }
 
     static boolean matches(Client client, ProcessInfo process)
@@ -677,6 +932,11 @@ public final class ManagedVrcClient
         if (process == null) return null;
         try
         {
+            if (Platform.CURRENT.isNT())
+            {
+                ProcessInfo retained = WindowsProcessEvidence.captureStarted(process);
+                return retained == null ? new ProcessInfo(process.pid(), null, null, null, List.of()) : retained;
+            }
             ProcessInfo info = NativeProcesses.info(process.toHandle());
             return info == null ? new ProcessInfo(process.pid(), null, null, null, List.of()) : info;
         }
@@ -685,6 +945,15 @@ public final class ManagedVrcClient
 
     private static final class NativeProcesses implements Processes
     {
+        public ForceResult forceClose(ProcessInfo expected, BooleanSupplier revalidate)
+        {
+            return Platform.CURRENT.isNT() ? WindowsClientTermination.request(expected, revalidate) : ForceResult.UNSUPPORTED;
+        }
+        public ProcessLease retain(ProcessInfo expected)
+        {
+            return Platform.CURRENT.isNT() ? WindowsProcessEvidence.retain(expected) : null;
+        }
+
         public String currentUser()
         {
             return ProcessHandle.current().info().user().orElse(null);
@@ -718,8 +987,19 @@ public final class ManagedVrcClient
             }
         }
 
+        public List<ProcessInfo> clientSnapshot()
+        {
+            return Platform.CURRENT.isNT() ? windowsSnapshot(true) : this.snapshot();
+        }
+
         private static List<ProcessInfo> windowsSnapshot()
         {
+            return windowsSnapshot(false);
+        }
+
+        private static List<ProcessInfo> windowsSnapshot(boolean clientsOnly)
+        {
+            Instant snapshotStarted = Instant.now();
             HANDLE snapshot = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Tlhelp32.TH32CS_SNAPPROCESS, new DWORD(0));
             if (snapshot == null || WinBase.INVALID_HANDLE_VALUE.equals(snapshot))
                 throw new IllegalStateException("Windows process inventory is unavailable");
@@ -736,7 +1016,13 @@ public final class ManagedVrcClient
                         throw new IllegalStateException("Windows process inventory exceeded its bound");
                     long pid = entry.th32ProcessID.longValue(), parent = entry.th32ParentProcessID.longValue();
                     String name = Native.toString(entry.szExeFile);
-                    ProcessInfo info = pid <= 0L ? null : ProcessHandle.of(pid).map(NativeProcesses::info).orElse(null);
+                    // Shutdown needs a complete name inventory, but not the identity of
+                    // unrelated processes. Their normal churn cannot invalidate a client.
+                    boolean readIdentity = !clientsOnly || "vrchat.exe".equalsIgnoreCase(name);
+                    ProcessInfo info = pid <= 0L || !readIdentity ? null : WindowsProcessEvidence.read(pid, parent);
+                    // The Toolhelp parent PID belongs to its captured process. Do not
+                    // attach that parent to a replacement born after capture began.
+                    validateSnapshotCreation(info, snapshotStarted);
                     // Toolhelp supplies complete executable names even when protected
                     // OS-process metadata is unavailable. Never use that name alone to
                     // establish ownership or select a close target.
@@ -756,6 +1042,7 @@ public final class ManagedVrcClient
 
         public ProcessInfo find(long pid)
         {
+            if (Platform.CURRENT.isNT()) return WindowsProcessEvidence.read(pid, -1L);
             return ProcessHandle.of(pid).map(NativeProcesses::info).orElse(null);
         }
 
@@ -771,35 +1058,42 @@ public final class ManagedVrcClient
 
         public boolean requestClose(ProcessInfo expected, BooleanSupplier revalidate)
         {
+            return this.requestCloseDetailed(expected, revalidate) == CloseResult.REQUESTED;
+        }
+
+        public CloseResult requestCloseDetailed(ProcessInfo expected, BooleanSupplier revalidate)
+        {
             if (Platform.CURRENT.isNT())
             {
-                List<HWND> windows = new ArrayList<>();
-                boolean enumerated = User32.INSTANCE.EnumWindows((window, data) ->
-                {
-                    IntByReference pid = new IntByReference();
-                    User32.INSTANCE.GetWindowThreadProcessId(window, pid);
-                    if (Integer.toUnsignedLong(pid.getValue()) == expected.pid()
-                        && User32.INSTANCE.IsWindowVisible(window))
-                        windows.add(window);
-                    return true;
-                }, null);
-                if (!enumerated || windows.size() != 1)
-                    return false;
-                HWND window = windows.get(0);
-                IntByReference pid = new IntByReference();
-                User32.INSTANCE.GetWindowThreadProcessId(window, pid);
-                if (Integer.toUnsignedLong(pid.getValue()) != expected.pid()
-                    || !sameProcess(expected, find(expected.pid())) || !revalidate.getAsBoolean())
-                    return false;
-                // JNA's User32.PostMessage has a void signature. Keep the native BOOL
-                // here so denied/elevated targets cannot be reported as a success.
-                return WindowsMessages.INSTANCE.PostMessageW(window, WinUser.WM_CLOSE, new WPARAM(0), new LPARAM(0));
+                return WindowsClientClose.request(expected.pid(), new WindowsClientClose.Windows<HWND>() {
+                    public List<HWND> visible(long expectedPid) {
+                        List<HWND> windows = new ArrayList<>();
+                        boolean enumerated = User32.INSTANCE.EnumWindows((window, data) -> {
+                            if (this.belongsTo(window, expectedPid) && User32.INSTANCE.IsWindowVisible(window)) windows.add(window);
+                            return true;
+                        }, null);
+                        return enumerated ? windows : null;
+                    }
+                    public boolean belongsTo(HWND window, long pid) {
+                        IntByReference found = new IntByReference();
+                        return User32.INSTANCE.GetWindowThreadProcessId(window, found) != 0
+                            && Integer.toUnsignedLong(found.getValue()) == pid;
+                    }
+                    public boolean postClose(HWND window) {
+                        Native.setLastError(0);
+                        return WindowsMessages.INSTANCE.PostMessageW(window, WinUser.WM_CLOSE, new WPARAM(0), new LPARAM(0));
+                    }
+                    public int lastError() { return Native.getLastError(); }
+                }, () -> sameProcess(expected, find(expected.pid())), revalidate,
+                    code -> org.slf4j.LoggerFactory.getLogger("Scarlet/VrcLaunch").warn("VRChat close diagnostic: windows-post-rejected; win32-error={}", code));
             }
             if (!"linux".equalsIgnoreCase(System.getProperty("os.name")))
-                return false;
+                return CloseResult.PLATFORM_UNSUPPORTED;
             ProcessHandle handle = ProcessHandle.of(expected.pid()).orElse(null);
-            return handle != null && sameProcess(expected, info(handle)) && revalidate.getAsBoolean()
-                && handle.destroy(); // SIGTERM, never destroyForcibly / SIGKILL.
+            if (handle == null || !sameProcess(expected, info(handle))) return CloseResult.IDENTITY_CHANGED;
+            if (!revalidate.getAsBoolean()) return CloseResult.FINAL_GUARD_VETO;
+            try { return handle.destroy() ? CloseResult.REQUESTED : CloseResult.UNSUPPORTED_OR_DENIED; }
+            catch (RuntimeException | LinkageError ex) { return CloseResult.DISPATCH_UNCERTAIN; }
         }
     }
 
@@ -807,5 +1101,11 @@ public final class ManagedVrcClient
     {
         WindowsMessages INSTANCE = Native.load("user32", WindowsMessages.class);
         boolean PostMessageW(HWND window, int message, WPARAM wParam, LPARAM lParam);
+    }
+
+    static void validateSnapshotCreation(ProcessInfo info, Instant snapshotStarted)
+    {
+        if (info != null && (info.startedAt() == null || snapshotStarted == null || info.startedAt().isAfter(snapshotStarted)))
+            throw new IllegalStateException("Process identity changed during Windows inventory");
     }
 }

@@ -83,6 +83,9 @@ public interface VrcLaunch
      * authorize the join and drops the client into the error/loading world even
      * though the instance exists. Public instances resolve from the location
      * alone, so a null shortName is fine for those.
+     *
+     * <p>The retained {@code userId} parameter is not a client profile selector.
+     * VRChat uses its existing login; Scarlet does not switch client accounts.
      */
     static void launch(String userId, String location, String shortName, LaunchMode mode) throws Exception
     {
@@ -93,6 +96,59 @@ public interface VrcLaunch
     static void launchIfNotRunning(String userId, String location, String shortName, LaunchMode mode) throws Exception
     {
         launch(userId, location, shortName, mode, false);
+    }
+
+    /** Startup's opt-in/account guard is checked again immediately before native launch dispatch. */
+    static void launchIfNotRunning(String userId, String location, String shortName, LaunchMode mode,
+        java.util.function.BooleanSupplier allowed) throws Exception
+    {
+        MANAGED_CLIENTS.launch(location, false, guard -> {
+            ManagedVrcClient.LaunchGuard checked = startupGuard(guard, allowed);
+            checked.check();
+            return ManagedVrcClient.startedProcess(Platform.CURRENT.isNT()
+                ? launch_win(userId, location, shortName, mode, checked)
+                : launch_linux(userId, location, shortName, mode, checked));
+        });
+    }
+
+    static ManagedVrcClient.LaunchGuard startupGuard(ManagedVrcClient.LaunchGuard guard,
+        java.util.function.BooleanSupplier allowed)
+    {
+        return () -> {
+            guard.check();
+            if (!allowed.getAsBoolean()) throw new InterruptedException("Startup auto-join cancelled before launch");
+        };
+    }
+
+    /** Auto-follow keeps its account/settings guard at close and launch boundaries. */
+    static void launchAutomatic(String userId, String location, String shortName, java.util.function.BooleanSupplier allowed) throws Exception
+    {
+        MANAGED_CLIENTS.launch(location, true, guard -> {
+            ManagedVrcClient.LaunchGuard checked = startupGuard(guard, allowed);
+            checked.check();
+            return ManagedVrcClient.startedProcess(Platform.CURRENT.isNT()
+                ? launch_win(userId, location, shortName, LaunchMode.DESKTOP, checked)
+                : launch_linux(userId, location, shortName, LaunchMode.DESKTOP, checked));
+        }, null, allowed, allowed, null);
+    }
+
+    /** Exact-client recovery; optional guarded force-stop never bypasses quiet-exit verification. */
+    static void recoverManagedClient(ManagedVrcClient.Client expected, String userId,
+        java.util.function.BooleanSupplier allowed, java.util.function.BooleanSupplier closeAllowed,
+        java.util.function.BooleanSupplier forceAllowed,
+        java.util.concurrent.Callable<String> prepareSecureJoin) throws Exception
+    {
+        if (expected == null) throw new IllegalArgumentException("Managed startup client required");
+        MANAGED_CLIENTS.launch(expected.requestedLocation(), true, guard -> {
+            ManagedVrcClient.LaunchGuard checked = startupGuard(guard, allowed);
+            checked.check();
+            String shortName = prepareSecureJoin.call(); // Recheck target after verified shutdown, not just before close.
+            if (shortName == null || shortName.isBlank()) throw new java.io.IOException("Secure startup join unavailable");
+            checked.check();
+            return ManagedVrcClient.startedProcess(Platform.CURRENT.isNT()
+                ? launch_win(userId, expected.requestedLocation(), shortName, LaunchMode.DESKTOP, checked)
+                : launch_linux(userId, expected.requestedLocation(), shortName, LaunchMode.DESKTOP, checked));
+        }, expected, allowed, closeAllowed, forceAllowed);
     }
 
     static void launch(String userId, String location, String shortName, LaunchMode mode, boolean allowManagedRestart) throws Exception
@@ -150,6 +206,23 @@ public interface VrcLaunch
         return MANAGED_CLIENTS.confirmedClientPids();
     }
 
+    /** Shared client arguments; an account ID is not a numeric VRChat profile selector. */
+    static java.util.List<String> clientArguments(String location, String shortName, LaunchMode mode)
+    {
+        if (mode == null)
+            mode = LaunchMode.DESKTOP;
+        java.util.List<String> arguments = new java.util.ArrayList<>();
+        if (mode.noVr) arguments.add("--no-vr");
+        arguments.add("--enable-sdk-log-levels");
+        arguments.add("--enable-udon-debug-logging");
+        arguments.add("--enable-verbose-logging");
+        arguments.add("--log-debug-levels=API;All;Always;AssetBundleDownloadManager;ContentCreator;Errors;NetworkData;NetworkProcessing;NetworkTransport;Warnings");
+        String uri = buildLaunchUri(location, shortName);
+        if (uri != null) arguments.add(uri);
+        // Use VRChat's existing login/profile. Never guess a numeric profile from a user ID.
+        return arguments;
+    }
+
     /**
      * Launch VRChat on Linux via Steam.
      *
@@ -160,19 +233,8 @@ public interface VrcLaunch
      */
     static Process launch_linux(String userId, String location, String shortName, LaunchMode mode, ManagedVrcClient.LaunchGuard guard) throws Exception
     {
-        if (mode == null)
-            mode = LaunchMode.DESKTOP;
         String vrchatUri = buildLaunchUri(location, shortName);
-
-        // Build the VRChat launch arguments (mirrors what launch_win passes on Windows)
-        java.util.List<String> vrcArgs = new java.util.ArrayList<>();
-        if (mode.noVr) { vrcArgs.add("--no-vr"); }
-        vrcArgs.add("--enable-sdk-log-levels");
-        vrcArgs.add("--enable-udon-debug-logging");
-        vrcArgs.add("--enable-verbose-logging");
-        vrcArgs.add("--log-debug-levels=API;All;Always;AssetBundleDownloadManager;ContentCreator;Errors;NetworkData;NetworkProcessing;NetworkTransport;Warnings");
-        if (location != null) { vrcArgs.add(vrchatUri); }
-        if (userId   != null) { vrcArgs.add("--profile=" + userId); }
+        java.util.List<String> vrcArgs = clientArguments(location, shortName, mode);
 
         // Strategy 1: steam -applaunch
         if (Sys.hasInPath("steam"))
@@ -239,8 +301,6 @@ public interface VrcLaunch
     }
     static Process launch_win(String userId, String location, String shortName, LaunchMode mode, ManagedVrcClient.LaunchGuard guard) throws Exception
     {
-        if (mode == null)
-            mode = LaunchMode.DESKTOP;
         String path;
         {
             IntByReference pType = new IntByReference(),
@@ -261,27 +321,7 @@ public interface VrcLaunch
         }
         java.util.List<String> cmd = new java.util.ArrayList<>();
         cmd.add(new File(path, "launch.exe").getAbsolutePath());
-
-        String vrchatUri = buildLaunchUri(location, shortName);
-        if (vrchatUri != null)
-        {
-            cmd.add(vrchatUri);
-        }
-
-        if (userId != null)
-        {
-            cmd.add("--profile=" + userId);
-        }
-
-        if (mode.noVr)
-        {
-            cmd.add("--no-vr");
-        }
-
-        cmd.add("--enable-sdk-log-levels");
-        cmd.add("--enable-udon-debug-logging");
-        cmd.add("--enable-verbose-logging");
-        cmd.add("--log-debug-levels=API;All;Always;AssetBundleDownloadManager;ContentCreator;Errors;NetworkData;NetworkProcessing;NetworkTransport;Warnings");
+        cmd.addAll(clientArguments(location, shortName, mode));
 
         LOG.info("Requesting VRChat launch through its registered launcher; launch arguments are private");
         ProcessBuilder builder = privateOutput(new ProcessBuilder(cmd));

@@ -66,17 +66,33 @@ class ScarletClientExitMonitorTest
         final AtomicReference<CloseResult> result = new AtomicReference<>();
         final AtomicReference<Client> current = new AtomicReference<>(client(LOCATION, START.minusSeconds(30), START.minusSeconds(20)));
         Instance response = closed();
-        Runnable duringQuery = () -> {}, beforeClose = () -> {};
+        Runnable duringQuery = () -> {}, beforeClose = () -> {}, duringCurrent = () -> {};
+        Runnable settle = () -> {};
+        net.sybyline.scarlet.ext.SingleVrcClient.Status selectionStatus;
         CloseResult closeResult = CloseResult.REQUESTED;
-        final ScarletClientExitMonitor monitor = new ScarletClientExitMonitor(enabled::get, group::get, healthy::get,
-            this, location -> {
-                assertEquals(LOCATION, location);
-                queries.incrementAndGet();
-                duringQuery.run();
-                return response;
-            }, result::set, clock::get, nanos::get);
+        final AtomicInteger forceCalls = new AtomicInteger(), forced = new AtomicInteger();
+        Runnable beforeForce = () -> {};
+        ManagedVrcClient.ForceResult forceResult = ManagedVrcClient.ForceResult.REQUESTED;
+        final java.util.List<String> diagnostics = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final ScarletClientExitMonitor monitor;
+        Fixture() { this(ScarletClientExitMonitor.EvidenceMode.API_CONFIRMED); }
+        Fixture(ScarletClientExitMonitor.EvidenceMode mode)
+        {
+            this.monitor = new ScarletClientExitMonitor(enabled::get, group::get, healthy::get,
+                this, location -> {
+                    assertEquals(LOCATION, location);
+                    queries.incrementAndGet();
+                    duringQuery.run();
+                    return response;
+                }, result::set, clock::get, nanos::get, diagnostics::add, () -> settle.run(), () -> "synthetic-tracking-failure", mode);
+        }
 
-        @Override public Client current() { currentCalls.incrementAndGet(); return current.get(); }
+        @Override public Client current() { currentCalls.incrementAndGet(); duringCurrent.run(); return current.get(); }
+        @Override public net.sybyline.scarlet.ext.SingleVrcClient.Selection select(String location, Instant joinedAt)
+        {
+            if (this.selectionStatus == null) return ScarletClientExitMonitor.Processes.super.select(location, joinedAt);
+            return new net.sybyline.scarlet.ext.SingleVrcClient.Selection(null, this.selectionStatus);
+        }
         @Override public CloseResult close(Client expected, BooleanSupplier revalidate)
         {
             closeCalls.incrementAndGet();
@@ -93,6 +109,14 @@ class ScarletClientExitMonitorTest
             monitor.joined(LOCATION, START, false);
             monitor.playerJoined(SELF);
         }
+        @Override public ManagedVrcClient.ForceResult force(Client expected, BooleanSupplier revalidate)
+        {
+            forceCalls.incrementAndGet(); beforeForce.run();
+            if (expected != current.get()) return ManagedVrcClient.ForceResult.IDENTITY_CHANGED;
+            if (!revalidate.getAsBoolean()) return ManagedVrcClient.ForceResult.GUARD_VETO;
+            if (forceResult == ManagedVrcClient.ForceResult.REQUESTED) forced.incrementAndGet();
+            return forceResult;
+        }
         void evidence() { monitor.audit(event("group.instance.close", CLOSED)); }
         void arm() { live(); evidence(); monitor.tick(); }
         void due() { nanos.set(WAIT); monitor.tick(); }
@@ -101,6 +125,57 @@ class ScarletClientExitMonitorTest
         {
             for (int i = 0; i < 5; ++i) { nanos.addAndGet(RETRY); monitor.tick(); }
         }
+    }
+
+    @Test void ordinaryCatchupDoesNotRestartThirtySecondGrace()
+    {
+        Fixture f = new Fixture(); f.arm();
+        f.nanos.set(TimeUnit.SECONDS.toNanos(20)); f.healthy.set(false);
+        f.settle = () -> f.healthy.set(true);
+        f.monitor.tick(); f.due();
+        assertEquals(1, f.requested.get());
+        assertFalse(f.diagnostics.contains("log-tracking-not-healthy"));
+    }
+
+    @Test void failedCatchupStillRestartsFullGrace()
+    {
+        Fixture f = new Fixture(); f.arm();
+        f.nanos.set(TimeUnit.SECONDS.toNanos(20)); f.healthy.set(false); f.monitor.tick();
+        f.healthy.set(true); f.due(); assertEquals(0, f.queries.get());
+        f.nanos.set(WAIT * 2 - 1); f.monitor.tick(); assertEquals(0, f.queries.get());
+        f.nanos.incrementAndGet(); f.monitor.tick(); assertEquals(1, f.requested.get());
+    }
+
+    @Test void catchupRunsOutsideRosterLockAndProcessesNewPlayerBeforeExit() throws Exception
+    {
+        Fixture f = new Fixture(); f.arm();
+        ExecutorService parser = Executors.newSingleThreadExecutor();
+        try
+        {
+            f.settle = () -> {
+                try { parser.submit(() -> f.monitor.playerJoined(OTHER)).get(2, TimeUnit.SECONDS); }
+                catch (Exception ex) { throw new AssertionError("Catch-up must not hold the roster lock", ex); }
+            };
+            f.due();
+            assertEquals(0, f.queries.get()); assertEquals(0, f.requested.get());
+        }
+        finally { parser.shutdownNow(); }
+    }
+
+    @Test void playerArrivingDuringPostQueryCatchupInvalidatesAttempt()
+    {
+        Fixture f = new Fixture(); f.arm();
+        f.duringQuery = () -> f.settle = () -> f.monitor.playerJoined(OTHER);
+        f.due();
+        assertEquals(1, f.queries.get()); assertEquals(0, f.closeCalls.get());
+    }
+
+    @Test void finalHealthFailureCannotBeBypassedByEarlierCatchup()
+    {
+        Fixture f = new Fixture(); f.arm();
+        f.settle = () -> f.healthy.set(true);
+        f.beforeClose = () -> f.healthy.set(false);
+        f.due(); assertEquals(0, f.requested.get()); assertEquals(CloseResult.CANCELLED, f.result.get());
     }
 
     @Test void exactManagedClosedSoleSelfSessionRequestsOneCloseAfterGrace()
@@ -112,6 +187,48 @@ class ScarletClientExitMonitorTest
         assertEquals(1, f.queries.get()); assertEquals(1, f.requested.get()); assertEquals(CloseResult.REQUESTED, f.result.get());
         f.evidence(); f.monitor.playerJoined(SELF); f.unchangedTicks();
         assertEquals(1, f.queries.get()); assertEquals(1, f.closeCalls.get());
+    }
+
+    @Test void diagnosticsIdentifyMissingProofWithoutChangingExitDecisions()
+    {
+        Fixture f = new Fixture(); f.live(); f.monitor.tick();
+        assertTrue(f.diagnostics.contains("waiting-for-matching-close-audit"));
+        f.current.set(null); f.monitor.tick();
+        assertTrue(f.diagnostics.contains("no-verified-shutdown-client"));
+        assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
+        Fixture g = new Fixture(); g.arm(); g.response = null; g.due();
+        assertTrue(g.diagnostics.contains("matching-close-audit-accepted"));
+        assertTrue(g.diagnostics.contains("waiting-for-30-second-grace"));
+        assertTrue(g.diagnostics.contains("server-instance-response-unavailable"));
+        assertEquals(0, g.closeCalls.get());
+    }
+
+    @Test void diagnosticRateLimitIsPerReasonAndContainsNoIdentifiers()
+    {
+        Fixture f = new Fixture(); f.live();
+        for (int i = 0; i < 20; i++) f.monitor.tick();
+        assertEquals(1, f.diagnostics.size());
+        f.nanos.set(RETRY); f.monitor.tick(); assertEquals(2, f.diagnostics.size());
+        f.healthy.set(false); f.monitor.tick();
+        assertEquals("log-tracking-not-healthy", f.diagnostics.get(2));
+        f.evidence();
+        for (String reason : f.diagnostics)
+        {
+            assertFalse(reason.contains(LOCATION)); assertFalse(reason.contains(SELF));
+            assertFalse(reason.contains(GROUP)); assertFalse(reason.contains("~"));
+        }
+        assertEquals(0, f.closeCalls.get());
+    }
+
+    @Test void diagnosticsExplainDisabledOccupiedAndRejectedAudit()
+    {
+        Fixture f = new Fixture(); f.enabled.set(false); f.monitor.tick();
+        assertTrue(f.diagnostics.contains("disabled-setting-or-operating-mode"));
+        f.enabled.set(true); f.live(); f.monitor.playerJoined(OTHER); f.evidence(); f.monitor.tick();
+        assertTrue(f.diagnostics.contains("other-players-present"));
+        f.monitor.audit(event("group.instance.close", START.minusSeconds(1)));
+        assertTrue(f.diagnostics.contains("close-audit-rejected-session-group-time-or-roster"));
+        assertEquals(0, f.closeCalls.get());
     }
 
     @Test void openOrMissingAuditNeverQueriesOrCloses()
@@ -218,10 +335,96 @@ class ScarletClientExitMonitorTest
         f.due(); assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
     }
 
-    @Test void delayedProcessDiscoveryRequiresFreshClosureEvidence()
+    @Test void delayedInitialProcessDiscoveryPreservesClosureButStartsFreshGraceAfterBinding()
     {
         Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null); f.arm();
-        f.current.set(actual); f.due(); f.retry(); assertEquals(0, f.closeCalls.get());
+        f.unchangedTicks(); assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
+        f.current.set(actual); f.monitor.tick(); assertEquals(0, f.queries.get());
+        f.nanos.addAndGet(WAIT - 1); f.monitor.tick(); assertEquals(0, f.queries.get());
+        f.nanos.incrementAndGet(); f.monitor.tick();
+        assertEquals(1, f.queries.get()); assertEquals(1, f.requested.get());
+        f.evidence(); f.unchangedTicks(); assertEquals(1, f.closeCalls.get());
+    }
+
+    @Test void delayedDiscoveryWithOccupiedRosterWaitsUntilSoleSelfThenFullGrace()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null);
+        f.live(); f.monitor.playerJoined(OTHER); f.evidence(); f.monitor.tick(); f.unchangedTicks();
+        f.current.set(actual); f.monitor.tick(); f.nanos.addAndGet(WAIT); f.monitor.tick();
+        assertEquals(0, f.queries.get());
+        f.monitor.playerLeft(OTHER); f.monitor.tick();
+        f.nanos.addAndGet(WAIT - 1); f.monitor.tick(); assertEquals(0, f.queries.get());
+        f.nanos.incrementAndGet(); f.monitor.tick(); assertEquals(1, f.requested.get());
+    }
+
+    @Test void delayedDiscoveryStillRequiresFreshServerConfirmationAndBackoff()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null); f.arm();
+        f.unchangedTicks(); f.current.set(actual); f.monitor.tick();
+        f.response = null; f.nanos.addAndGet(WAIT); f.monitor.tick();
+        assertEquals(1, f.queries.get()); assertEquals(0, f.closeCalls.get());
+        f.response = closed(); f.nanos.addAndGet(RETRY - 1); f.monitor.tick(); assertEquals(1, f.queries.get());
+        f.nanos.incrementAndGet(); f.monitor.tick(); assertEquals(2, f.queries.get()); assertEquals(1, f.requested.get());
+    }
+
+    @Test void delayedDiscoveryCannotCarryClosureAcrossDisableAndReenable()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null); f.arm();
+        f.enabled.set(false); f.monitor.tick(); f.enabled.set(true); f.monitor.tick();
+        f.current.set(actual); f.unchangedTicks(); assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
+    }
+
+    @Test void delayedDiscoveryCannotCarryClosureAcrossConfiguredGroupChange()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null); f.arm();
+        f.group.set(OTHER_GROUP); f.monitor.tick(); f.group.set(GROUP); f.monitor.tick();
+        f.current.set(actual); f.unchangedTicks(); assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
+    }
+
+    @Test void delayedDiscoveryCannotCarryClosureAcrossNewLogOrSameLocationRejoin()
+    {
+        Fixture newLog = new Fixture(); Client newLogClient = newLog.current.get(); newLog.current.set(null); newLog.arm();
+        newLog.live(); newLog.current.set(newLogClient); newLog.unchangedTicks();
+        assertEquals(0, newLog.queries.get()); assertEquals(0, newLog.closeCalls.get());
+        Fixture rejoin = new Fixture(); Client rejoinClient = rejoin.current.get(); rejoin.current.set(null); rejoin.arm();
+        rejoin.monitor.joined(LOCATION, CLOSED.plusSeconds(1), false); rejoin.monitor.playerJoined(SELF);
+        rejoin.current.set(rejoinClient); rejoin.unchangedTicks();
+        assertEquals(0, rejoin.queries.get()); assertEquals(0, rejoin.closeCalls.get());
+    }
+
+    @Test void delayedDiscoveryCannotCarryClosureAcrossAccountChangeOrLostRoster()
+    {
+        Fixture account = new Fixture(); Client accountClient = account.current.get(); account.current.set(null); account.arm();
+        account.monitor.authenticated(OTHER); account.monitor.playerLeft(SELF); account.monitor.playerJoined(OTHER);
+        account.current.set(accountClient); account.unchangedTicks();
+        assertEquals(0, account.queries.get()); assertEquals(0, account.closeCalls.get());
+        Fixture roster = new Fixture(); Client rosterClient = roster.current.get(); roster.current.set(null); roster.arm();
+        roster.monitor.playerLeft(SELF); roster.monitor.playerJoined(SELF);
+        roster.current.set(rosterClient); roster.unchangedTicks();
+        assertEquals(0, roster.queries.get()); assertEquals(0, roster.closeCalls.get());
+    }
+
+    @Test void delayedDiscoveryCannotCarryClosurePastReopeningOrReplayOfOlderClosure()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null); f.arm();
+        f.monitor.audit(event("group.instance.create", CLOSED.plusSeconds(1))); f.evidence();
+        f.current.set(actual); f.unchangedTicks(); assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
+    }
+
+    @Test void nonNullMismatchedProcessStillDiscardsClosureBeforeCorrectDiscovery()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.current.set(null); f.arm();
+        f.current.set(client(LOCATION + "~nonce(other)", START.minusSeconds(30), START.minusSeconds(20)));
+        f.monitor.tick(); f.current.set(null); f.monitor.tick();
+        f.current.set(actual); f.unchangedTicks(); assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
+        f.evidence(); f.monitor.tick(); f.nanos.addAndGet(WAIT); f.monitor.tick(); assertEquals(1, f.requested.get());
+    }
+
+    @Test void lostAlreadyBoundProcessStillRequiresFreshClosureEvidence()
+    {
+        Fixture f = new Fixture(); Client actual = f.current.get(); f.arm();
+        f.current.set(null); f.due(); f.current.set(actual); f.unchangedTicks();
+        assertEquals(0, f.queries.get()); assertEquals(0, f.closeCalls.get());
         f.evidence(); f.monitor.tick(); f.nanos.addAndGet(WAIT); f.monitor.tick(); assertEquals(1, f.requested.get());
     }
 

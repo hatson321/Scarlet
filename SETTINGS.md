@@ -369,8 +369,41 @@ Parameters are as such:
 ## file `settings.json`
 
 General settings for Scarlet:
+
+### Windows rendering compatibility
+
+In **Settings -> General -> Appearance**, enable **Windows rendering compatibility
+(restart required)** only if Scarlet has display corruption that improves when
+launched with `-Dsun.java2d.d3d=false`. The default is off. This option is hidden
+and has no effect on Linux. It is also available in Staff Mode.
+
+Click **Save Settings**, close Scarlet completely, and reopen it. Java chooses
+its rendering pipeline early, so the checkbox does not change the current window.
+The saved option disables Java Direct3D rendering for Scarlet on Windows; it does
+not change the Windows display settings or other applications. It may change UI
+rendering performance and is a compatibility workaround, not a graphics-driver repair.
+
+If the display is difficult to use, launch this build once with
+`java "-Dsun.java2d.d3d=false" -jar "scarlet-0.6.1-a9.jar"`, enable the checkbox and
+save, then close it and double-click the JAR normally. Explicit Java options
+(including a `.bat` launcher's `-Dsun.java2d.d3d=false` or `true`) take precedence
+over the checkbox. To return to normal rendering, turn it off, save and restart
+without that explicit option.
+
+The option is read from the resolved data home's `settings.json` before the UI
+starts. When a startup folder chooser or legacy-transfer prompt has multiple
+possible homes, a compatibility request from any offered/eligible home is used
+for that launch so the prompt can be drawn correctly. No home's saved preference
+is changed by that fallback. Missing, malformed, oversized or unsafe settings
+leave the existing Java rendering options unchanged.
+
+### Settings example
+
 ```json
 {
+    // Windows-only Java Direct3D compatibility workaround; save and restart to apply.
+    "windows_rendering_compatibility": false,
+
     // The username used to authenticate with VRChat
     "vrc_username": "DefinitelyNOTtupper",
     // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
@@ -503,8 +536,18 @@ General settings for Scarlet:
     // Whether to issue a ping to the Discord user whose associated VRChat user issues a User Unban
     "discord_ping_user_unban": false,
     
-    // Whether to launch a new VRChat Client instance on an Instance Create
+    // Whether to launch VRChat for newly created group instances and join an existing
+    // open instance at Scarlet startup. When several are open, startup chooses the
+    // newest using creation-audit timestamps, not the API list order. This runs in
+    // the background even if fast instance polling is disabled. A pre-existing
+    // VRChat client is left alone; an unverifiable choice is skipped with a log message.
     "vrchat_client_launch_on_instance_create": false,
+
+    // Small Discord profile/avatar thumbnails on staff and regular instance join/leave
+    // messages. Toggle in Settings; takes effect on subsequent messages without restart.
+    // Uses cached public profiles only: an uncached/missing image is omitted without
+    // delaying the log or making an additional VRChat request. Discord controls its size.
+    "discord_instance_join_leave_thumbnails": true,
     
     // Whether evidence submission is enabled
     "evidence_enabled": false,
@@ -513,9 +556,9 @@ General settings for Scarlet:
     // Enabling allows automatic avatar-change/hydration/rescan requests as well as
     // manual searches; selected services receive lookup data plus the configured
     // group ID and signed-in primary account ID in the User-Agent, with public support contacts.
-    // Older avatar_search_external_lookups_enabled permission is not reused:
+    // Older avatar_search_external_lookups_enabled / avatar_search_identified_lookups_enabled permission is not reused:
     // owners must opt in again after reviewing the updated provider notice.
-    "avatar_search_identified_lookups_enabled": false,
+    "avatar_search_identified_lookups_consent_v2": false,
 
     // Whether to use custom VRCX-compatible avatar search providers
     "custom_avatar_search_providers_enabled": false,

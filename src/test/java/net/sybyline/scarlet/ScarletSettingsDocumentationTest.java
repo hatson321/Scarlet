@@ -10,6 +10,15 @@ import com.google.gson.*;
 import com.google.gson.stream.JsonReader;
 
 class ScarletSettingsDocumentationTest {
+    @Test void renderingCompatibilityDocumentsRestartDefaultAndOverride() throws Exception {
+        String text = new String(Files.readAllBytes(Paths.get("SETTINGS.md")), StandardCharsets.UTF_8);
+        assertTrue(text.contains("Settings -> General -> Appearance"));
+        assertTrue(text.contains("\"windows_rendering_compatibility\": false"));
+        assertTrue(text.contains("restart required"));
+        assertTrue(text.contains("take precedence"));
+        assertTrue(text.contains("has no effect on Linux"));
+        assertTrue(text.contains("Staff Mode"));
+    }
     @Test void allIllustratedJsonParsesAfterRemovingDocumentedCommentLines() throws Exception {
         String text = new String(Files.readAllBytes(Paths.get("SETTINGS.md")), StandardCharsets.UTF_8);
         Matcher matcher = Pattern.compile("(?s)```json\\R(.*?)```").matcher(text);

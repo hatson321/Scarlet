@@ -6,6 +6,9 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
+
+import io.github.vrchatapi.model.User;
 
 import javax.swing.JFrame;
 
@@ -40,7 +43,11 @@ public interface IScarletUI extends Closeable
 
     void fireSort();
     void clearInstance();
+    /** Observed client location, independent of whether player rows have arrived yet. */
+    default void instanceLocation(String location) {}
     void playerJoin(boolean initialPreamble, String id, String name, LocalDateTime joined, String advisory, Color text_color, int priority, boolean isRejoinFromPrev);
+    /** Applies background details only to the still-current, present player; never creates a row. */
+    default void playerEnrich(String id, User user, String advisory, Color textColor, int priority, BooleanSupplier stillCurrent) {}
     void playerUpdate(boolean initialPreamble, String id, Func.V1.NE<ConnectedPlayer> update);
     void playerLeave(boolean initialPreamble, String id, String name, LocalDateTime left);
 

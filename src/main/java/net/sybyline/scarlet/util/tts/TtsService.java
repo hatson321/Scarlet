@@ -49,6 +49,8 @@ public class TtsService implements Closeable
         this.eventListener = eventListener;
         this.discord = discord;
         this.parentComponent = parentComponent;
+        this.synthesis = new TtsSynthesis(this.provider, 30_000L, this::speechDiagnostic,
+            (failed, working) -> this.eventListener.acceptWorkingTtsVoice(failed, working));
         // Bundled alert sounds live in the JAR; extract them to a scratch temp dir
         // (never the user data folder) purely so the external audio player has a path.
         File sfxDir = new File(System.getProperty("java.io.tmpdir", "."), "scarlet-sfx");
@@ -67,6 +69,17 @@ public class TtsService implements Closeable
     final Component parentComponent;
     final File mixedCharacterAlertWav;
     final File nuisanceAlertWav;
+    private final TtsSynthesis synthesis;
+    private final java.util.Map<String, Long> speechDiagnosticTimes = new java.util.HashMap<>();
+
+    private synchronized void speechDiagnostic(String reason)
+    {
+        long now = System.nanoTime();
+        Long previous = this.speechDiagnosticTimes.get(reason);
+        if (previous != null && now - previous >= 0 && now - previous < TimeUnit.MINUTES.toNanos(1)) return;
+        this.speechDiagnosticTimes.put(reason, now);
+        Scarlet.LOG.warn("TTS diagnostic: {}", reason);
+    }
 
     /**
      * Single-threaded executor that serialises all audio playback.
@@ -240,7 +253,7 @@ public class TtsService implements Closeable
             this.playPreparedAudio(marker, alertWav);
             try
             {
-                Path path = speech.get();
+                Path path = speech.get(35, TimeUnit.SECONDS);
                 if (path == null)
                 {
                     Scarlet.LOG.warn("TTS({}): Provider returned null path, audio generation may have failed", marker);
@@ -255,7 +268,8 @@ public class TtsService implements Closeable
             }
             catch (Exception ex)
             {
-                Scarlet.LOG.error("TTS({}): Exception during mixed-character alert processing", marker, ex);
+                speech.cancel(false);
+                Scarlet.LOG.warn("TTS({}): Alert speech unavailable; playback queue will continue ({})", marker, ex.getClass().getSimpleName());
             }
         }, this.playbackExecutor);
     }
@@ -293,26 +307,7 @@ public class TtsService implements Closeable
         final String selectedVoice = this.eventListener.getTtsVoiceName();
         Scarlet.LOG.info("TTS: Submitting text '{}' with voice '{}' for marker {}",
             text, selectedVoice, marker);
-        final String finalText = text;
-        return this.provider
-            .speak(finalText, selectedVoice, 1.0F, 1.0F)
-            .thenCompose(path ->
-            {
-                // A null path means the voice failed (e.g. an Online/Natural voice that
-                // cannot write to a file stream). Trigger fallback voice selection and retry
-                // the same text with that voice so the user's command isn't lost.
-                if (path == null)
-                {
-                    String fallbackVoice = this.eventListener.fallbackTtsVoice(selectedVoice);
-                    if (fallbackVoice != null)
-                    {
-                        Scarlet.LOG.info("TTS({}): Retrying with fallback voice '{}'", marker, fallbackVoice);
-                        return this.provider.speak(finalText, fallbackVoice, 1.0F, 1.0F);
-                    }
-                    return CompletableFuture.completedFuture(null);
-                }
-                return CompletableFuture.completedFuture(path);
-            });
+        return this.synthesis.submit(text, selectedVoice);
     }
 
     /**
@@ -379,6 +374,7 @@ public class TtsService implements Closeable
      */
     public boolean skip()
     {
+        boolean skippedSpeech = this.synthesis.skip();
         Process proc = this.activeProcess.getAndSet(null);
         if (proc != null && proc.isAlive())
         {
@@ -394,7 +390,7 @@ public class TtsService implements Closeable
             return true;
         }
         Scarlet.LOG.debug("TTS: skip() called but no clip or player was active");
-        return false;
+        return skippedSpeech;
     }
 
     /**
@@ -644,6 +640,7 @@ public class TtsService implements Closeable
     @Override
     public void close()
     {
+        this.synthesis.close();
         this.provider.close();
         this.playbackExecutor.shutdown();
         try

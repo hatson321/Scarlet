@@ -200,7 +200,7 @@ public class Scarlet implements Closeable
             if (implementationVersion != null && !implementationVersion.trim().isEmpty())
                 return implementationVersion.trim();
         }
-        return "0.6.1-a2";
+        return "0.6.1-a9";
     }
 
     public static void main(String[] args) throws Exception
@@ -210,6 +210,7 @@ public class Scarlet implements Closeable
         Thread.setDefaultUncaughtExceptionHandler(Scarlet::uncaughtException);
         if (ScarletOfflineTools.isOfflineCommand(launchArgs))
         {
+            configureRendering(dir);
             ScarletLogger.setConsoleOnly(true);
             try { ScarletOfflineTools.run(launchArgs); }
             catch (Exception failure)
@@ -427,6 +428,7 @@ public class Scarlet implements Closeable
     public static final File user_home = new File(System.getProperty("user.home"));
     public static volatile File dir, LEGACY_DIR;
     static volatile DataFolderMigrationResult DATA_FOLDER_MIGRATION;
+    private static boolean renderingCompatibilityApplied, renderingExplicitOptionReported;
     static
     {
         resolveDataDirectory(false);
@@ -489,7 +491,31 @@ public class Scarlet implements Closeable
         dir = dir0;
         LEGACY_DIR = legacyDir0;
         DATA_FOLDER_MIGRATION = migration0;
+        if (allowMigration) configureRendering(dir);
         System.out.println("[Scarlet] Data folder resolved to: " + dir0.getAbsolutePath());
+    }
+
+    /** Configure Java2D before the first UI; never load normal settings or write a preference here. */
+    static synchronized void configureRendering(File... candidateHomes)
+    {
+        if (renderingCompatibilityApplied || candidateHomes == null) return;
+        for (File candidate : candidateHomes)
+        {
+            if (candidate == null) continue;
+            ScarletRenderingCompatibility.Result result = ScarletRenderingCompatibility.apply(candidate);
+            if (result == ScarletRenderingCompatibility.Result.EXPLICIT_JVM_OPTION)
+            {
+                if (!renderingExplicitOptionReported) System.out.println(result.diagnostic());
+                renderingExplicitOptionReported = true;
+                return;
+            }
+            if (result.diagnostic() != null) System.out.println(result.diagnostic());
+            if (result == ScarletRenderingCompatibility.Result.ENABLED)
+            {
+                renderingCompatibilityApplied = true;
+                return;
+            }
+        }
     }
 
     static File defaultDataDir(String group, String name, String localappdata, String xdgDataHome)
@@ -641,6 +667,9 @@ public class Scarlet implements Closeable
             return null;
         if (candidates.size() == 1)
             return candidates.get(0);
+        // The chosen home is not known until after this UI. If any offered home
+        // requests compatibility, use it for this launch without changing any saved setting.
+        configureRendering(candidates.toArray(new File[0]));
         String message = "Scarlet found more than one data folder with a saved config.\n\nChoose which one to load:";
         try
         {
@@ -832,6 +861,8 @@ public class Scarlet implements Closeable
     static boolean confirmLegacyDataTransfer(File legacyDir, File newDir, boolean dryRun)
     {
         String message = dataFolderTransferPromptMessage(legacyDir, newDir, dryRun);
+        // Only eligible transfer homes influence this early prompt, not a skipped legacy source.
+        configureRendering(newDir, legacyDir);
         if (!GraphicsEnvironment.isHeadless())
         {
             Object[] options = { "Transfer data", "Start fresh" };
@@ -876,6 +907,7 @@ public class Scarlet implements Closeable
 
     static void showDataFolderTransferFailure(DataFolderMigrationResult migration)
     {
+        configureRendering(migration.newDir);
         String message =
             "Hatson321/Scarlet Logger could not transfer your existing Scarlet data.\n\n" +
             "Hatson321/Scarlet Logger data folder:\n" +
@@ -1106,6 +1138,11 @@ public class Scarlet implements Closeable
         net.sybyline.scarlet.ext.VrcLaunch.stopLaunching();
         // Some failure paths clear running directly; still wake IPC before waiting.
         this.stopIpc();
+        // Stop the producer before its background consumers. No late log event may
+        // enqueue work after shutdown or race the final save/export of local data.
+        MiscUtils.close(this.logs);
+        if (this.eventListener != null && !this.eventListener.shutdownBackgroundLookups())
+            throw new IOException("Background player/avatar lookups did not stop; offline migration was not started");
         this.exec.shutdown();
         this.execModal.shutdown();
         this.execIPC.shutdown();
@@ -1156,7 +1193,6 @@ public class Scarlet implements Closeable
             MiscUtils.close(this.ttsService);
         if (this.discord != null) this.discord.close();
         MiscUtils.close(this.vrc);
-        MiscUtils.close(this.logs);
         MiscUtils.close(this.ui);
         if (this.shouldPersistOnShutdown())
         {
@@ -1369,7 +1405,8 @@ public class Scarlet implements Closeable
                                      autoInviteOnVerify = this.settings.new FileValuedBoolean("auto_invite_group_on_verify", I18n.tr("setting.auto_invite_group_on_verify"), true),
                                      announceVerifyComplete = this.settings.new FileValuedBoolean("announce_verify_complete", I18n.tr("setting.announce_verify_complete"), true),
                                      trainingMode = this.settings.new FileValuedBoolean("training_mode_enabled", I18n.tr("setting.training_mode_enabled"), false),
-                                     uiAccentHeaders = this.settings.new FileValuedBoolean("ui_accent_headers", I18n.tr("setting.ui_accent_headers"), false);
+                                     uiAccentHeaders = this.settings.new FileValuedBoolean("ui_accent_headers", I18n.tr("setting.ui_accent_headers"), false),
+                                     windowsRenderingCompatibility = this.settings.new FileValuedBoolean(ScarletRenderingCompatibility.SETTING_KEY, I18n.tr("setting.windows_rendering_compatibility"), false);
     /** One-time first-launch flag: the user has seen and accepted the maintainer and release-process notice. */
     final ScarletSettings.FileValued<Boolean> maintainerNoticeAcknowledged = this.settings.new FileValuedBoolean("vibecoded_notice_acknowledged", I18n.tr("setting.maintainer_notice_acknowledged"), false);
     /** Desktop UI language override; blank/"system" follows the operating system language. Applied at startup (restart to change). */
@@ -1390,6 +1427,7 @@ public class Scarlet implements Closeable
     final ScarletSettings.FileValued<String[]> enforceInstancesWorldList = this.settings.new FileValuedStringArrayPattern("enforce_instances_world_list", I18n.tr("setting.enforce_instances_world_list"), new String[0], VrcIds.P_ID_WORLD, true);
     final ScarletSettings.FileValued<Integer> autoCloseBotInstanceMinutes = this.settings.new FileValuedIntRange("auto_close_bot_instance_minutes", I18n.tr("setting.auto_close_bot_instance_minutes"), 0, 0, 1440);
     final ScarletSettings.FileValued<Boolean> exitVrchatOnClosedEmptyInstance = this.settings.new FileValuedBoolean("vrchat_client_exit_closed_empty", I18n.tr("setting.vrchat_client_exit_closed_empty"), false);
+    final ScarletSettings.FileValued<Boolean> forceVrchatOnClosedEmptyInstance = this.settings.new FileValuedBoolean("vrchat_client_force_closed_empty", "VRChat Client: Force-close closed/empty client if normal close fails (Windows)", false);
     final ScarletSettings.FileValued<Integer> auditPollingInterval = this.settings.new FileValuedIntRange("audit_polling_interval", I18n.tr("setting.audit_polling_interval"), 60, 10, 300);
     final ScarletSettings.FileValued<Integer> auditCatchupMaxDays = this.settings.new FileValuedIntRange("audit_catchup_max_days", I18n.tr("setting.audit_catchup_max_days"), 14, 1, 90);
     // How often (seconds) to poll the group's live open instances so the follow-into-new-instance
@@ -1854,6 +1892,31 @@ public class Scarlet implements Closeable
         this.maintainerNoticeAcknowledged.set(Boolean.TRUE, "first-run-notice");
     }
 
+    void checkGroupStartupPermissions()
+    {
+        if (this.staffMode) return;
+        if (!this.vrc.hasValidGroupId()) this.vrc.modalNeedGroupId();
+        else if (!this.vrc.checkSelfUserHasVRChatPermission(GroupPermissions.group_audit_view))
+            this.vrc.modalNeedPerms(GroupPermissions.group_audit_view);
+    }
+
+    void maybeOfferDiscordModeration()
+    {
+        // Staff Mode has no Discord bot. Do not consume the opt-in for a later bot setup.
+        if (this.staffMode || !Features.DISCORD_KICK_BAN_ENABLED || this.discordKickBanPrompted.get()) return;
+        this.settings.requireConfirmYesNoAsync(
+            "Hatson321/Scarlet Logger includes built-in Discord slash commands for warning, kicking, and banning server members\n" +
+            "(/discord-warn, /discord-kick, and /discord-ban).\n\n" +
+            "Many users prefer to use a dedicated moderation bot for this instead.\n\n" +
+            "Would you like to enable Hatson321/Scarlet Logger's built-in Discord moderation commands?",
+            "Discord Moderation Commands",
+            () -> {
+                this.discordKickBanEnabled.set(true, "user-prompt");
+                this.discordKickBanPrompted.set(true, "user-prompt");
+            },
+            () -> this.discordKickBanPrompted.set(true, "user-prompt"));
+    }
+
     public void run()
     {
         System.out.println("===========================================");
@@ -1884,36 +1947,14 @@ public class Scarlet implements Closeable
             LOG.error("Failed to authenticate with VRChat", ex);
             return;
         }
-        if (!this.vrc.hasValidGroupId())
-        {
-            this.vrc.modalNeedGroupId();
-        }
-        else if (!this.vrc.checkSelfUserHasVRChatPermission(GroupPermissions.group_audit_view))
-        {
-            this.vrc.modalNeedPerms(GroupPermissions.group_audit_view);
-        }
+        this.checkGroupStartupPermissions();
         this.splash.splashSubtext(I18n.tr("splash.checkingUpdates"));
         this.checkUpdate();
         this.checkAnnouncement();
-        // One-time opt-in for built-in Discord moderation commands
-        if (Features.DISCORD_KICK_BAN_ENABLED && !this.discordKickBanPrompted.get())
-        {
-            this.settings.requireConfirmYesNoAsync(
-                "Hatson321/Scarlet Logger includes built-in Discord slash commands for warning, kicking, and banning server members\n" +
-                "(/discord-warn, /discord-kick, and /discord-ban).\n\n" +
-                "Many users prefer to use a dedicated moderation bot for this instead.\n\n" +
-                "Would you like to enable Hatson321/Scarlet Logger's built-in Discord moderation commands?",
-                "Discord Moderation Commands",
-                () -> {
-                    this.discordKickBanEnabled.set(true, "user-prompt");
-                    this.discordKickBanPrompted.set(true, "user-prompt");
-                },
-                () -> {
-                    this.discordKickBanPrompted.set(true, "user-prompt");
-                }
-            );
-        }
+        this.maybeOfferDiscordModeration();
         this.logs.start();
+        // Reconcile already-open instances before creation-audit catch-up can launch a client.
+        this.discord.maybeJoinActiveInstanceOnStartup();
         this.execIPC.execute(this::runIPC);
         // Health watchdog: converts Scarlet's silent failure modes (dead log tailer,
         // expired VRChat session) into visible, recoverable ones. Runs off the worker
@@ -3339,6 +3380,10 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
     private long fastInstancePollBackoffUntilMillis = 0L;
     void maybeFastDetectNewInstance()
     {
+        // Startup recovery is independent of the optional fast-poll interval.
+        this.discord.maybeJoinActiveInstanceOnStartup();
+        if (this.discord.isStartupInstanceJoinPending())
+            return;
         // Only worth an API call when the follow-into-new-instance feature is actually on.
         if (this.staffMode || !this.discord.isLaunchOnInstanceCreateEnabled())
             return;

@@ -74,6 +74,17 @@ class ScarletAvatarConsentIntegrationTest
         assertEquals(0, discord.getAvatarSearchProviders().length);
     }
 
+    @Test void dialogSelectionSurvivesDisabledConsentWithoutAuthorizingLookups()
+    {
+        String[] custom = {"https://selected.invalid/search"};
+        assertArrayEquals(custom, AvatarSearch.selectedProviders(true, custom, null));
+        assertEquals(0, AvatarSearch.effectiveProviders(true, false, true, custom, null).length);
+        assertArrayEquals(AvatarSearch.URL_ROOTS, AvatarSearch.selectedProviders(false, null, null));
+        assertEquals(0, AvatarSearch.selectedProviders(true, new String[0], null).length);
+        assertEquals(0, AvatarSearch.effectiveProviders(true, true, true, new String[0], null).length);
+        assertArrayEquals(custom, AvatarSearch.effectiveProviders(true, true, true, custom, null));
+    }
+
     @Test void actualDiscordAgreementEnablesAndRevocationDisablesSelectedProviders() throws Exception
     {
         ScarletSettings settings = this.settings();
