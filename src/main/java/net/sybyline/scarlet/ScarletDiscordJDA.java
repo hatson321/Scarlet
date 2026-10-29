@@ -38,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -89,6 +90,7 @@ import io.github.vrchatapi.model.ModelFile;
 import io.github.vrchatapi.model.PerformanceRatings;
 import io.github.vrchatapi.model.Print;
 import io.github.vrchatapi.model.Prop;
+import io.github.vrchatapi.model.PublicProfile;
 import io.github.vrchatapi.model.User;
 import io.github.vrchatapi.model.World;
 
@@ -159,6 +161,7 @@ import net.dv8tion.jda.api.utils.messages.MessageCreateRequest;
 import net.sybyline.scarlet.ScarletData.AuditEntryMetadata;
 import net.sybyline.scarlet.ScarletData.InstanceEmbedMessage;
 import net.sybyline.scarlet.ext.AvatarSearch;
+import net.sybyline.scarlet.ext.ExtendedUserAgent;
 import net.sybyline.scarlet.ext.VrcLaunch;
 import net.sybyline.scarlet.ext.ManagedVrcClient;
 import net.sybyline.scarlet.server.discord.LDaveSessionFactory;
@@ -308,6 +311,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public void close() throws IOException
     {
+        this.closeAvatarProviderCache();
+        this.closeVoteKickProfileWorker();
         this.closeClientLaunchWorker();
         this.closeSummaryWorker();
         ScarletAuditFollowupWorker followup;
@@ -541,6 +546,31 @@ public class ScarletDiscordJDA implements ScarletDiscord
     Map<String, String> auditExType2secretChannelSf = new ConcurrentHashMap<>();
     Map<String, Integer> auditType2color = new ConcurrentHashMap<>();
     List<Action> queuedActions = Collections.synchronizedList(new LinkedList<>());
+    ScarletModerationQueue moderationQueue;
+    private boolean moderationQueueLoadFailed, moderationQueueAlerted, moderationQueueStorageAlerted;
+
+    synchronized ScarletModerationQueue moderationQueue()
+    {
+        if (this.moderationQueueLoadFailed)
+            throw new IllegalStateException("Moderation queue needs local review before accepting or dispatching work");
+        if (this.moderationQueue == null) try
+        {
+            this.requireWritableConfig();
+            this.moderationQueue = new ScarletModerationQueue(new File(this.scarlet.data.dir, "moderation_queue.json"));
+        }
+        catch (RuntimeException ex)
+        {
+            this.moderationQueueLoadFailed = true;
+            throw ex;
+        }
+        return this.moderationQueue;
+    }
+
+    synchronized void enqueueModerationActions(List<Action> actions)
+    {
+        this.moderationQueue().accept(actions);
+        this.queuedActions = this.moderationQueue.pending(); // Compatibility view, never an execution source.
+    }
 
     ScarletDiscordCommands discordCommands = null;
     ScarletDiscordUI discordUI = null;
@@ -656,45 +686,59 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public long pollQueuedAction()
     {
+        ScarletModerationQueue.Receipt receipt = null;
         try
         {
-            if (!this.queuedActions.isEmpty())
+            ScarletModerationQueue queue = this.moderationQueue();
+            if (!this.moderationQueueAlerted && queue.reviewCount() > 0)
             {
-                Action queuedAction = this.queuedActions.remove(0);
-                switch (queuedAction.action)
-                {
-                case "ban":
-                    return this.pollQueuedAction_ban(queuedAction);
-                case "unban":
-                    return this.pollQueuedAction_unban(queuedAction);
-                }
+                this.emitOpsAlert("Moderation queue requires review", "Interrupted or legacy moderation receipts were retained in moderation_queue.json. They will not be replayed. Verify the current group and audit history before intentionally submitting any replacement request.", 0xFEE75C);
+                this.moderationQueueAlerted = true;
             }
+            receipt = queue.claim();
+            this.moderationQueueStorageAlerted = false;
+            this.queuedActions = queue.pending();
+            if (receipt == null) return 10L;
+            VRChatBanAttempt attempt = "ban".equals(receipt.action.action)
+                ? this.executeQueuedBan(receipt.action)
+                : this.executeVRChatUnban(receipt.action, DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+            queue.finish(receipt.id, attempt.outcome == null ? ScarletVRChat.GroupModerationResult.REJECTED : attempt.outcome);
+            if (!attempt.succeeded()) this.emitActionFailure(this.scarlet, receipt.action, "%s", attempt.message);
+            if (attempt.outcome == ScarletVRChat.GroupModerationResult.UNKNOWN) this.moderationQueueAlerted = false;
+            return attempt.succeeded() ? 60L : 30L;
         }
         catch (Exception ex)
         {
-            LOG.error("Exception polling queued action", ex);
+            // A failed result save leaves CLAIMED, never QUEUED. Do not repeat a remote mutation.
+            this.moderationQueueAlerted = false;
+            LOG.error("Moderation queue could not advance safely; receipts retained for review ({})", ex.getClass().getSimpleName());
+            if (!this.moderationQueueStorageAlerted)
+            {
+                this.emitOpsAlert("Moderation queue storage needs review", "A queue transition could not be safely saved. No uncertain action will be replayed. Check local moderation_queue.json and storage before submitting replacements.", 0xFEE75C);
+                this.moderationQueueStorageAlerted = true;
+            }
         }
         return 10L;
     }
     long pollQueuedAction_ban(Action queuedAction)
+    {
+        VRChatBanAttempt attempt = this.executeQueuedBan(queuedAction);
+        if (!attempt.succeeded()) this.emitActionFailure(this.scarlet, queuedAction, "%s", attempt.message);
+        return attempt.succeeded() ? 60L : 30L;
+    }
+    private VRChatBanAttempt executeQueuedBan(Action queuedAction)
     {
         if (queuedAction.requesterDiscordId == null || queuedAction.actorId == null
             || queuedAction.discordGuildId == null || queuedAction.vrchatGroupId == null
             || !queuedAction.discordGuildId.equals(this.guildSf)
             || !queuedAction.vrchatGroupId.equals(this.scarlet.vrc.groupId))
         {
-            this.emitActionFailure(this.scarlet, queuedAction,
+            return new VRChatBanAttempt(queuedAction.actorId, null,
                 "Queued ban was refused because its original requester or group context cannot be verified. Submit a new request.");
-            return 30L;
         }
-        VRChatBanAttempt attempt = this.executeVRChatBan(queuedAction.requesterDiscordId, queuedAction.actorId,
-            queuedAction.targetId, DPerms.PermType.MODAL_SUBMIT, "vrchat-user-ban-multi");
-        if (!attempt.succeeded())
-        {
-            this.emitActionFailure(this.scarlet, queuedAction, "%s", attempt.message);
-            return 30L;
-        }
-        return 60L;
+        return this.executeVRChatBan(queuedAction.requesterDiscordId, queuedAction.actorId,
+            queuedAction.targetId, DPerms.PermType.MODAL_SUBMIT, "vrchat-user-ban-multi", 0L,
+            queuedAction.discordGuildId, queuedAction.vrchatGroupId);
     }
 
     /** Retrieve instead of trusting the Member captured when a command or modal was opened. */
@@ -810,9 +854,20 @@ public class ScarletDiscordJDA implements ScarletDiscord
     VRChatBanAttempt executeVRChatBan(String requesterDiscordId, String expectedActorId, String targetId,
         DPerms.PermType type, String operation, long timedExpiry)
     {
+        return this.executeVRChatBan(requesterDiscordId, expectedActorId, targetId, type, operation, timedExpiry,
+            this.guildSf, this.scarlet.vrc.groupId);
+    }
+
+    private VRChatBanAttempt executeVRChatBan(String requesterDiscordId, String expectedActorId, String targetId,
+        DPerms.PermType type, String operation, long timedExpiry, String expectedGuildId, String expectedGroupId)
+    {
+        String expectedBotId = this.scarlet.vrc.currentUserId;
         VRChatBanAccess access = this.checkVRChatBanAccess(requesterDiscordId, expectedActorId, targetId, type, operation);
         if (!access.allowed()) return new VRChatBanAttempt(access.actorId, null, access.message);
-        String groupId = this.scarlet.vrc.groupId;
+        if (!Objects.equals(expectedGuildId, this.guildSf) || !Objects.equals(expectedGroupId, this.scarlet.vrc.groupId)
+            || !Objects.equals(expectedBotId, this.scarlet.vrc.currentUserId))
+            return new VRChatBanAttempt(access.actorId, null, "The configured group, guild or account changed during verification. No ban was submitted.");
+        String groupId = expectedGroupId;
         ScarletPendingModActions.PendingReservation reservation;
         try
         {
@@ -835,10 +890,22 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 return new VRChatBanAttempt(access.actorId, null, "The automatic-unban intent could not be saved. No ban was submitted.");
             }
         }
+        // Receipt persistence and timer preparation can block too. Refresh Discord and retain
+        // the original group binding before the service performs its final VRChat authority check.
+        VRChatBanAccess finalAccess = this.resolveVRChatBanRequester(requesterDiscordId, access.actorId, type, operation);
+        if (!finalAccess.allowed() || !Objects.equals(expectedGuildId, this.guildSf)
+            || !Objects.equals(groupId, this.scarlet.vrc.groupId) || !Objects.equals(expectedBotId, this.scarlet.vrc.currentUserId))
+        {
+            String retainedIntent = this.discardUnsubmittedTimer(targetId, timer);
+            this.releaseBanReservation(reservation);
+            return new VRChatBanAttempt(access.actorId, null, (finalAccess.allowed()
+                ? "The configured group, guild or account changed before submission. No ban was submitted."
+                : finalAccess.message) + retainedIntent);
+        }
         ScarletVRChat.GroupBanResult result;
         try
         {
-            result = this.scarlet.vrc.banFromGroupAs(groupId, access.actorId, targetId, access.allowPermissionOverride);
+            result = this.scarlet.vrc.banFromGroupAs(groupId, access.actorId, targetId, finalAccess.allowPermissionOverride);
         }
         catch (RuntimeException ex)
         {
@@ -890,18 +957,25 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
     long pollQueuedAction_unban(Action queuedAction)
     {
+        VRChatBanAttempt attempt = this.executeVRChatUnban(queuedAction, DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+        if (!attempt.succeeded()) this.emitActionFailure(this.scarlet, queuedAction, "%s", attempt.message);
+        return attempt.succeeded() ? 60L : 30L;
+    }
+
+    /** Shared single/bulk unban gate: current authority, owned reservation and tri-state outcome. */
+    VRChatBanAttempt executeVRChatUnban(Action queuedAction, DPerms.PermType type, String operation)
+    {
         if (!this.queuedUnbanContextMatches(queuedAction))
         {
-            this.emitActionFailure(this.scarlet, queuedAction,
-                "Queued unban was refused because its original requester, linked account or group context cannot be verified. Legacy/unbound requests must be submitted again.");
-            return 30L;
+            return new VRChatBanAttempt(null, null,
+                "Unban was refused because its original requester, linked account or group context cannot be verified. Submit a new request.");
         }
         ScarletPendingModActions.PendingReservation reservation = null;
         boolean submitted = false;
         try
         {
             VRChatBanAccess access = this.resolveVRChatBanRequester(queuedAction.requesterDiscordId, queuedAction.actorId,
-                DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+                type, operation);
             if (!access.allowed()) throw new IllegalStateException(access.message);
             String groupId = queuedAction.vrchatGroupId, botId = this.scarlet.vrc.currentUserId;
             Group group = ScarletBanSnapshot.group(this.scarlet.vrc.readBanGroup(groupId), groupId);
@@ -910,7 +984,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             GroupMember target = ScarletBanSnapshot.member(this.scarlet.vrc.readBanMember(groupId, queuedAction.targetId), groupId, queuedAction.targetId);
             // Refresh Discord again after the blocking VRChat reads. A revoked override cannot survive them.
             access = this.resolveVRChatBanRequester(queuedAction.requesterDiscordId, queuedAction.actorId,
-                DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+                type, operation);
             if (!access.allowed()) throw new IllegalStateException(access.message);
             ScarletBanAuthorization.Decision decision = ScarletBanAuthorization.evaluateUnban(group,
                 queuedAction.actorId, botId, actor, bot, access.allowPermissionOverride);
@@ -924,7 +998,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             if (reservation == null)
                 throw new IllegalStateException("This user already has a pending moderation request. No unban was sent.");
             access = this.resolveVRChatBanRequester(queuedAction.requesterDiscordId, queuedAction.actorId,
-                DPerms.PermType.MODAL_SUBMIT, "vrchat-user-unban-multi");
+                type, operation);
             if (!access.allowed()) throw new IllegalStateException(access.message);
             decision = ScarletBanAuthorization.evaluateUnban(group, queuedAction.actorId, botId, actor, bot,
                 access.allowPermissionOverride);
@@ -934,7 +1008,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 throw new IllegalStateException("Queued unban context changed before submission. Submit a new request.");
             submitted = true;
             ScarletVRChat.GroupModerationResult result = this.scarlet.vrc.unbanFromGroupDetailed(groupId, queuedAction.targetId);
-            if (result == ScarletVRChat.GroupModerationResult.SUCCEEDED) return 60L;
+            if (result == ScarletVRChat.GroupModerationResult.SUCCEEDED)
+                return new VRChatBanAttempt(queuedAction.actorId, result, null);
             if (result == ScarletVRChat.GroupModerationResult.REJECTED)
             {
                 submitted = false;
@@ -945,11 +1020,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
         catch (Exception ex)
         {
             if (!submitted && reservation != null) this.releaseBanReservation(reservation);
-            String message = ex instanceof IllegalStateException ? ex.getMessage()
-                : submitted ? "The queued unban outcome is unknown; its pending reservation was retained for reconciliation."
-                    : "Current queued-unban authority could not be verified. No unban was sent; submit a new request when verification is available.";
-            this.emitActionFailure(this.scarlet, queuedAction, "%s", message);
-            return 30L;
+            String message = submitted ? "The unban outcome is unknown; its pending reservation was retained for reconciliation. Check the group and audit history before retrying."
+                : ex instanceof IllegalStateException ? ex.getMessage()
+                    : "Current unban authority could not be verified. No unban was sent; submit a new request when verification is available.";
+            return new VRChatBanAttempt(queuedAction.actorId, submitted ? ScarletVRChat.GroupModerationResult.UNKNOWN
+                : ScarletVRChat.GroupModerationResult.REJECTED, message);
         }
     }
 
@@ -1042,7 +1117,9 @@ public class ScarletDiscordJDA implements ScarletDiscord
             + "VRChat account ID and the maintainer's public support contact. Login credentials are not included. "
             + "Explicit permission is required even if you enabled the earlier checkbox. "
             + "Uncheck permission or every provider to stop future lookups (requests already in flight may finish). "
-            + "Only public Internet destinations are allowed. Saving may rescan missing avatar information.</body></html>");
+            + "Only public Internet destinations are allowed. Public avatar metadata is cached privately in this profile "
+            + "for up to 24 hours (empty results: 5 minutes), with an 8 MiB limit. Images are not downloaded. "
+            + "Saving may rescan missing avatar information.</body></html>");
         headerLabel.setAlignmentX(0.0F);
         panel.add(headerLabel);
         panel.add(Box.createVerticalStrut(10));
@@ -1075,6 +1152,27 @@ public class ScarletDiscordJDA implements ScarletDiscord
         JButton restoreDefaults = new JButton("Restore defaults");
         restoreDefaults.setAlignmentX(0.0F);
         panel.add(restoreDefaults);
+        JButton clearCache = new JButton("Clear saved avatar results");
+        clearCache.setAlignmentX(0.0F);
+        panel.add(clearCache);
+        clearCache.addActionListener($ ->
+        {
+            clearCache.setEnabled(false);
+            new javax.swing.SwingWorker<Boolean, Void>()
+            {
+                @Override protected Boolean doInBackground() { return clearAvatarProviderCache(); }
+                @Override protected void done()
+                {
+                    boolean cleared = false;
+                    try { cleared = this.get(); } catch (Exception ignored) { /* optional cache action */ }
+                    clearCache.setEnabled(true);
+                    JOptionPane.showMessageDialog(panel, cleared
+                        ? "Saved avatar results cleared. New lookups will use the selected providers."
+                        : "Memory results cleared, but saved results could not be cleared safely. Check Scarlet's diagnostics.",
+                        "Avatar search providers", cleared ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE);
+                }
+            }.execute();
+        });
         addButton.addActionListener($ ->
         {
             String url = addField.getText().trim();
@@ -1143,6 +1241,83 @@ public class ScarletDiscordJDA implements ScarletDiscord
     {
         return AvatarSearch.effectiveProviders(Features.AVATAR_SEARCH_ENABLED, this.avatarSearchExternalLookupsEnabled.get(),
             this.avatarSearchProvidersEnabled.get(), this.avatarSearchProviders.get(), BLOCKED_AVATAR_SEARCH_HOST);
+    }
+
+    private ScarletAvatarProviderCache avatarProviderCache;
+    private volatile boolean avatarProviderCacheClosed;
+
+    synchronized ScarletAvatarProviderCache avatarProviderCache()
+    {
+        if (this.avatarProviderCacheClosed) return null;
+        if (this.avatarProviderCache == null)
+            this.avatarProviderCache = new ScarletAvatarProviderCache(
+                this.scarlet.dataDir.toPath().resolve("avatar-provider-cache.json"));
+        return this.avatarProviderCache;
+    }
+
+    boolean clearAvatarProviderCache()
+    {
+        ScarletAvatarProviderCache cache = this.avatarProviderCache();
+        return cache != null && cache.clear();
+    }
+
+    void closeAvatarProviderCache()
+    {
+        ScarletAvatarProviderCache cache;
+        synchronized (this)
+        {
+            this.avatarProviderCacheClosed = true;
+            cache = this.avatarProviderCache;
+        }
+        if (cache != null) cache.close();
+    }
+
+    /** A cache hit must obey the same account, consent and live-request guards as a network result. */
+    BooleanSupplier avatarProviderRequestGuard(BooleanSupplier current)
+    {
+        final Scarlet owner = this.scarlet;
+        final ScarletVRChat vrc = owner.vrc;
+        final JDA discord = this.jda;
+        final String group = vrc == null ? null : vrc.groupId;
+        final String account = vrc == null ? null : vrc.currentUserId;
+        final String[] providers = this.getAvatarSearchProviders();
+        final long generation = ExtendedUserAgent.currentAuthenticationGeneration();
+        final java.util.concurrent.atomic.AtomicBoolean invalid = new java.util.concurrent.atomic.AtomicBoolean();
+        return () ->
+        {
+            boolean allowed = !invalid.get() && !this.avatarProviderCacheClosed && owner.running
+                && owner == this.scarlet && owner.discord == this && vrc != null && owner.vrc == vrc
+                && discord == this.jda // Staff Mode permits local lookups without a Discord connection.
+                && group != null && Objects.equals(group, vrc.groupId)
+                && account != null && Objects.equals(account, vrc.currentUserId)
+                && vrc.pendingUsername == null && vrc.pendingPassword == null
+                && ExtendedUserAgent.isPrimaryAuthenticationStable(generation)
+                && providers.length > 0 && Arrays.equals(providers, this.getAvatarSearchProviders())
+                && current != null && current.getAsBoolean();
+            if (!allowed) invalid.set(true);
+            return allowed;
+        };
+    }
+
+    Stream<AvatarSearch.VrcxAvatar> searchAvatarProviders(String query, int count, BooleanSupplier current)
+    {
+        BooleanSupplier allowed = this.avatarProviderRequestGuard(current);
+        if (!allowed.getAsBoolean()) return Stream.empty();
+        ScarletAvatarProviderCache cache = this.avatarProviderCache();
+        return cache == null ? Stream.empty() : AvatarSearch.vrcxSearchAllCached(
+            cache, this.getAvatarSearchProviders(), count, query, allowed);
+    }
+
+    Stream<AvatarSearch.VrcxAvatar> searchAvatarProviderImages(String[] requested, String image, String author, BooleanSupplier current)
+    {
+        BooleanSupplier allowed = this.avatarProviderRequestGuard(current);
+        if (!allowed.getAsBoolean()) return Stream.empty();
+        Set<String> selected = new HashSet<>(Arrays.asList(this.getAvatarSearchProviders()));
+        String[] providers = requested == null ? new String[0] : Arrays.stream(requested)
+            .filter(selected::contains).distinct().toArray(String[]::new);
+        ScarletAvatarProviderCache cache = this.avatarProviderCache();
+        return cache == null ? Stream.empty() : AvatarSearch.ByImage.vrcxSearchAllCachedByImage(
+            cache, providers, image, author, allowed);
     }
 
     void selectEvidenceRoot()
@@ -1554,7 +1729,17 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 }
             });
         this.auditType2color = auditType2color;
-        this.queuedActions = Collections.synchronizedList(spec.queuedActions == null ? new LinkedList<>() : new LinkedList<>(spec.queuedActions));
+        try
+        {
+            this.moderationQueue().importLegacy(spec.queuedActions);
+            this.queuedActions = this.moderationQueue.pending();
+        }
+        catch (RuntimeException ex)
+        {
+            this.moderationQueueLoadFailed = true;
+            this.queuedActions = Collections.emptyList();
+            LOG.error("Moderation queue is unavailable; legacy actions were not dispatched or discarded");
+        }
     }
     public synchronized void save()
     {
@@ -1585,7 +1770,10 @@ public class ScarletDiscordJDA implements ScarletDiscord
         if (this.auditType2color != null && !this.auditType2color.isEmpty())
             this.auditType2color.forEach((auditType, color) -> auditType2color.put(auditType, Integer.toHexString(color)));
         spec.auditType2color = auditType2color;
-        spec.queuedActions = new ArrayList<>(this.queuedActions);
+        // The durable receipt store is authoritative. Keep legacy input only if migration failed.
+        if (this.moderationQueueLoadFailed)
+            throw new IllegalStateException("Moderation queue migration needs review; refusing to erase legacy requests");
+        spec.queuedActions = new ArrayList<>();
         this.save(spec);
     }
     synchronized void save(JDASettingsSpec spec)
@@ -4342,7 +4530,18 @@ public class ScarletDiscordJDA implements ScarletDiscord
     @Override
     public void emitExtendedVtkInitiated(Scarlet scarlet, LocalDateTime timestamp, String location, String userId, String displayName, String optActorId, String optActorDisplayName)
     {
-        this.condEmitEx(ScarletSimulation.isTrainingId(userId), GroupAuditTypeEx.VTK_START, true, false, location, (channelSf, guild, channel) ->
+        boolean training = ScarletSimulation.isTrainingId(userId);
+        VoteKickProfileContext context = null;
+        if (!training && ScarletJoinLeaveThumbnail.isUserId(userId)) try
+        {
+            context = new VoteKickProfileContext();
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.debug("Optional vote-to-kick profile context is unavailable; the base alert is unchanged");
+        }
+        final VoteKickProfileContext profileContext = context;
+        this.condEmitEx(training, GroupAuditTypeEx.VTK_START, true, false, location, (channelSf, guild, channel) ->
         {
             EmbedBuilder builder = new EmbedBuilder()
                     .setDescription(String.format("### [%s](https://vrchat.com/home/user/%s) was targeted by a vote-to-kick in [a group instance](https://vrchat.com/home/launch?worldId=%s)",
@@ -4358,14 +4557,119 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 builder.setAuthor(MarkdownSanitizer.escape(optActorDisplayName), "https://vrchat.com/home/user/"+optActorId);
                 builder.addField("Initiating User ID", "`"+optActorId+"`", false);
             }
-            return channel.sendMessageEmbeds(builder
-                    .build())
+            MessageEmbed base = builder.build(), initial = base;
+            User cachedUser = null;
+            PublicProfile cachedProfile = null;
+            boolean profileAllowed = profileContext != null && profileContext.matchesGuild(guild)
+                && profileContext.getAsBoolean();
+            if (profileAllowed)
+            {
+                try { cachedUser = profileContext.vrc.cachedUsers.get(userId); }
+                catch (RuntimeException ex) { LOG.debug("Optional vote-to-kick user cache is unavailable"); }
+                try
+                {
+                    cachedProfile = profileContext.vrc.cachedPublicProfiles.get(userId);
+                    if (cachedProfile != null && cachedProfile.getId() != null && !userId.equals(cachedProfile.getId()))
+                        cachedProfile = null;
+                }
+                catch (RuntimeException ex)
+                {
+                    cachedProfile = null;
+                    LOG.debug("Optional vote-to-kick public-profile cache is unavailable");
+                }
+                initial = ScarletVoteKickProfile.enrich(base, userId, cachedUser, cachedProfile);
+                if (!profileContext.getAsBoolean()) initial = base;
+            }
+            Message message = channel.sendMessageEmbeds(initial)
                 .addComponents(ActionRow.of(
                     Button.danger("vrchat-user-ban:"+userId, "Ban user"),
                     Button.success("vrchat-user-unban:"+userId, "Unban user")
                 ))
                 .complete();
+            if (profileAllowed && cachedProfile == null) try
+            {
+                this.enrichVoteKickProfile(profileContext, channel, message, base, userId, cachedUser);
+            }
+            catch (RuntimeException ex)
+            {
+                LOG.debug("Optional vote-to-kick profile enrichment could not be queued; the alert was delivered");
+            }
+            return message;
         });
+    }
+
+    private ScarletBackgroundWork voteKickProfileWorker;
+    private volatile boolean voteKickProfileClosed;
+
+    long voteKickProfileNanoTime() { return System.nanoTime(); }
+
+    /** Snapshot only: profile decoration must never migrate to a different account or route. */
+    private final class VoteKickProfileContext implements BooleanSupplier
+    {
+        final Scarlet owner = ScarletDiscordJDA.this.scarlet;
+        final ScarletVRChat vrc = this.owner.vrc;
+        final JDA discord = ScarletDiscordJDA.this.jda;
+        final String group = this.vrc.groupId, account = this.vrc.currentUserId;
+        final String guildId = ScarletDiscordJDA.this.guildSf;
+        final String route = ScarletDiscordJDA.this.auditExType2channelSf.get(GroupAuditTypeEx.VTK_START.id);
+        final long authentication = ExtendedUserAgent.currentAuthenticationGeneration();
+        final long started = ScarletDiscordJDA.this.voteKickProfileNanoTime();
+
+        boolean matchesGuild(Guild guild)
+        {
+            return guild != null && Objects.equals(this.guildId, guild.getId());
+        }
+
+        @Override public boolean getAsBoolean()
+        {
+            return !ScarletDiscordJDA.this.voteKickProfileClosed
+                && ScarletDiscordJDA.this.voteKickProfileNanoTime() - this.started < TimeUnit.SECONDS.toNanos(30L)
+                && this.owner == ScarletDiscordJDA.this.scarlet && this.vrc == this.owner.vrc
+                && this.discord != null && this.discord == ScarletDiscordJDA.this.jda
+                && this.group != null && Objects.equals(this.group, this.vrc.groupId)
+                && this.account != null && Objects.equals(this.account, this.vrc.currentUserId)
+                && this.guildId != null && Objects.equals(this.guildId, ScarletDiscordJDA.this.guildSf)
+                && this.route != null && Objects.equals(this.route,
+                    ScarletDiscordJDA.this.auditExType2channelSf.get(GroupAuditTypeEx.VTK_START.id))
+                && ExtendedUserAgent.isPrimaryAuthenticationStable(this.authentication)
+                && this.vrc.pendingUsername == null && this.vrc.pendingPassword == null;
+        }
+    }
+
+    private void enrichVoteKickProfile(VoteKickProfileContext context, GuildMessageChannel channel,
+        Message message, MessageEmbed base, String userId, User cachedUser)
+    {
+        if (message == null || !context.getAsBoolean()) return;
+        synchronized (this)
+        {
+            if (this.voteKickProfileClosed) return;
+            if (this.voteKickProfileWorker == null)
+                this.voteKickProfileWorker = new ScarletBackgroundWork("Scarlet-vote-kick-profile", 16,
+                    failure -> LOG.debug("Optional vote-to-kick profile enrichment did not complete; the alert remains available"));
+            this.voteKickProfileWorker.submit(message.getId(), 0L, context, allowed -> {
+                PublicProfile profile = context.vrc.getPublicProfile(userId, ScarletJsonCache.ALWAYS_PREFER_CACHED);
+                if (profile == null || !allowed.getAsBoolean()) return;
+                MessageEmbed enriched = ScarletVoteKickProfile.enrich(base, userId, cachedUser, profile);
+                if (enriched == base || !allowed.getAsBoolean()) return;
+                // Wait only on the optional worker. Its bounded single flight prevents queued edit growth,
+                // and keeps the job guard valid until JDA actually dispatches this embed-only edit.
+                channel.editMessageEmbedsById(message.getId(), enriched)
+                    .timeout(10L, TimeUnit.SECONDS).setCheck(allowed).complete();
+            });
+        }
+    }
+
+    /** An undrained optional request must not keep reading a profile during an offline migration. */
+    void closeVoteKickProfileWorker() throws IOException
+    {
+        ScarletBackgroundWork worker;
+        synchronized (this)
+        {
+            this.voteKickProfileClosed = true;
+            worker = this.voteKickProfileWorker;
+        }
+        if (worker != null && !worker.close(5_000L))
+            throw new IOException("Vote-to-kick profile worker did not stop; offline migration cannot proceed");
     }
 
     @Override

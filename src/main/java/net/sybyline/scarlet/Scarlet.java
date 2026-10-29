@@ -200,7 +200,7 @@ public class Scarlet implements Closeable
             if (implementationVersion != null && !implementationVersion.trim().isEmpty())
                 return implementationVersion.trim();
         }
-        return "0.6.1-a9";
+        return "0.6.1-a11";
     }
 
     public static void main(String[] args) throws Exception

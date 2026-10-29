@@ -1,6 +1,9 @@
 package net.sybyline.scarlet;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -54,12 +57,8 @@ public class ScarletCacheCleanup
 
     // ── Directories / file categories ─────────────────────────────────────────
 
-    /** TTS output .wav files — safe to delete any time; regenerated on demand. */
-    private final File ttsDir;
-    /** Scarlet own log files — skip the active session file. */
-    private final File scarletLogDir;
-    /** JSON API-cache subdirectories (usr/, wrld/, avtr/, etc.). */
-    private final File cachesDir;
+    /** Keep the configured path, not an alias-resolved destination, for every cleanup check. */
+    private final Path dataRoot;
 
     private final Scarlet scarlet;
 
@@ -73,9 +72,7 @@ public class ScarletCacheCleanup
     public ScarletCacheCleanup(Scarlet scarlet)
     {
         this.scarlet     = scarlet;
-        this.ttsDir      = new File(Scarlet.dir, "tts");
-        this.scarletLogDir = new File(Scarlet.dir, "logs");
-        this.cachesDir   = new File(Scarlet.dir, "caches");
+        this.dataRoot   = Scarlet.dir.toPath().toAbsolutePath().normalize();
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -253,43 +250,58 @@ public class ScarletCacheCleanup
      */
     private List<File> collectEligible(long cutoffMs)
     {
-        List<File> result = new ArrayList<>();
-
         // Active Scarlet log — never delete while running
         File activeLog = ScarletLogger.getActiveLogFile();
 
         // Active VRChat log — never delete while it is being tailed
         File activeTail = this.scarlet.logs.currentTarget();
+        return collectEligible(this.dataRoot, cutoffMs, activeLog, activeTail);
+    }
+
+    /** Explicit root/active-file inputs also permit isolated filesystem regression tests. */
+    static List<File> collectEligible(Path data, long cutoffMs, File activeLog, File activeTail)
+    {
+        List<File> result = new ArrayList<>();
+        final Path root;
+        try { root = ScarletCleanupPaths.checkedRoot(data); }
+        catch (IOException | SecurityException invalid)
+        {
+            LOG.warn("Cache cleanup skipped: data directory could not be verified as an exact path");
+            return result;
+        }
+        File ttsDir = root.resolve("tts").toFile();
+        File scarletLogDir = root.resolve("logs").toFile();
+        File cachesDir = root.resolve("caches").toFile();
 
         // ── TTS .wav files ────────────────────────────────────────────────────
-        collectFromDir(this.ttsDir, cutoffMs, null, null, result);
+        collectFromDir(root, ttsDir, cutoffMs, activeLog, activeTail, result);
 
         // ── Scarlet log files ─────────────────────────────────────────────────
         // Only touch files matching the known log name pattern
-        if (this.scarletLogDir.isDirectory())
+        if (ScarletCleanupPaths.directory(root, scarletLogDir.toPath()))
         {
-            File[] logFiles = this.scarletLogDir.listFiles(
+            File[] logFiles = scarletLogDir.listFiles(
                 (dir, name) -> ScarletLogger.lfpattern.matcher(name).find());
             if (logFiles != null)
             {
                 for (File f : logFiles)
                 {
-                    if (isSameFile(f, activeLog))
+                    if (isSameFile(f, activeLog) || isSameFile(f, activeTail))
                         continue;  // never touch the live log
-                    if (f.lastModified() < cutoffMs)
+                    if (ScarletCleanupPaths.regularFile(root, f.toPath()) && f.lastModified() < cutoffMs)
                         result.add(f);
                 }
             }
         }
 
         // ── JSON cache subdirectories ─────────────────────────────────────────
-        if (this.cachesDir.isDirectory())
+        if (ScarletCleanupPaths.directory(root, cachesDir.toPath()))
         {
-            File[] kindDirs = this.cachesDir.listFiles(File::isDirectory);
+            File[] kindDirs = cachesDir.listFiles(f -> ScarletCleanupPaths.directory(root, f.toPath()));
             if (kindDirs != null)
             {
                 for (File kindDir : kindDirs)
-                    collectFromDir(kindDir, cutoffMs, activeTail, null, result);
+                    collectFromDir(root, kindDir, cutoffMs, activeLog, activeTail, result);
             }
         }
 
@@ -326,18 +338,18 @@ public class ScarletCacheCleanup
      * Scans a single directory for files older than cutoffMs, skipping
      * {@code skip1} and {@code skip2} if non-null.
      */
-    private static void collectFromDir(File dir, long cutoffMs,
+    private static void collectFromDir(Path root, File dir, long cutoffMs,
                                        File skip1, File skip2,
                                        List<File> result)
     {
-        if (!dir.isDirectory())
+        if (!ScarletCleanupPaths.directory(root, dir.toPath()))
             return;
-        File[] files = dir.listFiles(File::isFile);
+        File[] files = dir.listFiles(f -> ScarletCleanupPaths.regularFile(root, f.toPath()));
         if (files == null)
             return;
         for (File f : files)
         {
-            if (f.equals(skip1) || f.equals(skip2))
+            if (isSameFile(f, skip1) || isSameFile(f, skip2))
                 continue;
             if (f.lastModified() < cutoffMs)
                 result.add(f);
@@ -351,8 +363,11 @@ public class ScarletCacheCleanup
         long totalBytes = 0;
         for (File f : files)
         {
+            // The active file and directory layout can change while a confirmation is open.
+            if (isSameFile(f, ScarletLogger.getActiveLogFile()) || isSameFile(f, this.scarlet.logs.currentTarget()))
+                continue;
             long size = f.length();
-            if (f.delete())
+            if (deleteCollectedFile(this.dataRoot, f))
             {
                 deleted++;
                 totalBytes += size;
@@ -383,6 +398,22 @@ public class ScarletCacheCleanup
         }
 
         this.scarlet.settings.lastCacheCleanup.set(OffsetDateTime.now(ZoneOffset.UTC));
+    }
+
+    static boolean deleteCollectedFile(Path data, File file)
+    {
+        try
+        {
+            Path root = ScarletCleanupPaths.checkedRoot(data);
+            Path path = file.toPath().toAbsolutePath().normalize();
+            if (!ScarletCleanupPaths.regularFile(root, path)) return false;
+            Path relative = root.relativize(path);
+            if (relative.getNameCount() < 2) return false;
+            String category = relative.getName(0).toString();
+            if (!category.equals("caches") && !category.equals("tts") && !category.equals("logs")) return false;
+            return Files.deleteIfExists(path);
+        }
+        catch (IOException | SecurityException invalid) { return false; }
     }
 
 }

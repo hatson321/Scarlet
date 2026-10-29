@@ -216,19 +216,30 @@ public interface ScarletDiscord extends Closeable
         
         if (!entryMeta.hasAuxActor() && (scarlet.vrc.currentUserId == null || Objects.equals(scarlet.vrc.currentUserId, entry.getActorId())))
         {
-            String pendingActorId = scarlet.pendingModActions.pollPending(latype, entry.getTargetId());
-            if (pendingActorId != null)
+            ScarletPendingModActions.PendingAttribution attribution =
+                scarlet.pendingModActions.peekPendingAttribution(latype, entry.getTargetId());
+            if (attribution != null)
             {
-                entryMeta.auxActorId = pendingActorId;
-                User auxActor = scarlet.vrc.getUser(pendingActorId);
-                if (auxActor != null)
-                {
-                    entryMeta.auxActorDisplayName = auxActor.getDisplayName();
-                }
-                else
-                {
-                    entryMeta.auxActorDisplayName = pendingActorId;
-                }
+                entryMeta.auxActorId = attribution.actorUserId;
+                entryMeta.auxActorDisplayName = attribution.actorUserId;
+                entryMeta.setAuxData("pendingAttributionToken", attribution.token);
+            }
+        }
+
+        String attributionToken = entryMeta.getAuxData("pendingAttributionToken", (String)null, e -> e.getAsString());
+        if (entryMeta.hasAuxActor() && attributionToken != null)
+        {
+            // Never remove the source before its identity is committed to the outbox.
+            // In particular, a crash in the following user lookup must not lose the
+            // requester used by confidential-channel and history routing.
+            new ScarletAuditOutbox(scarlet.data.dir).save(entryMeta);
+            // Retrying after a crash may find either store or both. Only acknowledge
+            // this persisted attempt; a later reservation must never be consumed.
+            scarlet.pendingModActions.acknowledgePendingAttribution(latype, entry.getTargetId(), attributionToken);
+            if (Objects.equals(entryMeta.auxActorId, entryMeta.auxActorDisplayName))
+            {
+                User auxActor = scarlet.vrc.getUser(entryMeta.auxActorId);
+                if (auxActor != null) entryMeta.auxActorDisplayName = auxActor.getDisplayName();
             }
         }
         

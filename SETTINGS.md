@@ -20,6 +20,33 @@ Files containing the output of the application log.
 
 Files containing cached objects from the VRChat API
 
+## file `avatar-provider-cache.json`
+
+Starting with 0.6.1-a11, external avatar-provider results are saved privately inside
+the current Scarlet data profile. Repeated matching lookups can reuse these results
+after restarting Scarlet. This is separate from the VRChat API object cache above.
+
+- Successful results expire after 24 hours; successful empty results expire after
+  five minutes. Errors, timeouts and rate-limit responses are not cached as empty.
+- The cache retains at most 256 entries, with an 8 MiB total size ceiling and a
+  512 KiB ceiling per entry. Oversized successful results can still be used for the
+  current lookup without retaining them. Evicted or expired entries require a new lookup.
+- Results are kept separate for each provider, lookup mode, exact query and requested
+  result count. Avatar names alone are not treated as proof of an avatar's identity.
+- Only public avatar metadata is saved, not image files, login credentials or the
+  operator's identity. Query/provider keys are hashed, but the metadata is encoded,
+  **not encrypted**. Treat the file as private profile data.
+- Existing provider consent and selection still apply to cache hits. Disabling consent
+  prevents further use; it does not delete already saved metadata. Use **Settings →
+  Avatar search providers → Manage… → Clear saved avatar results** to clear it.
+- If Scarlet cannot safely protect or read the cache file, it logs a warning and
+  continues with a bounded memory-only cache. It does not weaken file permissions.
+
+Provider responses also have an 8 MiB transfer/decoded limit and a maximum of 5,000
+records (or the smaller requested count). Initializing or clearing the cache does
+not itself query a provider; normal opted-in searches and automatic avatar lookups
+still run as needed.
+
 ## file `caches/XXX/known_404s.json`
 
 List of ids known to return a `HTTP 404 Not Found` from the VRChat API

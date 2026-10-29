@@ -368,7 +368,8 @@ public class ScarletDiscordCommands
         @FeatureGate("avatar_search.enabled")
         public void avatar(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("search-query") String searchQuery, @SlashOpt("entries-per-page") int entriesPerPage) throws Exception
         {
-            MessageEmbed[] embeds = AvatarSearch.vrcxSearchAllCached(ScarletDiscordCommands.this.discord.getAvatarSearchProviders(), searchQuery)
+            java.util.function.BooleanSupplier current = ScarletDiscordCommands.this.discord.avatarProviderRequestGuard(() -> true);
+            MessageEmbed[] embeds = ScarletDiscordCommands.this.discord.searchAvatarProviders(searchQuery, AvatarSearch.SEARCH_N, current)
                 .map($ -> new EmbedBuilder()
                     .setAuthor($.authorName, VrcWeb.Home.user($.authorId), null)
                     .setTitle(MiscUtils.maybeEllipsis(256, $.name), VrcWeb.Home.avatar($.id))
@@ -377,6 +378,12 @@ public class ScarletDiscordCommands
                     .addField("Report avatar", MarkdownUtil.maskedLink("link", VRChatHelpDeskURLs.newModerationRequest_content_avatar(ScarletDiscordCommands.this.discord.requestingEmail.get(), $.id, "Avatar", null)), false)
                     .build())
                 .toArray(MessageEmbed[]::new);
+            if (!current.getAsBoolean())
+            {
+                hook.sendMessage("Avatar search unavailable or cancelled because the account or provider permissions changed.")
+                    .setEphemeral(true).queue();
+                return;
+            }
             ScarletDiscordCommands.this.discord.interactions.new Pagination(event.getId(), embeds, entriesPerPage).queue(hook);
         }
     }
@@ -2398,6 +2405,7 @@ public class ScarletDiscordCommands
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void vrchatUserUnban(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("vrchat-user") io.github.vrchatapi.model.User vrchatUser) throws Exception
     {
+        String requestedGroupId = this.discord.scarlet.vrc.groupId, requestedGuildId = this.discord.guildSf;
         String vrcTargetId = VrcIds.getAsString_user(event.getOption("vrchat-user"));
         if (ScarletSimulation.isTrainingId(vrcTargetId))
         {
@@ -2425,22 +2433,12 @@ public class ScarletDiscordCommands
                 return;
             }
         }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, hook))
-            return;
-        
-        GroupMemberStatus status = this.discord.scarlet.vrc.getGroupMembershipStatus(this.discord.scarlet.vrc.groupId, vrcTargetId);
-        if (status != GroupMemberStatus.BANNED)
+        ScarletDiscordJDA.VRChatBanAttempt attempt = this.discord.executeVRChatUnban(
+            new ScarletDiscord.Action("unban", vrcActorId, vrcTargetId, null, event.getUser().getId(), requestedGuildId, requestedGroupId),
+            net.sybyline.scarlet.server.discord.DPerms.PermType.SLASH_COMMAND, "vrchat-user-unban");
+        if (!attempt.succeeded())
         {
-            hook.sendMessage("This VRChat user is not banned").setEphemeral(true).queue();
-        }
-        else if (this.discord.scarlet.pendingModActions.addPending(GroupAuditType.USER_UNBAN, vrcTargetId, vrcActorId) != null)
-        {
-            hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
-        }
-        else if (!this.discord.scarlet.vrc.unbanFromGroup(vrcTargetId))
-        {
-            this.discord.scarlet.pendingModActions.pollPending(GroupAuditType.USER_UNBAN, vrcTargetId);
-            hook.sendMessageFormat("Failed to unban %s", vrchatUser.getDisplayName()).setEphemeral(true).queue();
+            hook.sendMessage(attempt.message).setEphemeral(true).queue();
         }
         else
         {

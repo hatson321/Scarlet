@@ -15,6 +15,66 @@ class EncryptedPrefsDurabilityTest
 {
     @TempDir Path directory;
 
+    @Test void failedRecoveryStorageAbortsReseedAndPreservesEveryRegistryValue() throws Exception
+    {
+        Path blocker = Files.writeString(directory.resolve("not-a-directory"), "blocker");
+        MemoryPreferences registry = new MemoryPreferences(null, "");
+        String key = EncryptedPrefs.masterPasswordKey(registry.absolutePath(), "synthetic-password");
+        registry.putByteArray(key, new byte[] { 1, 2, 3, 4 });
+        registry.put("synthetic-credential-record", "preserve-exact-record");
+        Map<String, String> before = new HashMap<>(registry.values);
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+            () -> new EncryptedPrefs(registry, "synthetic-password", blocker.toFile()));
+        assertTrue(failure.getMessage().contains("original seed was preserved"));
+        assertEquals(before, registry.values);
+        assertEquals("blocker", Files.readString(blocker));
+    }
+
+    @Test void malformedBase64SeedStillRequiresVerifiedRecoveryBeforeReseed() throws Exception
+    {
+        Path blocker = Files.writeString(directory.resolve("not-a-directory"), "blocker");
+        MemoryPreferences registry = new MemoryPreferences(null, "");
+        registry.put(EncryptedPrefs.masterPasswordKey(registry.absolutePath(), "synthetic-password"), "not-base64!");
+        Map<String, String> before = new HashMap<>(registry.values);
+        assertThrows(IllegalStateException.class, () -> new EncryptedPrefs(registry, "synthetic-password", blocker.toFile()));
+        assertEquals(before, registry.values);
+    }
+
+    @Test void failedRegistrySnapshotEnumerationAbortsReseed() throws Exception
+    {
+        MemoryPreferences registry = new MemoryPreferences(null, "");
+        registry.putByteArray(EncryptedPrefs.masterPasswordKey(registry.absolutePath(), "synthetic-password"), new byte[] { 5, 6 });
+        Map<String, String> before = new HashMap<>(registry.values);
+        registry.failKeysAfter = 0;
+        assertThrows(IllegalStateException.class, () -> new EncryptedPrefs(registry, "synthetic-password", directory.toFile()));
+        assertEquals(before, registry.values);
+        assertFalse(Files.exists(directory.resolve("secure-prefs.dat")));
+    }
+
+    @Test void reseedRequiresAndPreservesAnExactReadableRegistryRecoverySnapshot() throws Exception
+    {
+        MemoryPreferences registry = new MemoryPreferences(null, "");
+        String key = EncryptedPrefs.masterPasswordKey(registry.absolutePath(), "synthetic-password");
+        registry.putByteArray(key, new byte[] { 1, 2, 3, 4 });
+        registry.put("synthetic-credential-record", "preserve-exact-record");
+        registry.put("lastRunVersion", "synthetic-version");
+        Map<String, String> before = new HashMap<>(registry.values);
+        new EncryptedPrefs(registry, "synthetic-password", directory.toFile());
+        java.util.List<Path> snapshots;
+        try (java.util.stream.Stream<Path> files = Files.list(directory))
+        {
+            snapshots = files.filter(path -> path.getFileName().toString().startsWith("secure-prefs.registry-backup-"))
+                .collect(java.util.stream.Collectors.toList());
+        }
+        assertEquals(1, snapshots.size());
+        java.util.Properties recovery = new java.util.Properties();
+        try (java.io.InputStream input = Files.newInputStream(snapshots.get(0))) { recovery.load(input); }
+        assertEquals(before.size(), recovery.size());
+        before.forEach((name, value) -> assertEquals(value, recovery.getProperty("s:" + name)));
+        assertNotEquals(before.get(key), registry.values.get(key));
+        assertNotNull(EncryptedPrefs.tryReadLocalPassword(registry, "synthetic-password"));
+    }
+
     @Test void failedMirrorStorageNeverDeletesRegistryCredentials() throws Exception
     {
         Path blocker = directory.resolve("not-a-directory");

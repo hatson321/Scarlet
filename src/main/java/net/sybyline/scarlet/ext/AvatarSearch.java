@@ -1,15 +1,21 @@
 package net.sybyline.scarlet.ext;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.SocketTimeoutException;
 import java.time.OffsetDateTime;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Stream;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.InflaterInputStream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,7 +32,7 @@ import com.google.gson.stream.JsonWriter;
 
 import net.sybyline.scarlet.util.HttpURLInputStream;
 import net.sybyline.scarlet.util.JsonAdapters;
-import net.sybyline.scarlet.util.LRUMap;
+import net.sybyline.scarlet.ScarletAvatarProviderCache;
 import net.sybyline.scarlet.util.URLs;
 
 public interface AvatarSearch
@@ -34,6 +40,7 @@ public interface AvatarSearch
 
     int SEARCH_N = 5000;
     int HYDRATION_SEARCH_N = 50;
+    int MAX_PROVIDER_RESPONSE_BYTES = 8 * 1024 * 1024;
     // A new key requires explicit confirmation instead of trusting the former plain checkbox.
     String IDENTIFIED_LOOKUP_CONSENT_KEY = "avatar_search_identified_lookups_consent_v2";
     Logger LOG = LoggerFactory.getLogger("Scarlet/AvatarSearch");
@@ -45,7 +52,7 @@ public interface AvatarSearch
          ERROR_LOG_THROTTLE_MILLIS = TimeUnit.MINUTES.toMillis(1L);
     // After this many consecutive failures a provider is treated as long-term
     // down: we stop warning and only whisper at TRACE, so a dead or gated host
-    // can't flood the console for the rest of the session.
+        // can't flood the console for the rest of the session.
     int QUIET_AFTER_STREAK = 3;
     Map<String, Long> providerBlockedUntil = new ConcurrentHashMap<>(),
                       providerLastLog = new ConcurrentHashMap<>();
@@ -129,15 +136,14 @@ public interface AvatarSearch
         boolean throttleElapsed = last == null || now - last.longValue() >= ERROR_LOG_THROTTLE_MILLIS;
         // One warning when a provider first goes down, one more when we give up
         // on it, then silence. Stack traces for these expected network failures
-        // (DNS, HTTP 4xx/5xx, timeouts) never reach WARN or DEBUG -- they say
-        // nothing the message doesn't -- and only go to TRACE for deep debugging.
+        // (DNS, HTTP 4xx/5xx, timeouts) never include query text, configured URLs,
+        // response bodies or exception details in the log.
         if (streak <= 1)
-            LOG.warn("Avatar search provider unavailable: {} ({})", urlRoot, message);
+            LOG.warn("Avatar search provider unavailable ({})", message);
         else if (streak == QUIET_AFTER_STREAK)
-            LOG.warn("Avatar search provider still unavailable after {} tries; backing off and suppressing further warnings: {} ({})", Integer.valueOf(streak), urlRoot, message);
+            LOG.warn("Avatar search provider still unavailable after {} tries; backing off and suppressing further warnings ({})", Integer.valueOf(streak), message);
         else if (throttleElapsed)
-            LOG.debug("Avatar search provider still unavailable: {} ({})", urlRoot, message);
-        LOG.trace("Avatar search provider failure detail: {}", urlRoot, throwable);
+            LOG.debug("Avatar search provider still unavailable ({})", message);
     }
 
     /** Clears a provider's failure state after a successful query, noting recovery if it had been given up on. */
@@ -147,7 +153,7 @@ public interface AvatarSearch
         providerBlockedUntil.remove(urlRoot);
         providerLastLog.remove(urlRoot);
         if (streak != null && streak.intValue() >= QUIET_AFTER_STREAK)
-            LOG.info("Avatar search provider recovered: {}", urlRoot);
+            LOG.info("An avatar search provider recovered");
     }
 
     /** Forgets all provider backoffs, e.g. after the user deliberately changes the provider list. */
@@ -194,30 +200,30 @@ public interface AvatarSearch
         String lower = message.toLowerCase();
         int httpCode = httpResponseCode(message);
         if (message.contains("429") || httpCode == 429)
-            blockProvider(urlRoot, RATE_LIMIT_BACKOFF_MILLIS, "rate limited while searching `"+search+"`", ex);
+            blockProvider(urlRoot, RATE_LIMIT_BACKOFF_MILLIS, "rate limited", ex);
         else if (ex instanceof SocketTimeoutException || lower.contains("timed out"))
-            blockProvider(urlRoot, TIMEOUT_BACKOFF_MILLIS, "timed out while searching `"+search+"`", ex);
+            blockProvider(urlRoot, TIMEOUT_BACKOFF_MILLIS, "request timed out", ex);
         else if (ex instanceof com.google.gson.JsonSyntaxException || message.contains("Expected BEGIN"))
             // The provider is up but not speaking the expected format (endpoint moved,
             // maintenance page, HTML error, ...). Retrying immediately can't succeed and
             // just spams the log with parse stack traces, so back off like a rate limit.
-            blockProvider(urlRoot, RATE_LIMIT_BACKOFF_MILLIS, "returned a malformed response while searching `"+search+"`", ex);
+            blockProvider(urlRoot, RATE_LIMIT_BACKOFF_MILLIS, "returned a malformed or oversized response", ex);
         else if (httpCode >= 400 && httpCode < 500)
             // Client error: 403 gated (needs a key), 404/410 gone, 401 unauthorized.
             // None of these fix themselves on retry, so back off hard.
-            blockProvider(urlRoot, GONE_BACKOFF_MILLIS, "returned HTTP "+httpCode+" while searching `"+search+"`", ex);
+            blockProvider(urlRoot, GONE_BACKOFF_MILLIS, "returned HTTP "+httpCode, ex);
         else if (httpCode >= 500)
-            blockProvider(urlRoot, SERVER_ERROR_BACKOFF_MILLIS, "returned HTTP "+httpCode+" while searching `"+search+"`", ex);
+            blockProvider(urlRoot, SERVER_ERROR_BACKOFF_MILLIS, "returned HTTP "+httpCode, ex);
         else if (ex instanceof java.net.UnknownHostException
               || lower.contains("no route")
               || lower.contains("refused")
               || lower.contains("name or service not known")
               || lower.contains("connection reset"))
             // DNS or connection failure: the host is down or gone. Back off long.
-            blockProvider(urlRoot, GONE_BACKOFF_MILLIS, "unreachable while searching `"+search+"` ("+message+")", ex);
+            blockProvider(urlRoot, GONE_BACKOFF_MILLIS, "provider unreachable", ex);
         else
             // Anything else unrecognised: still back off briefly so it can't spin.
-            blockProvider(urlRoot, TIMEOUT_BACKOFF_MILLIS, "search failed for `"+search+"`: "+message, ex);
+            blockProvider(urlRoot, TIMEOUT_BACKOFF_MILLIS, "request failed", ex);
     }
 
     /** Parses the numeric code out of "Server returned HTTP response code: NNN for URL: ..." (0 if absent). */
@@ -241,8 +247,6 @@ public interface AvatarSearch
     class VrcxAvatar
     {
         static final VrcxAvatar[] NONE = new VrcxAvatar[0];
-        static final Map<String, Map<String, VrcxAvatar[]>> searchCacheByUrlRoot = new ConcurrentHashMap<>(),
-                                                            searchCacheByUrlRootByImage = new ConcurrentHashMap<>();
         
         @SerializedName(value = "id", alternate = { "avatarId", "avatar_id", "vrcId", "vrc_id" })
         public String id;
@@ -627,21 +631,96 @@ public interface AvatarSearch
 
     static VrcxAvatar[] vrcxSearch0(String urlRoot, int n, String search)
     {
-        if (!urlRoot.startsWith("http://") && !urlRoot.startsWith("https://"))
-            return VrcxAvatar.NONE;
+        int count = resultLimit(n);
+        if (!validProvider(urlRoot) || search == null)
+            return null;
         if (!providerAvailable(urlRoot))
             return null;
-        try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&search=" + URLs.encode(search)))
+        try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + count + "&search=" + URLs.encode(search)))
         {
-            VrcxAvatar[] results = parseVrcxResults(in.readAsJson(null, null, JsonElement.class));
+            VrcxAvatar[] results = readVrcxResults(in, in.connection().getContentEncoding(), count);
             providerSucceeded(urlRoot);
-            LOG.debug("{} returned {} result(s) for `{}`", urlRoot, results.length, search);
+            LOG.debug("Avatar search provider returned {} result(s)", results.length);
             return results;
         }
         catch (Exception ex)
         {
             handleSearchFailure(urlRoot, search, ex);
             return null;
+        }
+    }
+
+    static int resultLimit(int n)
+    {
+        if (n <= 0) throw new IllegalArgumentException("Avatar search count must be positive");
+        return Math.min(n, SEARCH_N);
+    }
+
+    static boolean validProvider(String provider)
+    {
+        return provider != null && (provider.startsWith("http://") || provider.startsWith("https://"));
+    }
+
+    static boolean lookupAllowed(BooleanSupplier allowed)
+    {
+        try { return allowed != null && allowed.getAsBoolean(); }
+        catch (RuntimeException ex) { return false; }
+    }
+
+    static Stream<String> selectedProviderStream(String[] providers)
+    {
+        return Arrays.stream(providers == null ? new String[0] : providers.clone())
+            .filter(Objects::nonNull).map(String::trim).filter(value -> !value.isEmpty()).distinct();
+    }
+
+    /** Reject oversized transfer and decoded bodies before Gson is allowed to allocate a JSON tree. */
+    static VrcxAvatar[] readVrcxResults(InputStream response, String contentEncoding, int n) throws IOException
+    {
+        int limit = resultLimit(n);
+        String encoding = contentEncoding == null ? "" : contentEncoding.trim();
+        InputStream bounded = new ProviderResponseInput(response);
+        InputStream decoded;
+        if (encoding.isEmpty() || "identity".equalsIgnoreCase(encoding)) decoded = bounded;
+        else if ("gzip".equalsIgnoreCase(encoding)) decoded = new GZIPInputStream(bounded);
+        else if ("deflate".equalsIgnoreCase(encoding)) decoded = new InflaterInputStream(bounded);
+        else throw new JsonSyntaxException("Unsupported avatar provider content encoding");
+        try (InputStream body = decoded; ByteArrayOutputStream bytes = new ByteArrayOutputStream(8192))
+        {
+            byte[] buffer = new byte[8192];
+            int total = 0, read;
+            while ((read = body.read(buffer, 0, Math.min(buffer.length, MAX_PROVIDER_RESPONSE_BYTES - total + 1))) != -1)
+            {
+                total += read;
+                if (total > MAX_PROVIDER_RESPONSE_BYTES)
+                    throw new JsonSyntaxException("Avatar provider response exceeds the byte limit");
+                bytes.write(buffer, 0, read);
+            }
+            JsonElement json = HttpURLInputStream.readJson(new ByteArrayInputStream(bytes.toByteArray()), null, null, JsonElement.class);
+            return parseVrcxResults(json, limit);
+        }
+    }
+
+    final class ProviderResponseInput extends FilterInputStream
+    {
+        private int count;
+        ProviderResponseInput(InputStream input) { super(Objects.requireNonNull(input, "response")); }
+        private void counted(int read)
+        {
+            if (read > 0 && (this.count += read) > MAX_PROVIDER_RESPONSE_BYTES)
+                throw new JsonSyntaxException("Avatar provider response exceeds the byte limit");
+        }
+        @Override public int read() throws IOException
+        {
+            int value = this.in.read();
+            if (value != -1) this.counted(1);
+            return value;
+        }
+        @Override public int read(byte[] bytes, int offset, int length) throws IOException
+        {
+            if (length == 0) return 0;
+            int read = this.in.read(bytes, offset, Math.min(length, MAX_PROVIDER_RESPONSE_BYTES - this.count + 1));
+            this.counted(read);
+            return read;
         }
     }
 
@@ -655,6 +734,12 @@ public interface AvatarSearch
      */
     static VrcxAvatar[] parseVrcxResults(JsonElement json)
     {
+        return parseVrcxResults(json, SEARCH_N);
+    }
+
+    static VrcxAvatar[] parseVrcxResults(JsonElement json, int n)
+    {
+        int limit = resultLimit(n);
         JsonArray array = null;
         if (json != null && json.isJsonArray())
         {
@@ -675,9 +760,10 @@ public interface AvatarSearch
         }
         if (array == null)
             throw new JsonSyntaxException("unrecognized avatar search response shape");
-        java.util.List<VrcxAvatar> out = new java.util.ArrayList<>(array.size());
+        java.util.List<VrcxAvatar> out = new java.util.ArrayList<>(Math.min(array.size(), limit));
         for (JsonElement element : array)
         {
+            if (out.size() >= limit) break;
             if (!element.isJsonObject())
                 continue;
             JsonObject entry = element.getAsJsonObject();
@@ -696,25 +782,28 @@ public interface AvatarSearch
             try
             {
                 VrcxAvatar avatar = net.sybyline.scarlet.Scarlet.GSON.fromJson(entry, VrcxAvatar.class);
-                if (avatar != null && avatar.id != null)
+                if (avatar != null && avatar.id != null && !avatar.id.trim().isEmpty())
                     out.add(avatar);
             }
             catch (RuntimeException ignored)
             {
             }
         }
+        if (!array.isEmpty() && out.isEmpty())
+            throw new JsonSyntaxException("Avatar provider response contains no usable records");
         return out.toArray(new VrcxAvatar[0]);
     }
-    static VrcxAvatar[] vrcxFindInCache(String urlRoot, String search)
+    /** Compatibility search wrappers retain only a bounded process-local cache. */
+    final class LegacyCacheHolder
     {
-        return VrcxAvatar.searchCacheByUrlRoot.getOrDefault(urlRoot, Collections.emptyMap()).get(search);
+        private LegacyCacheHolder() { }
+        static final ScarletAvatarProviderCache CACHE = new ScarletAvatarProviderCache(null);
     }
-    static VrcxAvatar[] vrcxPutInCache(String urlRoot, String search, VrcxAvatar[] results)
+
+    static VrcxAvatar[] boundedResults(VrcxAvatar[] results, int n)
     {
-        if (results == null)
-            return null;
-        VrcxAvatar.searchCacheByUrlRoot.computeIfAbsent(urlRoot, urlRoot0 -> LRUMap.ofSynchronized()).put(search, results);
-        return results;
+        int limit = resultLimit(n);
+        return results == null ? null : results.length <= limit ? results : Arrays.copyOf(results, limit);
     }
     static VrcxAvatar[] vrcxSearchCached(String urlRoot, String search)
     {
@@ -722,22 +811,16 @@ public interface AvatarSearch
     }
     static VrcxAvatar[] vrcxSearchCached(String urlRoot, int n, String search)
     {
-        Map<String, VrcxAvatar[]> urlCache;
-        synchronized (VrcxAvatar.searchCacheByUrlRoot) {
-            urlCache = VrcxAvatar.searchCacheByUrlRoot.computeIfAbsent(urlRoot, urlRoot0 -> LRUMap.ofSynchronized());
-        }
-        
-        synchronized (urlCache) {
-            String key = cacheKey(n, search);
-            VrcxAvatar[] cached = urlCache.get(key);
-            if (cached == null) {
-                cached = AvatarSearch.vrcxSearch(urlRoot, n, search);
-                if (cached != null) {
-                    urlCache.put(key, cached);
-                }
-            }
-            return cached;
-        }
+        return vrcxSearchCached(LegacyCacheHolder.CACHE, urlRoot, n, search, () -> true);
+    }
+    static VrcxAvatar[] vrcxSearchCached(ScarletAvatarProviderCache cache, String urlRoot, int n,
+        String search, BooleanSupplier allowed)
+    {
+        resultLimit(n);
+        if (cache == null || !validProvider(urlRoot) || search == null || !lookupAllowed(allowed)) return null;
+        VrcxAvatar[] results = cache.get(urlRoot, "text", n, search, allowed,
+            () -> lookupAllowed(allowed) ? vrcxSearch0(urlRoot, n, search) : null);
+        return lookupAllowed(allowed) ? boundedResults(results, n) : null;
     }
     static VrcxAvatar[] vrcxSearch(String urlRoot, String search)
     {
@@ -745,10 +828,7 @@ public interface AvatarSearch
     }
     static VrcxAvatar[] vrcxSearch(String urlRoot, int n, String search)
     {
-        VrcxAvatar[] results = vrcxSearch0(urlRoot, n, search);
-        if (n == SEARCH_N && results != null)
-            vrcxPutInCache(urlRoot, cacheKey(n, search), results);
-        return results;
+        return vrcxSearch0(urlRoot, n, search);
     }
     static Stream<VrcxAvatar> vrcxSearchAllCached(String search)
     {
@@ -760,12 +840,19 @@ public interface AvatarSearch
     }
     static Stream<VrcxAvatar> vrcxSearchAllCached(String[] urlRoots, int n, String search)
     {
-        return Arrays.stream(urlRoots)
-            .filter(Objects::nonNull)
-            .map($ -> vrcxSearchCached($, n, search))
+        return vrcxSearchAllCached(LegacyCacheHolder.CACHE, urlRoots, n, search, () -> true);
+    }
+    static Stream<VrcxAvatar> vrcxSearchAllCached(ScarletAvatarProviderCache cache, String[] urlRoots, int n,
+        String search, BooleanSupplier allowed)
+    {
+        resultLimit(n);
+        if (cache == null || search == null || !lookupAllowed(allowed)) return Stream.empty();
+        return selectedProviderStream(urlRoots)
+            .map($ -> vrcxSearchCached(cache, $, n, search, allowed))
             .filter(Objects::nonNull)
             .flatMap(Arrays::stream)
             .filter(Objects::nonNull)
+            .filter(ignored -> lookupAllowed(allowed))
         ;
     }
     static Stream<VrcxAvatar> vrcxSearchAll(String search)
@@ -774,8 +861,7 @@ public interface AvatarSearch
     }
     static Stream<VrcxAvatar> vrcxSearchAll(String[] urlRoots, String search)
     {
-        return Arrays.stream(urlRoots)
-            .filter(Objects::nonNull)
+        return selectedProviderStream(urlRoots)
             .map($ -> vrcxSearch($, SEARCH_N, search))
             .filter(Objects::nonNull)
             .flatMap(Arrays::stream)
@@ -795,13 +881,14 @@ public interface AvatarSearch
         };
         static VrcxAvatar[] vrcxSearch0ByImage(String urlRoot, int n, String imageFileId)
         {
-            if (!urlRoot.startsWith("http://") && !urlRoot.startsWith("https://"))
-                return VrcxAvatar.NONE;
+            int count = resultLimit(n);
+            if (!validProvider(urlRoot) || imageFileId == null)
+                return null;
             if (!providerAvailable(urlRoot))
                 return null;
-            try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&fileId=" + URLs.encode(imageFileId)))
+            try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + count + "&fileId=" + URLs.encode(imageFileId)))
             {
-                VrcxAvatar[] results = parseVrcxResults(in.readAsJson(null, null, JsonElement.class));
+                VrcxAvatar[] results = readVrcxResults(in, in.connection().getContentEncoding(), count);
                 providerSucceeded(urlRoot);
                 return results;
             }
@@ -811,39 +898,22 @@ public interface AvatarSearch
                 return null;
             }
         }
-        static VrcxAvatar[] vrcxFindInCacheByImage(String urlRoot, String imageFileId)
-        {
-            return VrcxAvatar.searchCacheByUrlRootByImage.getOrDefault(urlRoot, Collections.emptyMap()).get(imageFileId);
-        }
-        static VrcxAvatar[] vrcxPutInCacheByImage(String urlRoot, String imageFileId, VrcxAvatar[] results)
-        {
-            if (results == null)
-                return null;
-            VrcxAvatar.searchCacheByUrlRootByImage.computeIfAbsent(urlRoot, urlRoot0 -> LRUMap.ofSynchronized()).put(imageFileId, results);
-            return results;
-        }
         static VrcxAvatar[] vrcxSearchCachedByImage(String urlRoot, String imageFileId)
         {
             return vrcxSearchCachedByImage(urlRoot, SEARCH_N, imageFileId);
         }
         static VrcxAvatar[] vrcxSearchCachedByImage(String urlRoot, int n, String imageFileId)
         {
-            Map<String, VrcxAvatar[]> urlCache;
-            synchronized (VrcxAvatar.searchCacheByUrlRootByImage) {
-                urlCache = VrcxAvatar.searchCacheByUrlRootByImage.computeIfAbsent(urlRoot, urlRoot0 -> LRUMap.ofSynchronized());
-            }
-            
-            synchronized (urlCache) {
-                String key = cacheKey(n, imageFileId);
-                VrcxAvatar[] cached = urlCache.get(key);
-                if (cached == null) {
-                    cached = AvatarSearch.ByImage.vrcxSearchByImage(urlRoot, n, imageFileId);
-                    if (cached != null) {
-                        urlCache.put(key, cached);
-                    }
-                }
-                return cached;
-            }
+            return vrcxSearchCachedByImage(LegacyCacheHolder.CACHE, urlRoot, n, imageFileId, () -> true);
+        }
+        static VrcxAvatar[] vrcxSearchCachedByImage(ScarletAvatarProviderCache cache, String urlRoot, int n,
+            String imageFileId, BooleanSupplier allowed)
+        {
+            resultLimit(n);
+            if (cache == null || !validProvider(urlRoot) || imageFileId == null || !lookupAllowed(allowed)) return null;
+            VrcxAvatar[] results = cache.get(urlRoot, "image", n, imageFileId, allowed,
+                () -> lookupAllowed(allowed) ? vrcxSearch0ByImage(urlRoot, n, imageFileId) : null);
+            return lookupAllowed(allowed) ? boundedResults(results, n) : null;
         }
         static VrcxAvatar[] vrcxSearchByImage(String urlRoot, String imageFileId)
         {
@@ -851,10 +921,7 @@ public interface AvatarSearch
         }
         static VrcxAvatar[] vrcxSearchByImage(String urlRoot, int n, String imageFileId)
         {
-            VrcxAvatar[] results = vrcxSearch0ByImage(urlRoot, n, imageFileId);
-            if (n == SEARCH_N && results != null)
-                vrcxPutInCacheByImage(urlRoot, cacheKey(n, imageFileId), results);
-            return results;
+            return vrcxSearch0ByImage(urlRoot, n, imageFileId);
         }
         static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(String imageFileId)
         {
@@ -862,12 +929,18 @@ public interface AvatarSearch
         }
         static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(String[] urlRoots, String imageFileId)
         {
-            return Arrays.stream(urlRoots)
-                .filter(Objects::nonNull)
-                .map($ -> vrcxSearchCachedByImage($, SEARCH_N, imageFileId))
+            return vrcxSearchAllCachedByImage(LegacyCacheHolder.CACHE, urlRoots, imageFileId, () -> true);
+        }
+        static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(ScarletAvatarProviderCache cache, String[] urlRoots,
+            String imageFileId, BooleanSupplier allowed)
+        {
+            if (cache == null || imageFileId == null || !lookupAllowed(allowed)) return Stream.empty();
+            return selectedProviderStream(urlRoots)
+                .map($ -> vrcxSearchCachedByImage(cache, $, SEARCH_N, imageFileId, allowed))
                 .filter(Objects::nonNull)
                 .flatMap(Arrays::stream)
                 .filter(Objects::nonNull)
+                .filter(ignored -> lookupAllowed(allowed))
             ;
         }
         static Stream<VrcxAvatar> vrcxSearchAllByImage(String imageFileId)
@@ -876,8 +949,7 @@ public interface AvatarSearch
         }
         static Stream<VrcxAvatar> vrcxSearchAllByImage(String[] urlRoots, String imageFileId)
         {
-            return Arrays.stream(urlRoots)
-                .filter(Objects::nonNull)
+            return selectedProviderStream(urlRoots)
                 .map($ -> vrcxSearchByImage($, SEARCH_N, imageFileId))
                 .filter(Objects::nonNull)
                 .flatMap(Arrays::stream)
@@ -906,14 +978,15 @@ public interface AvatarSearch
 
         static VrcxAvatar[] vrcxSearch0ByAuthor(String urlRoot, int n, String authorId)
         {
-            if (!urlRoot.startsWith("http://") && !urlRoot.startsWith("https://"))
-                return VrcxAvatar.NONE;
+            int count = resultLimit(n);
+            if (!validProvider(urlRoot) || authorId == null)
+                return null;
             String stateKey = authorStateKey(urlRoot);
             if (!providerAvailable(stateKey))
                 return null;
-            try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&authorId=" + URLs.encode(authorId)))
+            try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + count + "&authorId=" + URLs.encode(authorId)))
             {
-                VrcxAvatar[] results = parseVrcxResults(in.readAsJson(null, null, JsonElement.class));
+                VrcxAvatar[] results = readVrcxResults(in, in.connection().getContentEncoding(), count);
                 providerSucceeded(stateKey);
                 return results;
             }
@@ -926,22 +999,16 @@ public interface AvatarSearch
 
         static VrcxAvatar[] vrcxSearchCachedByAuthor(String urlRoot, int n, String authorId)
         {
-            String cacheRoot = authorStateKey(urlRoot);
-            Map<String, VrcxAvatar[]> urlCache;
-            synchronized (VrcxAvatar.searchCacheByUrlRootByImage) {
-                urlCache = VrcxAvatar.searchCacheByUrlRootByImage.computeIfAbsent(cacheRoot, r -> LRUMap.ofSynchronized());
-            }
-            synchronized (urlCache) {
-                String key = cacheKey(n, authorId);
-                VrcxAvatar[] cached = urlCache.get(key);
-                if (cached == null) {
-                    cached = vrcxSearch0ByAuthor(urlRoot, n, authorId);
-                    if (cached != null) {
-                        urlCache.put(key, cached);
-                    }
-                }
-                return cached;
-            }
+            return vrcxSearchCachedByAuthor(LegacyCacheHolder.CACHE, urlRoot, n, authorId, () -> true);
+        }
+        static VrcxAvatar[] vrcxSearchCachedByAuthor(ScarletAvatarProviderCache cache, String urlRoot, int n,
+            String authorId, BooleanSupplier allowed)
+        {
+            resultLimit(n);
+            if (cache == null || !validProvider(urlRoot) || authorId == null || !lookupAllowed(allowed)) return null;
+            VrcxAvatar[] results = cache.get(urlRoot, "author", n, authorId, allowed,
+                () -> lookupAllowed(allowed) ? vrcxSearch0ByAuthor(urlRoot, n, authorId) : null);
+            return lookupAllowed(allowed) ? boundedResults(results, n) : null;
         }
 
         /** Does this avatar's image or thumbnail reference the given VRChat file id? */
@@ -961,17 +1028,21 @@ public interface AvatarSearch
          */
         static Stream<VrcxAvatar> vrcxSearchAllByImageViaAuthor(String[] selectedProviders, String imageFileId, String authorId)
         {
-            if (imageFileId == null || authorId == null || authorId.isEmpty())
+            return vrcxSearchAllByImageViaAuthor(LegacyCacheHolder.CACHE, selectedProviders, imageFileId, authorId, () -> true);
+        }
+        static Stream<VrcxAvatar> vrcxSearchAllByImageViaAuthor(ScarletAvatarProviderCache cache, String[] selectedProviders,
+            String imageFileId, String authorId, BooleanSupplier allowed)
+        {
+            if (cache == null || imageFileId == null || authorId == null || authorId.isEmpty() || !lookupAllowed(allowed))
                 return Stream.empty();
-            return Arrays.stream(selectedProviders == null ? new String[0] : selectedProviders)
-                .filter(Objects::nonNull)
+            return selectedProviderStream(selectedProviders)
                 .filter(url -> !URL_ROOT_AVTRDB.equals(url))
-                .distinct()
-                .map($ -> vrcxSearchCachedByAuthor($, SEARCH_N, authorId))
+                .map($ -> vrcxSearchCachedByAuthor(cache, $, SEARCH_N, authorId, allowed))
                 .filter(Objects::nonNull)
                 .flatMap(Arrays::stream)
                 .filter(Objects::nonNull)
                 .filter($ -> imageMatchesFileId($, imageFileId))
+                .filter(ignored -> lookupAllowed(allowed))
             ;
         }
 
@@ -985,8 +1056,15 @@ public interface AvatarSearch
         /** Cached by-image with author fallback. */
         static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(String[] selectedProviders, String imageFileId, String authorId)
         {
+            return vrcxSearchAllCachedByImage(LegacyCacheHolder.CACHE, selectedProviders, imageFileId, authorId, () -> true);
+        }
+        static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(ScarletAvatarProviderCache cache, String[] selectedProviders,
+            String imageFileId, String authorId, BooleanSupplier allowed)
+        {
+            if (cache == null || !lookupAllowed(allowed)) return Stream.empty();
             String[] direct = selectedImageProviders(selectedProviders);
-            return Stream.concat(vrcxSearchAllCachedByImage(direct, imageFileId), vrcxSearchAllByImageViaAuthor(selectedProviders, imageFileId, authorId));
+            return Stream.concat(vrcxSearchAllCachedByImage(cache, direct, imageFileId, allowed),
+                vrcxSearchAllByImageViaAuthor(cache, selectedProviders, imageFileId, authorId, allowed));
         }
 
         static String[] selectedImageProviders(String[] selectedProviders)
@@ -994,7 +1072,7 @@ public interface AvatarSearch
             if (selectedProviders == null)
                 return new String[0];
             java.util.Set<String> supported = new java.util.HashSet<>(Arrays.asList(BY_IMAGE_URL_ROOTS));
-            return Arrays.stream(selectedProviders).filter(Objects::nonNull).filter(supported::contains).distinct().toArray(String[]::new);
+            return selectedProviderStream(selectedProviders).filter(supported::contains).toArray(String[]::new);
         }
     }
 

@@ -1101,18 +1101,16 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
 
     private Stream<AvatarSearch.VrcxAvatar> searchAvatarRecords(String name, BooleanSupplier allowed)
     {
-        return Arrays.stream(this.avatarSearchProviders()).flatMap(provider ->
-            allowed.getAsBoolean() && Arrays.asList(this.avatarSearchProviders()).contains(provider)
-                ? AvatarSearch.vrcxSearchAllCached(new String[]{provider}, AvatarSearch.HYDRATION_SEARCH_N, name)
-                : Stream.empty());
+        return this.scarlet.discord instanceof ScarletDiscordJDA
+            ? ((ScarletDiscordJDA)this.scarlet.discord).searchAvatarProviders(name, AvatarSearch.HYDRATION_SEARCH_N, allowed)
+            : Stream.empty();
     }
 
     private Stream<AvatarSearch.VrcxAvatar> searchAvatarImage(String[] providers, String image, String author, BooleanSupplier allowed)
     {
-        return Arrays.stream(providers).flatMap(provider ->
-            allowed.getAsBoolean() && Arrays.asList(this.avatarSearchProviders()).contains(provider)
-                ? AvatarSearch.ByImage.vrcxSearchAllCachedByImage(new String[]{provider}, image, author)
-                : Stream.empty());
+        return this.scarlet.discord instanceof ScarletDiscordJDA
+            ? ((ScarletDiscordJDA)this.scarlet.discord).searchAvatarProviderImages(providers, image, author, allowed)
+            : Stream.empty();
     }
 
     private String[] avatarSearchProviders()

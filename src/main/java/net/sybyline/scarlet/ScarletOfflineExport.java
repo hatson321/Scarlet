@@ -274,16 +274,23 @@ public final class ScarletOfflineExport
 
     static long cleanupSize(Path data) throws IOException
     {
+        Path dataRoot = ScarletCleanupPaths.checkedRoot(data);
         long[] bytes = { 0L };
         for (String name : new String[] { "logs", "caches", "tts" })
         {
-            Path root = data.resolve(name);
-            if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) continue;
+            Path root = dataRoot.resolve(name);
+            if (!ScarletCleanupPaths.directory(dataRoot, root)) continue;
             Files.walkFileTree(root, new SimpleFileVisitor<Path>()
             {
+                @Override public FileVisitResult preVisitDirectory(Path path, BasicFileAttributes attributes)
+                {
+                    return ScarletCleanupPaths.directory(dataRoot, path)
+                        ? FileVisitResult.CONTINUE : FileVisitResult.SKIP_SUBTREE;
+                }
                 @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attributes)
                 {
-                    if (attributes.isRegularFile()) bytes[0] += attributes.size();
+                    if (attributes.isRegularFile() && ScarletCleanupPaths.regularFile(dataRoot, file))
+                        bytes[0] += attributes.size();
                     return FileVisitResult.CONTINUE;
                 }
             });
@@ -293,50 +300,61 @@ public final class ScarletOfflineExport
 
     static CleanupResult cleanup(Path data) throws IOException
     {
-        Path root = data.toRealPath();
+        Path root = ScarletCleanupPaths.checkedRoot(data);
         CleanupResult result = new CleanupResult();
         for (String name : new String[] { "caches", "tts" })
         {
             Path directory = root.resolve(name);
-            if (Files.isSymbolicLink(directory)) { result.failures++; continue; }
+            if (Files.exists(directory, LinkOption.NOFOLLOW_LINKS)
+                && !ScarletCleanupPaths.directory(root, directory)) { result.failures++; continue; }
             if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) continue;
             Files.walkFileTree(directory, new SimpleFileVisitor<Path>()
             {
+                @Override public FileVisitResult preVisitDirectory(Path path, BasicFileAttributes attributes)
+                {
+                    if (ScarletCleanupPaths.directory(root, path)) return FileVisitResult.CONTINUE;
+                    result.failures++;
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
                 @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attributes)
                 {
-                    deleteCleanupItem(file, attributes.isRegularFile() ? attributes.size() : 0L, result);
+                    if (attributes.isRegularFile()) deleteCleanupItem(root, file, attributes.size(), result);
+                    else result.failures++;
                     return FileVisitResult.CONTINUE;
                 }
                 @Override public FileVisitResult visitFileFailed(Path file, IOException failure)
                 { result.failures++; return FileVisitResult.CONTINUE; }
                 @Override public FileVisitResult postVisitDirectory(Path path, IOException failure)
                 {
-                    if (!path.equals(directory)) deleteCleanupItem(path, 0L, result);
+                    if (failure != null) result.failures++;
+                    else if (!path.equals(directory)) deleteCleanupItem(root, path, 0L, result);
                     return FileVisitResult.CONTINUE;
                 }
             });
         }
         Path logs = root.resolve("logs");
-        if (Files.isSymbolicLink(logs)) { result.failures++; return result; }
+        if (Files.exists(logs, LinkOption.NOFOLLOW_LINKS)
+            && !ScarletCleanupPaths.directory(root, logs)) { result.failures++; return result; }
         if (Files.isDirectory(logs, LinkOption.NOFOLLOW_LINKS))
         {
             List<Path> oldLogs = new ArrayList<>();
             try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(logs))
             {
                 for (Path file : entries)
-                    if (Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)
+                    if (ScarletCleanupPaths.regularFile(root, file)
                         && file.getFileName().toString().matches("scarlet_log_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}\\.txt"))
                         oldLogs.add(file);
             }
             oldLogs.sort(Comparator.comparing((Path path) -> path.getFileName().toString()).reversed());
             for (int i = 1; i < oldLogs.size(); i++)
-                deleteCleanupItem(oldLogs.get(i), Files.size(oldLogs.get(i)), result);
+                deleteCleanupItem(root, oldLogs.get(i), Files.size(oldLogs.get(i)), result);
         }
         return result;
     }
 
-    private static void deleteCleanupItem(Path path, long bytes, CleanupResult result)
+    private static void deleteCleanupItem(Path root, Path path, long bytes, CleanupResult result)
     {
+        if (path.equals(root) || !ScarletCleanupPaths.exact(root, path)) { result.failures++; return; }
         try { if (Files.deleteIfExists(path)) result.bytes += bytes; }
         catch (IOException failure) { result.failures++; }
     }

@@ -77,7 +77,8 @@ class ScarletOfflineExportPolicyTest
         assertEquals(0L, ScarletOfflineExport.cleanupSize(data));
         ScarletOfflineExport.CleanupResult result = ScarletOfflineExport.cleanup(data);
         assertEquals(0L, result.bytes);
-        assertEquals(1, result.failures);
+        assertEquals(2, result.failures);
+        assertTrue(Files.isSymbolicLink(caches.resolve("external")));
         assertTrue(Files.isSymbolicLink(data.resolve("tts")));
         assertArrayEquals(new byte[19], Files.readAllBytes(protectedFile));
     }

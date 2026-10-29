@@ -7,22 +7,25 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import net.sybyline.scarlet.Scarlet;
+import net.sybyline.scarlet.ScarletAvatarProviderCache;
 import net.sybyline.scarlet.ext.AvatarSearch.VrcxAvatar;
 
 class AvatarProviderPolicyTest
 {
+    final ScarletAvatarProviderCache cache = new ScarletAvatarProviderCache(null);
+
     @AfterEach
     void clearSyntheticCaches()
     {
-        VrcxAvatar.searchCacheByUrlRoot.clear();
-        VrcxAvatar.searchCacheByUrlRootByImage.clear();
+        this.cache.close();
         AvatarSearch.clearProviderBackoffs();
         ExtendedUserAgent.setCurrentGroupId(null);
         ExtendedUserAgent.setCurrentUserId(null);
@@ -51,17 +54,20 @@ class AvatarProviderPolicyTest
     private static VrcxAvatar avatar(String id)
     {
         VrcxAvatar result = new VrcxAvatar();
-        result.id = id;
+        result.id = "avtr_" + UUID.nameUUIDFromBytes(id.getBytes(StandardCharsets.UTF_8));
+        result.name = id;
         result.imageUrl = "https://image.invalid/file_synthetic/image.png";
         return result;
     }
 
-    private static void seed(String provider, String id)
+    private void seed(String provider, String id)
     {
         VrcxAvatar[] result = {avatar(id)};
-        VrcxAvatar.searchCacheByUrlRoot.put(provider, new HashMap<>(Collections.singletonMap("synthetic-name", result)));
-        VrcxAvatar.searchCacheByUrlRootByImage.put(AvatarSearch.ByImage.authorStateKey(provider),
-            new HashMap<>(Collections.singletonMap("synthetic-author", result)));
+        this.cache.get(provider, "text", AvatarSearch.SEARCH_N, "synthetic-name", () -> true, () -> result);
+        this.cache.get(provider, "author", AvatarSearch.SEARCH_N, "synthetic-author", () -> true, () -> result);
+        // An unexpected cache miss must still never make a real provider request in this test.
+        AvatarSearch.providerBlockedUntil.put(provider, Long.MAX_VALUE);
+        AvatarSearch.providerBlockedUntil.put(AvatarSearch.ByImage.authorStateKey(provider), Long.MAX_VALUE);
     }
 
     @Test
@@ -69,32 +75,32 @@ class AvatarProviderPolicyTest
     {
         for (String provider : AvatarSearch.URL_ROOTS) seed(provider, "never-used");
         String[] none = AvatarSearch.effectiveProviders(true, true, true, new String[0], null);
-        assertEquals(0, AvatarSearch.vrcxSearchAllCached(none, "synthetic-name").count());
-        assertEquals(0, AvatarSearch.ByImage.vrcxSearchAllCachedByImage(none, "file_synthetic", "synthetic-author").count());
+        assertEquals(0, AvatarSearch.vrcxSearchAllCached(cache, none, AvatarSearch.SEARCH_N, "synthetic-name", () -> true).count());
+        assertEquals(0, AvatarSearch.ByImage.vrcxSearchAllCachedByImage(cache, none, "file_synthetic", "synthetic-author", () -> true).count());
         assertEquals(0, AvatarSearch.ByImage.vrcxSearchAllByImage(none, "file_synthetic", "synthetic-author").count());
     }
 
     @Test
     void imageAuthorFallbackUsesOnlySelectedBuiltInAndCustomProviders()
     {
-        for (String provider : AvatarSearch.URL_ROOTS) seed(provider, "excluded");
         String chosen = AvatarSearch.URL_ROOT_NEKOSUNEVR;
         String custom = "https://custom.invalid/search";
+        for (String provider : AvatarSearch.URL_ROOTS) if (!provider.equals(chosen)) seed(provider, "excluded");
         seed(chosen, "chosen");
         seed(custom, "custom");
         assertEquals(Arrays.asList("chosen", "custom"),
-            AvatarSearch.ByImage.vrcxSearchAllCachedByImage(new String[] {chosen, custom}, "file_synthetic", "synthetic-author")
-                .map(VrcxAvatar::id).collect(Collectors.toList()));
-        assertEquals(Collections.singletonList("chosen"), AvatarSearch.vrcxSearchAllCached(new String[] {chosen}, "synthetic-name")
-            .map(VrcxAvatar::id).collect(Collectors.toList()));
+            AvatarSearch.ByImage.vrcxSearchAllCachedByImage(cache, new String[] {chosen, custom}, "file_synthetic", "synthetic-author", () -> true)
+                .map(VrcxAvatar::name).collect(Collectors.toList()));
+        assertEquals(Collections.singletonList("chosen"), AvatarSearch.vrcxSearchAllCached(cache, new String[] {chosen}, AvatarSearch.SEARCH_N, "synthetic-name", () -> true)
+            .map(VrcxAvatar::name).collect(Collectors.toList()));
     }
 
     @Test
     void knownNameOnlyProviderIsNotQueriedForAuthorMatching()
     {
         seed(AvatarSearch.URL_ROOT_AVTRDB, "name-only");
-        assertEquals(0, AvatarSearch.ByImage.vrcxSearchAllCachedByImage(new String[] {AvatarSearch.URL_ROOT_AVTRDB},
-            "file_synthetic", "synthetic-author").count());
+        assertEquals(0, AvatarSearch.ByImage.vrcxSearchAllCachedByImage(cache, new String[] {AvatarSearch.URL_ROOT_AVTRDB},
+            "file_synthetic", "synthetic-author", () -> true).count());
     }
 
     @Test

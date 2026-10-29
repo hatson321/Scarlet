@@ -411,14 +411,21 @@ public final class EncryptedPrefs
         String plain = firstNonNull(this.primaryString(FALLBACK_PREFIX + hash), this.secondaryString(FALLBACK_PREFIX + hash));
         if (plain != null) { this.storeString(FALLBACK_PREFIX + hash, plain); return plain.toCharArray(); }
 
-        boolean anyExisting = this.getRegBytes(hash) != null || this.mirrorGetBytes(hash) != null
-                           || this.getRegBytes(legacyHash) != null || this.mirrorGetBytes(legacyHash) != null;
+        // A malformed Base64 value is still recovery evidence; byte decoding must not hide it.
+        boolean anyExisting = this.getRegString(hash) != null || this.mirrorGetString(hash) != null
+                           || this.getRegString(legacyHash) != null || this.mirrorGetString(legacyHash) != null;
         if (anyExisting)
         {
             LOG.error("secure store: a local-password record exists but no copy could be decrypted. "
-                    + "Backing everything up before reseeding so nothing is destroyed; existing credentials "
-                    + "will need to be re-entered. Backup + quarantine written under {}.", this.dataDir);
-            this.snapshotEverything("localpw-undecryptable");
+                    + "A verified recovery snapshot is required before reseeding; existing credentials "
+                    + "will need to be re-entered if recovery is unavailable.");
+            try { this.snapshotEverythingVerified("localpw-undecryptable"); }
+            catch (IOException | BackingStoreException | RuntimeException failed)
+            {
+                throw new IllegalStateException("Credential reseeding was stopped because a recovery snapshot "
+                    + "could not be saved and verified. The original seed was preserved. Restore a verified "
+                    + "backup or repair the data-folder storage before continuing.", failed);
+            }
             byte[] q;
             if ((q = this.getRegBytes(hash)) != null)    this.quarantine("localpw-registry", q);
             if ((q = this.mirrorGetBytes(hash)) != null) this.quarantine("localpw-file", q);
@@ -865,19 +872,6 @@ public final class EncryptedPrefs
 
     // ---- snapshots & quarantine (never destroy) -------------------------------------------------
 
-    private void snapshotRegistry(String reason)
-    {
-        if (this.dataDir == null || this.prefs == null) return;
-        try
-        {
-            this.snapshotRegistryVerified(reason);
-        }
-        catch (Throwable t)
-        {
-            LOG.warn("secure store: failed to snapshot registry", t);
-        }
-    }
-
     private void snapshotRegistryVerified(String reason) throws IOException, BackingStoreException
     {
         Properties dump = new Properties();
@@ -893,21 +887,16 @@ public final class EncryptedPrefs
         if (!dump.equals(readProperties(snapshot))) throw new IOException("Registry snapshot failed read-back verification");
     }
 
-    private void snapshotEverything(String reason)
+    private void snapshotEverythingVerified(String reason) throws IOException, BackingStoreException
     {
-        this.snapshotRegistry(reason);
-        if (this.mirrorFile != null && this.mirrorFile.isFile())
+        this.snapshotRegistryVerified(reason);
+        if (this.mirrorFile != null && Files.exists(this.mirrorFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS))
         {
-            try
-            {
-                File f = new File(this.dataDir, MIRROR_FILENAME + ".backup-" + ts() + ".dat");
-                Files.copy(this.mirrorFile.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                LOG.warn("secure store: wrote file-mirror snapshot to {}", f);
-            }
-            catch (Throwable t)
-            {
-                LOG.warn("secure store: failed to snapshot file mirror", t);
-            }
+            byte[] original = Files.readAllBytes(this.mirrorFile.toPath());
+            File snapshot = new File(this.dataDir, MIRROR_FILENAME + ".backup-" + ts() + "-" + java.util.UUID.randomUUID() + ".dat");
+            FileBackups.writeBytes(snapshot, 0, output -> output.write(original));
+            if (!Arrays.equals(original, Files.readAllBytes(snapshot.toPath())))
+                throw new IOException("Credential mirror recovery snapshot failed read-back verification");
         }
     }
 

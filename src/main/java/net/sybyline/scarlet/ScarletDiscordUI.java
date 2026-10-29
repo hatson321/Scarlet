@@ -767,7 +767,12 @@ public class ScarletDiscordUI
             return;
         }
         
-        this.discord.queuedActions.addAll(banActions);
+        try { this.discord.enqueueModerationActions(banActions); }
+        catch (RuntimeException ex)
+        {
+            hook.sendMessage("No bans were accepted: the durable moderation queue could not be saved. Check local storage before retrying.").setEphemeral(true).queue();
+            return;
+        }
         
         hook.sendMessageFormat("Queuing %s user ban(s)", banActions.size()).setEphemeral(true).queue();
     }
@@ -776,6 +781,7 @@ public class ScarletDiscordUI
     @Ephemeral
     public void vrchatUserUnban(ButtonInteractionEvent event, InteractionHook hook)
     {
+        String requestedGroupId = this.discord.scarlet.vrc.groupId, requestedGuildId = this.discord.guildSf;
         String[] parts = event.getButton().getCustomId().split(":");
 
         String vrcTargetId = parts[1];
@@ -810,27 +816,12 @@ public class ScarletDiscordUI
             hook.sendMessage("Unbanned the training user. *(Training simulation — no real action occurred.)*").setEphemeral(false).queue();
             return;
         }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, hook))
-            return;
-        
-        GroupMemberStatus status = this.discord.scarlet.vrc.getGroupMembershipStatus(this.discord.scarlet.vrc.groupId, vrcTargetId);
-        
-        if (status != GroupMemberStatus.BANNED)
+        ScarletDiscordJDA.VRChatBanAttempt attempt = this.discord.executeVRChatUnban(
+            new ScarletDiscord.Action("unban", vrcActorId, vrcTargetId, null, event.getUser().getId(), requestedGuildId, requestedGroupId),
+            net.sybyline.scarlet.server.discord.DPerms.PermType.BUTTON_PRESS, "vrchat-user-unban");
+        if (!attempt.succeeded())
         {
-            hook.sendMessage("This VRChat user is not banned").setEphemeral(true).queue();
-            return;
-        }
-        
-        if (this.discord.scarlet.pendingModActions.addPending(GroupAuditType.USER_UNBAN, vrcTargetId, vrcActorId) != null)
-        {
-            hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
-            return;
-        }
-        
-        if (!this.discord.scarlet.vrc.unbanFromGroup(vrcTargetId))
-        {
-            this.discord.scarlet.pendingModActions.pollPending(GroupAuditType.USER_UNBAN, vrcTargetId);
-            hook.sendMessageFormat("Failed to unban %s", sc.getDisplayName()).setEphemeral(true).queue();
+            hook.sendMessage(attempt.message).setEphemeral(true).queue();
             return;
         }
         
@@ -877,7 +868,12 @@ public class ScarletDiscordUI
             return;
         }
         
-        this.discord.queuedActions.addAll(unbanActions);
+        try { this.discord.enqueueModerationActions(unbanActions); }
+        catch (RuntimeException ex)
+        {
+            event.reply("No unbans were accepted: the durable moderation queue could not be saved. Check local storage before retrying.").setEphemeral(true).queue();
+            return;
+        }
         
         event.replyFormat("Queuing %s user unban(s)", unbanActions.size()).setEphemeral(true).queue();
     }

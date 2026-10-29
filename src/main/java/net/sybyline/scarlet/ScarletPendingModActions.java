@@ -58,6 +58,7 @@ public class ScarletPendingModActions
     {
         public Map<String, String> pendingModActions;
         public Map<String, Long> pendingStartedAt;
+        public Map<String, String> pendingTokens;
         public Map<String, BanInfo> pendingBanInfo;
         public Map<String, TimedBan> timedBans;
     }
@@ -240,6 +241,40 @@ public class ScarletPendingModActions
     {
         this.expirePending(type.id+":"+targetUserId);
         return this.removePending(type.id+":"+targetUserId);
+    }
+
+    /** Immutable, restart-stable ownership proof for the audit receipt handoff. */
+    public static final class PendingAttribution
+    {
+        public final String actorUserId, token;
+
+        private PendingAttribution(String actorUserId, String token)
+        {
+            this.actorUserId = actorUserId;
+            this.token = token;
+        }
+    }
+
+    public synchronized PendingAttribution peekPendingAttribution(GroupAuditType type, String targetUserId)
+    {
+        if (this.loadFailed)
+            throw new IllegalStateException("Pending attribution storage is unavailable");
+        String key = type.id+":"+targetUserId;
+        this.expirePending(key);
+        String actor = this.pendingModActions.get(key), token = this.pendingTokens.get(key);
+        if (actor == null) return null;
+        if (this.loadFailed || token == null)
+            throw new IllegalStateException("Pending attribution is not safely available");
+        return new PendingAttribution(actor, token);
+    }
+
+    /** Called only after the destination receipt durably owns the actor and this token. */
+    public synchronized boolean acknowledgePendingAttribution(GroupAuditType type, String targetUserId, String token)
+    {
+        String key = type.id+":"+targetUserId;
+        if (token == null || !token.equals(this.pendingTokens.get(key))) return false;
+        this.removePending(key);
+        return true;
     }
 
     private String removePending(String key)
@@ -581,13 +616,16 @@ public class ScarletPendingModActions
         if (!this.pendingModActionsFile.exists())
         {
             this.loadFailed = false;
-            return this.save();
+            boolean initialized = this.save();
+            this.loadFailed = !initialized;
+            return initialized;
         }
         DataSpec spec;
         try (Reader r = MiscUtils.reader(this.pendingModActionsFile))
         {
             spec = Scarlet.GSON_PRETTY.fromJson(r, DataSpec.class);
             if (spec == null || hasNullEntries(spec.pendingModActions) || hasNullEntries(spec.pendingStartedAt)
+                || hasNullEntries(spec.pendingTokens)
                 || hasNullEntries(spec.pendingBanInfo) || hasNullEntries(spec.timedBans))
                 throw new java.io.IOException("Invalid pending moderation data");
         }
@@ -625,7 +663,13 @@ public class ScarletPendingModActions
             else
             {
                 this.pendingStartedAt.put(key, started);
-                this.pendingTokens.put(key, UUID.randomUUID().toString());
+                String token = spec.pendingTokens == null ? null : spec.pendingTokens.get(key);
+                if (token == null || token.isEmpty())
+                {
+                    token = UUID.randomUUID().toString();
+                    migrated = true;
+                }
+                this.pendingTokens.put(key, token);
             }
         }
         this.pendingBanInfo.clear();
@@ -646,7 +690,12 @@ public class ScarletPendingModActions
                     migrated = true;
                 }
         }
-        return !migrated || this.save();
+        if (migrated && !this.save())
+        {
+            this.loadFailed = true;
+            return false;
+        }
+        return true;
     }
 
     public synchronized boolean save()
@@ -659,6 +708,7 @@ public class ScarletPendingModActions
         DataSpec spec = new DataSpec();
         spec.pendingModActions = new HashMap<>(this.pendingModActions);
         spec.pendingStartedAt = new HashMap<>(this.pendingStartedAt);
+        spec.pendingTokens = new HashMap<>(this.pendingTokens);
         spec.pendingBanInfo = new HashMap<>(this.pendingBanInfo);
         spec.timedBans = new HashMap<>(this.timedBans);
         try
