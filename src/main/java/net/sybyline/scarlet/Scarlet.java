@@ -1141,7 +1141,7 @@ public class Scarlet implements Closeable
     });
     final ScarletSettings.FileValued<String> verifiedRoleSf = this.settings.new FileValuedStringPattern("verified_role_snowflake", I18n.tr("setting.verified_role_snowflake"), "1234567890", "\\d{1,20}", true);
     final ScarletSettings.FileValued<String> membersRoleSf = this.settings.new FileValuedStringPattern("members_role_snowflake", I18n.tr("setting.members_role_snowflake"), "1234567890", "\\d{1,20}", true);
-    final ScarletSettings.FileValued<String> notVerifiedLinkMessage = this.settings.new FileValuedStringPattern("link_vrchat_manual_verify_message", I18n.tr("setting.link_vrchat_manual_verify_message"), "Please open a ticket so an Orchard administrator can verify you manually.", null, true);
+    final ScarletSettings.FileValued<String> notVerifiedLinkMessage = this.settings.new FileValuedStringPattern("link_vrchat_manual_verify_message", I18n.tr("setting.link_vrchat_manual_verify_message"), "Please open a ticket so an administrator can verify you manually.", null, true);
     final ScarletSettings.FileValued<String> autoInviteGroupId = this.settings.new FileValuedStringPattern("auto_invite_group_id", I18n.tr("setting.auto_invite_group_id"), DEFAULT_AUTO_INVITE_GROUP_ID, VrcIds.P_ID_GROUP, true);
     final ScarletSettings.FileValued<EnforcementAgeState> enforceInstances18plus = this.settings.new FileValuedEnum<>("enforce_instances_18_plus", I18n.tr("setting.enforce_instances_18_plus"), EnforcementAgeState.DISABLED);
     final ScarletSettings.FileValued<EnforcementListState> enforceInstancesWorlds = this.settings.new FileValuedEnum<>("enforce_instances_worlds", I18n.tr("setting.enforce_instances_worlds"), EnforcementListState.DISABLED);
