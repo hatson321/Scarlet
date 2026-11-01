@@ -9,7 +9,7 @@
 
 A self-hostable VRChat Group management utility with Discord integration.
 
-> **About this fork.** Scarlet (this fork) is maintained by **KozyBlake** and developed largely with AI assistance — a "vibe-coded" project. Features and fixes come from KozyBlake and community ideas, implemented and reasoned through with an AI pair, then reviewed and built by KozyBlake. On first launch Scarlet shows this notice and lets you close it if running AI-assisted software isn't for you. (KozyBlake maintains and is accountable for the project; the AI is a tool, not the maintainer.)
+> Scarlet is actively maintained by **Hatson321**. AI may assist with API updates and implementation; changes are reviewed and tested before release, and release notes identify the changes and testing performed.
 
 - [VRChat Group](https://vrchat.com/home/group/grp_f12667c7-df5f-454f-9a34-5ed8c33112a1)
 - [Changelog](CHANGELOG.md)
@@ -523,9 +523,7 @@ Scarlet runs on both Windows and Linux (this is the Linux-compatible fork). The 
 
 If you wish to not install Java for all users on the PC, if you would like to have several different Java installations, or if you would otherwise prefer to keep the Java installation to Scarlet only, see the instructions further below.
 
-Thanks to [@KozyBlake](https://github.com/KozyBlake) for making this video tutorial:
-
-[![installation-tutorial-video](https://img.youtube.com/vi/JMJgMSThBac/0.jpg)](https://www.youtube.com/watch?v=JMJgMSThBac)
+> **Installation tutorial:** The previous tutorial is private and outdated. A new tutorial is needed; please use the written instructions below in the meantime.
 
 ---
 
