@@ -7,7 +7,7 @@ class ScarletLoggerFactory implements ILoggerFactory
 {
     private static final String
         LEGACY_SCARLET_LOG_ROOT = "Scarlet",
-        SCARLET_LOG_ROOT = "KozyBlake/Scarlet",
+        SCARLET_LOG_ROOT = "Hatson321/Scarlet Logger",
         SCARLET_PACKAGE_PREFIX = "net.sybyline.scarlet.";
 
     ScarletLoggerFactory()

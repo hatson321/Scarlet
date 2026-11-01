@@ -18,7 +18,7 @@ import net.sybyline.scarlet.util.tts.TtsService;
  * person to physically join a bad group.
  *
  * <p>Simulated events run through the <i>real</i> presentation and emit pipeline:
- * the instance player list, TTS callouts, desktop/mobile notifications, and the
+ * the instance player list, TTS callouts, desktop notifications, and the
  * Discord custom-event posts (including their normal interactive components).
  * Integrity boundaries: simulated users use an unmistakable {@code usr_training-}
  * id namespace, and everything Discord- or archive-bound carries a
@@ -131,7 +131,7 @@ public final class ScarletSimulation
             wg.id = "grp_training";
             wg.message = detail;
             wg.priority = 100;
-            scarlet.mobile.notifyWatchedGroupJoined(name, userId, wg, location);
+            scarlet.desktopNotifications.notifyWatchedGroupJoined(name, userId, wg, location);
             scarlet.discord.emitExtendedUserJoin(scarlet, now, location, userId, taggedName);
             scarlet.data.customEvent_new(GroupAuditTypeEx.USER_JOIN, odt, userId, taggedName, location, null);
             break;
@@ -147,7 +147,7 @@ public final class ScarletSimulation
             we.id = userId;
             we.message = detail;
             we.priority = 100;
-            scarlet.mobile.notifyWatchedUserJoined(name, userId, we, location);
+            scarlet.desktopNotifications.notifyWatchedUserJoined(name, userId, we, location);
             scarlet.discord.emitExtendedUserJoin(scarlet, now, location, userId, taggedName);
             scarlet.data.customEvent_new(GroupAuditTypeEx.USER_JOIN, odt, userId, taggedName, location, null);
             break;
@@ -160,7 +160,7 @@ public final class ScarletSimulation
             scarlet.getTtsService().submit(marker,
                 I18n.tr("adv.joinedLobbyFmt", TtsService.sanitizeName(name)) + " "
                 + I18n.tr("adv.ttsNewDays", days, I18n.tr("adv.days")));
-            scarlet.mobile.notifyNewPlayerJoined(name, userId, days, location);
+            scarlet.desktopNotifications.notifyNewPlayerJoined(name, userId, days, location);
             scarlet.discord.emitExtendedUserJoin(scarlet, now, location, userId, taggedName);
             scarlet.data.customEvent_new(GroupAuditTypeEx.USER_JOIN, odt, userId, taggedName, location, null);
             break;
@@ -169,7 +169,7 @@ public final class ScarletSimulation
         {
             scarlet.ui.playerJoin(false, userId, name, now, I18n.tr("adv.mixedCharName"), new Color(255, 190, 60), 60, false);
             scarlet.getTtsService().submitMixedCharacterNameJoinAlert(marker);
-            scarlet.mobile.notifyMixedCharacterName(name, userId, location);
+            scarlet.desktopNotifications.notifyMixedCharacterName(name, userId, location);
             scarlet.discord.emitExtendedUserJoin(scarlet, now, location, userId, taggedName);
             scarlet.data.customEvent_new(GroupAuditTypeEx.USER_JOIN, odt, userId, taggedName, location, null);
             break;
@@ -180,7 +180,7 @@ public final class ScarletSimulation
             scarlet.getTtsService().submit(marker,
                 I18n.tr("adv.joinedLobbyFmt", TtsService.sanitizeName(name)) + " "
                 + I18n.tr("adv.suspiciousPronounsLabel") + ": " + ScarletEventListener.endDot(detail));
-            scarlet.mobile.notifySuspiciousPronouns(name, userId, detail, "training simulation", location);
+            scarlet.desktopNotifications.notifySuspiciousPronouns(name, userId, detail, "training simulation", location);
             scarlet.discord.emitExtendedUserJoin(scarlet, now, location, userId, taggedName);
             scarlet.data.customEvent_new(GroupAuditTypeEx.USER_JOIN, odt, userId, taggedName, location, null);
             break;
@@ -199,7 +199,7 @@ public final class ScarletSimulation
             wa.id = "avtr_training";
             wa.message = detail;
             wa.priority = 90;
-            scarlet.mobile.notifyWatchedAvatar(name, userId, TRAINING_PREFIX + avatarName, new String[0], wa, location);
+            scarlet.desktopNotifications.notifyWatchedAvatar(name, userId, TRAINING_PREFIX + avatarName, new String[0], wa, location);
             scarlet.discord.emitExtendedUserAvatar(scarlet, now, location, userId, taggedName, TRAINING_PREFIX + avatarName, new String[0]);
             scarlet.data.customEvent_new(GroupAuditTypeEx.USER_AVATAR, odt, userId, taggedName, null, TRAINING_PREFIX + avatarName);
             break;
@@ -207,7 +207,7 @@ public final class ScarletSimulation
         case VTK:
         {
             scarlet.getTtsService().submit(marker, I18n.tr("adv.vtkAgainst", TtsService.sanitizeName(name)));
-            scarlet.mobile.notifyVoteToKick(name, userId, null, null, location);
+            scarlet.desktopNotifications.notifyVoteToKick(name, userId, null, null, location);
             scarlet.discord.emitExtendedVtkInitiated(scarlet, now, location, userId, taggedName, null, null);
             scarlet.data.customEvent_new(GroupAuditTypeEx.VTK_START, odt, null, null, userId, taggedName);
             break;
@@ -228,7 +228,7 @@ public final class ScarletSimulation
                                 : kind == Kind.MOD_KICK ? GroupAuditType.INSTANCE_KICK
                                 : GroupAuditType.USER_BAN;
             String verb = kind == Kind.MOD_WARN ? "warned" : kind == Kind.MOD_KICK ? "kicked" : "banned";
-            io.github.vrchatapi.model.GroupAuditLogEntry entry = new io.github.vrchatapi.model.GroupAuditLogEntry();
+            io.github.vrchatapi.model.GroupAuditLogEntryUnknown entry = new io.github.vrchatapi.model.GroupAuditLogEntryUnknown();
             entry.setId(TRAINING_AUDIT_ID_PREFIX + Long.toUnsignedString(System.nanoTime(), 16));
             entry.setEventType(type.id);
             entry.setGroupId(scarlet.vrc.groupId != null ? scarlet.vrc.groupId : "grp_training");

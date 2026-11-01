@@ -15,9 +15,9 @@
     "role": "Author"
   },
   {
-    "name": "KozyBlake",
-    "url": "https://github.com/KozyBlake",
-    "role": "Contributor, provisional maintainer of Linux-compatible fork"
+    "name": "Hatson321",
+    "url": "https://github.com/Hatson321",
+    "role": "Maintainer of Scarlet Logger"
   },
   {
     "name": "kubectl",
@@ -65,7 +65,7 @@
     "role": "Brazilian Portuguese translator"
   },
   {
-    "name": "KozyBlake, Claude",
+    "name": "Claude",
     "url": "",
     "role": "Russian translator"
   }

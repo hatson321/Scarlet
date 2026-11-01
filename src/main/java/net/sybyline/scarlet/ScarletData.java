@@ -1,8 +1,13 @@
 package net.sybyline.scarlet;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.lang.reflect.Type;
 import java.time.OffsetDateTime;
 import java.util.Arrays;
@@ -28,7 +33,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.reflect.TypeToken;
 
 import io.github.vrchatapi.JSON;
-import io.github.vrchatapi.model.GroupAuditLogEntry;
+import io.github.vrchatapi.model.GroupAuditLogEntryUnknown;
 
 import net.sybyline.scarlet.util.LRUMap;
 import net.sybyline.scarlet.util.MiscUtils;
@@ -38,6 +43,13 @@ public class ScarletData
 {
 
     static final Logger LOG = LoggerFactory.getLogger("Scarlet/Data");
+
+    private static Gson storageGson(Class<?> type)
+    {
+        // Historical audit records are Scarlet's local format, not newly validated
+        // HTTP responses. Preserve their raw data even before the API client starts.
+        return type == AuditEntryMetadata.class ? Scarlet.GSON : JSON.getGson();
+    }
 
     public ScarletData(File dir)
     {
@@ -52,6 +64,24 @@ public class ScarletData
     final File dir;
     final Map<String, Datum<?>> objs;
     final Map<String, Data<?>> subs;
+    private final Object[] entityLocks = new Object[256];
+    {
+        Arrays.setAll(this.entityLocks, i -> new Object());
+    }
+    private final Map<String, PendingWrite> pendingWrites = new ConcurrentHashMap<>();
+
+    private Object entityLock(String kind, String id)
+    {
+        return this.entityLocks[((kind + "/" + id).hashCode() & Integer.MAX_VALUE) % this.entityLocks.length];
+    }
+    private static final class PendingWrite
+    {
+        final String kind, id;
+        final Object value;
+        final Runnable retry;
+        PendingWrite(String kind, String id, Object value, Runnable retry)
+        { this.kind = kind; this.id = id; this.value = value; this.retry = retry; }
+    }
 
     final Datum<LiveInstancesMetadata> liveInstances;
     final Datum<GlobalMetadata> global;
@@ -75,14 +105,32 @@ public class ScarletData
 
     public void saveDirty()
     {
+        this.retryPendingWrites();
         this.objs.values().forEach(Datum::saveIfDirty);
         this.subs.values().forEach(Data::saveIfDirty);
     }
 
     public void saveAll()
     {
+        this.retryPendingWrites();
         this.objs.values().forEach(Datum::save);
         this.subs.values().forEach(Data::save);
+    }
+
+    boolean hasPendingAuditMetadataWrites()
+    {
+        for (String key : this.pendingWrites.keySet())
+            if (key.startsWith("gaud/")) return true;
+        return false;
+    }
+
+    private void retryPendingWrites()
+    {
+        for (PendingWrite pending : this.pendingWrites.values())
+            synchronized (this.entityLock(pending.kind, pending.id))
+            {
+                if (this.pendingWrites.get(pending.kind + "/" + pending.id) == pending) pending.retry.run();
+            }
     }
 
     <T> T readObj(String name, Class<T> type)
@@ -102,17 +150,20 @@ public class ScarletData
             return null;
         }
         File targetFile = new File(this.dir, name);
-        if (!targetFile.isFile())
+        if (!existingRecord(targetFile))
         {
             LOG.warn("Reading data `"+name+"`: No such file: "+targetFile.getAbsolutePath());
         }
         else try (Reader reader = MiscUtils.reader(targetFile))
         {
-            return JSON.getGson().fromJson(reader, type);
+            T value = storageGson(type).fromJson(reader, type);
+            if (value == null) throw new IOException("Existing metadata contains no object");
+            return value;
         }
         catch (Exception ex)
         {
             LOG.error("Exception reading data "+name, ex);
+            throw readFailure(ex);
         }
         if (orNew) try
         {
@@ -124,44 +175,44 @@ public class ScarletData
         }
         return null;
     }
-    <T> void writeObj(String name, Class<T> type, T data)
+    <T> boolean writeObj(String name, Class<T> type, T data)
     {
         if (name == null)
         {
             LOG.error("Writing data: name == null", new Exception());
-            return;
+            return false;
         }
         if (type == null)
         {
             LOG.error("Writing data `"+name+"`: type == null", new Exception());
-            return;
+            return false;
         }
         if (data == null)
         {
             LOG.error("Writing data `"+name+"`: data == null", new Exception());
-            return;
+            return false;
         }
         File targetFile = new File(this.dir, name);
         if (!targetFile.getParentFile().isDirectory())
             targetFile.getParentFile().mkdirs();
-        try (Writer writer = net.sybyline.scarlet.util.FileBackups.writer(targetFile))
+        try (net.sybyline.scarlet.util.FileBackups.AtomicWriter writer = net.sybyline.scarlet.util.FileBackups.writer(targetFile))
         {
-            JSON.getGson().toJson(data, type, writer);
+            storageGson(type).toJson(data, type, writer);
+            writer.commit();
         }
         catch (Exception ex)
         {
             LOG.error("Exception writing data "+name, ex);
+            return false;
         }
+        return true;
     }
     <T> void editObj(String name, Class<T> type, UnaryOperator<T> edit)
     {
         T data = this.readObj(name, type);
-        if (data != null) try
+        if (data != null)
         {
             data = edit.apply(data);
-        }
-        finally
-        {
             this.writeObj(name, type, data);
         }
     }
@@ -187,6 +238,8 @@ public class ScarletData
     }
     <T> T readSub(String kind, String id, Class<T> type, boolean orNew)
     {
+        PendingWrite pending = this.pendingWrites.get(kind + "/" + id);
+        if (pending != null && type != null && type.isInstance(pending.value)) return type.cast(pending.value);
         if (kind == null)
         {
             LOG.error("Reading sub data: kind == null", new Exception());
@@ -203,17 +256,18 @@ public class ScarletData
             return null;
         }
         File targetDir = new File(this.dir, kind);
-        if (!targetDir.isDirectory())
-            targetDir.mkdirs();
         File targetFile = new File(targetDir, id);
-        if (targetFile.isFile())
+        if (existingRecord(targetFile))
         try (Reader reader = MiscUtils.reader(targetFile))
         {
-            return JSON.getGson().fromJson(reader, type);
+            T value = storageGson(type).fromJson(reader, type);
+            if (value == null) throw new IOException("Existing metadata contains no object");
+            return value;
         }
         catch (Exception ex)
         {
             LOG.error("Exception reading sub data "+kind+":"+id, ex);
+            throw readFailure(ex);
         }
         if (orNew) try
         {
@@ -225,27 +279,59 @@ public class ScarletData
         }
         return null;
     }
-    <T> void writeSub(String kind, String id, Class<T> type, T data)
+
+    /** Only a confirmed absent file permits a new default; damaged records stay untouched. */
+    static boolean existingRecord(File file)
+    {
+        try
+        {
+            BasicFileAttributes attributes = Files.readAttributes(file.toPath(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!attributes.isRegularFile() || attributes.isSymbolicLink() || attributes.isOther())
+                throw new IOException("Existing metadata is not a regular file");
+            return true;
+        }
+        catch (NoSuchFileException absent) { return false; }
+        catch (IOException | RuntimeException failure) { throw readFailure(failure); }
+    }
+
+    private static java.io.UncheckedIOException readFailure(Exception cause)
+    {
+        return new java.io.UncheckedIOException("Existing metadata could not be read; its original bytes were preserved. Restore or repair the record before retrying.",
+            cause instanceof IOException ? (IOException) cause : new IOException(cause));
+    }
+    <T> boolean writeSub(String kind, String id, Class<T> type, T data)
+    {
+        synchronized (this.entityLock(kind, id))
+        {
+            boolean saved = this.writeSubNow(kind, id, type, data);
+            String key = kind + "/" + id;
+            if (saved) this.pendingWrites.remove(key);
+            else if (kind != null && id != null && type != null && data != null)
+                this.pendingWrites.put(key, new PendingWrite(kind, id, data, () -> this.writeSub(kind, id, type, data)));
+            return saved;
+        }
+    }
+    private <T> boolean writeSubNow(String kind, String id, Class<T> type, T data)
     {
         if (kind == null)
         {
             LOG.error("Writing sub data: kind == null", new Exception());
-            return;
+            return false;
         }
         if (id == null)
         {
             LOG.error("Writing sub data `"+kind+"`: id == null", new Exception());
-            return;
+            return false;
         }
         if (type == null)
         {
             LOG.error("Writing sub data `"+kind+"`: type == null", new Exception());
-            return;
+            return false;
         }
         if (data == null)
         {
             LOG.error("Writing sub data `"+kind+"`: data == null", new Exception());
-            return;
+            return false;
         }
         File targetDir = new File(this.dir, kind);
         if (!targetDir.isDirectory())
@@ -254,27 +340,35 @@ public class ScarletData
         // High-cardinality per-entity file: crash-safe atomic write (fsync) but keep=0 so we do
         // not spawn a dated backup per user/audit-entry/event. Truncation-on-crash is the risk we
         // are closing here; the singleton configs above keep dated backups.
-        try (Writer writer = net.sybyline.scarlet.util.FileBackups.writer(targetFile, 0))
+        try (net.sybyline.scarlet.util.FileBackups.AtomicWriter writer = net.sybyline.scarlet.util.FileBackups.writer(targetFile, 0))
         {
-            JSON.getGson().toJson(data, type, writer);
+            storageGson(type).toJson(data, type, writer);
+            writer.commit();
         }
         catch (Exception ex)
         {
             LOG.error("Exception writing sub data "+kind+":"+id, ex);
+            return false;
         }
+        return true;
     }
     <T> void editSub(String kind, String id, Class<T> type, UnaryOperator<T> edit)
     {
-        T data = this.readSub(kind, id, type);
-        if (data != null) try
+        synchronized (this.entityLock(kind, id))
         {
-            data = edit.apply(data);
-        }
-        finally
-        {
-            this.writeSub(kind, id, type, data);
+            T data = this.readSub(kind, id, type, true);
+            if (data != null)
+            {
+                // Do not publish partial mutations from a callback that throws.
+                Gson gson = storageGson(type);
+                T edited = edit.apply(gson.fromJson(gson.toJson(data), type));
+                if (!this.writeSub(kind, id, type, edited)) throw persistenceFailure();
+            }
         }
     }
+
+    private static java.io.UncheckedIOException persistenceFailure()
+    { return new java.io.UncheckedIOException(new java.io.IOException("Metadata could not be saved; pending changes are retained for retry")); }
 
     public interface Datum<T>
     {
@@ -350,30 +444,22 @@ public class ScarletData
             return this.value != null || new File(ScarletData.this.dir, this.name).isFile();
         }
         @Override
-        public void markDirty()
+        public synchronized void markDirty()
         {
             this.dirty = true;
         }
         @Override
-        public boolean pollDirty()
+        public synchronized boolean pollDirty()
         {
-            try
-            {
-                return this.dirty;
-            }
-            finally
-            {
-                this.dirty = false;
-            }
+            return this.dirty;
         }
         @Override
         public synchronized void save()
         {
-            this.dirty = false;
             T value = this.value;
             if (value != null)
             {
-                ScarletData.this.writeObj(this.name, this.type, value);
+                this.dirty = !ScarletData.this.writeObj(this.name, this.type, value);
             }
         }
         @Override
@@ -408,33 +494,39 @@ public class ScarletData
         final File subdir;
         final Map<String, T> values;
         final Set<String> dirties;
-        synchronized void saveIfDirty(String id, T value)
+        void saveIfDirty(String id, T value)
         {
-            if (this.dirties.remove(id) && value != null)
+            synchronized (this.values)
             {
-                ScarletData.this.writeSub(this.kind, id, this.type, value);
+                if (this.dirties.contains(id) && value != null) this.save(id, value);
             }
         }
-        synchronized void save(String id, T value)
+        void save(String id, T value)
         {
-            this.dirties.remove(id);
-            if (value != null)
+            synchronized (this.values)
             {
-                ScarletData.this.writeSub(this.kind, id, this.type, value);
+                if (value != null)
+                {
+                    if (ScarletData.this.writeSub(this.kind, id, this.type, value)) this.dirties.remove(id);
+                    else this.dirties.add(id);
+                }
             }
         }
-        synchronized void flush(String id, T value)
+        void flush(String id, T value)
         {
-            this.dirties.remove(id);
-            if (value != null)
+            synchronized (this.values)
             {
-                this.values.remove(id, value);
-                ScarletData.this.writeSub(this.kind, id, this.type, value);
+                if (value != null)
+                {
+                    if (ScarletData.this.writeSub(this.kind, id, this.type, value))
+                    { this.values.remove(id, value); this.dirties.remove(id); }
+                    else this.dirties.add(id);
+                }
             }
         }
         T get0(String id)
         {
-            return this.values.computeIfAbsent(id, _id -> ScarletData.this.readSub(_id, id, this.type, true));
+            return this.values.computeIfAbsent(id, _id -> ScarletData.this.readSub(this.kind, _id, this.type, true));
         }
         @Override
         public Class<T> getType()
@@ -467,7 +559,7 @@ public class ScarletData
             this.values.forEach(this::saveIfDirty);
         }
         @Override
-        public synchronized Datum<T> get(String id)
+        public Datum<T> get(String id)
         {
             return new Datum<T>()
             {
@@ -489,12 +581,12 @@ public class ScarletData
                 @Override
                 public void markDirty()
                 {
-                    SubData.this.dirties.add(id);
+                    synchronized (SubData.this.values) { SubData.this.dirties.add(id); }
                 }
                 @Override
                 public boolean pollDirty()
                 {
-                    return SubData.this.dirties.remove(id);
+                    return SubData.this.dirties.contains(id);
                 }
                 @Override
                 public void save()
@@ -510,19 +602,19 @@ public class ScarletData
         }
     }
 
-    public String globalMetadata_getSnowflakeId(String userSnowflake)
+    public synchronized String globalMetadata_getSnowflakeId(String userSnowflake)
     {
         ScarletData.GlobalMetadata globalMeta = this.global.get();
         return globalMeta.getSnowflakeId(userSnowflake);
     }
-    public ScarletData.GlobalMetadata globalMetadata_setSnowflakeId(String userSnowflake, String userId)
+    public synchronized ScarletData.GlobalMetadata globalMetadata_setSnowflakeId(String userSnowflake, String userId)
     {
         ScarletData.GlobalMetadata globalMeta = this.global.get();
         globalMeta.setSnowflakeId(userSnowflake, userId);
         this.global.markDirty();
         return globalMeta;
     }
-    public ScarletData.GlobalMetadata globalMetadata_removeSnowflakeId(String userSnowflake)
+    public synchronized ScarletData.GlobalMetadata globalMetadata_removeSnowflakeId(String userSnowflake)
     {
         ScarletData.GlobalMetadata globalMeta = this.global.get();
         globalMeta.removeSnowflakeId(userSnowflake);
@@ -572,22 +664,25 @@ public class ScarletData
     }
     public void userMetadata(String userId, UserMetadata userMetadata)
     {
-        this.writeSub("usr", userId, UserMetadata.class, userMetadata);
+        if (!this.writeSub("usr", userId, UserMetadata.class, userMetadata)) throw persistenceFailure();
     }
     public void userMetadata(String userId, UnaryOperator<UserMetadata> edit)
     {
-        this.editSub("usr", userId, UserMetadata.class, edit);
+        this.updateUserMetadata(userId, edit);
+    }
+    public UserMetadata updateUserMetadata(String userId, UnaryOperator<UserMetadata> edit)
+    {
+        synchronized (this.entityLock("usr", userId))
+        {
+            this.editSub("usr", userId, UserMetadata.class, edit);
+            return this.userMetadata(userId);
+        }
     }
     public ScarletData.UserMetadata userMetadata_setSnowflake(String userId, String userSnowflake)
     {
-        ScarletData.UserMetadata userMeta = this.userMetadata(userId);
-        if (userMeta == null)
-            userMeta = new ScarletData.UserMetadata();
-        userMeta.userSnowflake = userSnowflake;
-        this.userMetadata(userId, userMeta);
-        return userMeta;
+        return this.updateUserMetadata(userId, userMeta -> { userMeta.userSnowflake = userSnowflake; return userMeta; });
     }
-    public String userMetadata_getSnowflake(String userId)
+    public synchronized String userMetadata_getSnowflake(String userId)
     {
         ScarletData.UserMetadata userMeta = this.userMetadata(userId);
         if (userMeta == null)
@@ -605,39 +700,52 @@ public class ScarletData
     }
     public void auditEntryMetadata(String auditEntryId, AuditEntryMetadata auditEntryMetadata)
     {
-        this.writeSub("gaud", auditEntryId, AuditEntryMetadata.class, auditEntryMetadata);
+        if (!this.writeSub("gaud", auditEntryId, AuditEntryMetadata.class, auditEntryMetadata)) throw persistenceFailure();
     }
     public void auditEntryMetadata(String auditEntryId, UnaryOperator<AuditEntryMetadata> edit)
     {
         this.editSub("gaud", auditEntryId, AuditEntryMetadata.class, edit);
     }
+    /** Update only a still-existing audit record and return the committed snapshot. */
+    public AuditEntryMetadata updateAuditEntryMetadata(String auditEntryId, UnaryOperator<AuditEntryMetadata> edit)
+    {
+        synchronized (this.entityLock("gaud", auditEntryId))
+        {
+            AuditEntryMetadata current = this.auditEntryMetadata(auditEntryId);
+            if (current == null) return null;
+            Gson gson = storageGson(AuditEntryMetadata.class);
+            AuditEntryMetadata edited = edit.apply(gson.fromJson(gson.toJson(current), AuditEntryMetadata.class));
+            if (!this.writeSub("gaud", auditEntryId, AuditEntryMetadata.class, edited)) throw persistenceFailure();
+            return this.auditEntryMetadata(auditEntryId);
+        }
+    }
     public ScarletData.AuditEntryMetadata auditEntryMetadata_setTags(String auditEntryId, String[] entryTags)
     {
-        ScarletData.AuditEntryMetadata auditEntryMeta = this.auditEntryMetadata(auditEntryId);
-        if (auditEntryMeta == null)
-            auditEntryMeta = new ScarletData.AuditEntryMetadata();
-        auditEntryMeta.entryTags.clear().addAll(entryTags);
-        this.auditEntryMetadata(auditEntryId, auditEntryMeta);
-        return auditEntryMeta;
+        synchronized (this.entityLock("gaud", auditEntryId))
+        {
+            this.editSub("gaud", auditEntryId, AuditEntryMetadata.class, value -> { value.entryTags.clear().addAll(entryTags); return value; });
+            return this.auditEntryMetadata(auditEntryId);
+        }
     }
     public ScarletData.AuditEntryMetadata auditEntryMetadata_editTags(String auditEntryId, String[] entryTagsRemove, String[] entryTagsAdd)
     {
-        ScarletData.AuditEntryMetadata auditEntryMeta = this.auditEntryMetadata(auditEntryId);
-        if (auditEntryMeta == null)
-            auditEntryMeta = new ScarletData.AuditEntryMetadata();
-        auditEntryMeta.entryTags.removeAll(entryTagsRemove);
-        auditEntryMeta.entryTags.addAll(entryTagsAdd);
-        this.auditEntryMetadata(auditEntryId, auditEntryMeta);
-        return auditEntryMeta;
+        synchronized (this.entityLock("gaud", auditEntryId))
+        {
+            this.editSub("gaud", auditEntryId, AuditEntryMetadata.class, value -> {
+                value.entryTags.removeAll(entryTagsRemove); value.entryTags.addAll(entryTagsAdd); return value;
+            });
+            return this.auditEntryMetadata(auditEntryId);
+        }
     }
     public ScarletData.AuditEntryMetadata auditEntryMetadata_setDescription(String auditEntryId, String entryDescription)
     {
-        ScarletData.AuditEntryMetadata auditEntryMeta = this.auditEntryMetadata(auditEntryId);
-        if (auditEntryMeta == null)
-            auditEntryMeta = new ScarletData.AuditEntryMetadata();
-        auditEntryMeta.entryDescription = entryDescription == null || (entryDescription = entryDescription.trim()).isEmpty() ? null : entryDescription;
-        this.auditEntryMetadata(auditEntryId, auditEntryMeta);
-        return auditEntryMeta;
+        synchronized (this.entityLock("gaud", auditEntryId))
+        {
+            this.editSub("gaud", auditEntryId, AuditEntryMetadata.class, value -> {
+                value.entryDescription = entryDescription == null || entryDescription.trim().isEmpty() ? null : entryDescription.trim(); return value;
+            });
+            return this.auditEntryMetadata(auditEntryId);
+        }
     }
 
     public CustomEvent customEvent(String customEventId)
@@ -844,7 +952,7 @@ public class ScarletData
         public String threadSnowflake;
         public String auxMessageSnowflake;
         
-        public GroupAuditLogEntry entry;
+        public GroupAuditLogEntryUnknown entry;
         
         public UniqueStrings entryTags = new UniqueStrings();
         public String entryDescription;
@@ -906,17 +1014,17 @@ public class ScarletData
         { return this.parentEventId != null; }
         
         public boolean hasNonEmptyData()
-        { Object data = this.entry.getData(); return data != null && data instanceof Map && !((Map<?, ?>)data).isEmpty(); }
+        { JsonObject data = ScarletAuditData.json(this.entry.getData()); return data != null && !data.entrySet().isEmpty(); }
         public Map<String, Object> getData()
-        { @SuppressWarnings("unchecked") Map<String, Object> data = (Map<String, Object>)this.entry.getData(); return data; }
+        { return Scarlet.GSON.fromJson(ScarletAuditData.json(this.entry.getData()), new TypeToken<Map<String, Object>>(){}.getType()); }
         public <T> T getData(String name)
-        { @SuppressWarnings("unchecked") Map<String, Object> data = (Map<String, Object>)this.entry.getData(); if (data == null) return null; @SuppressWarnings("unchecked") T value = (T)data.get(name); return value; }
+        { Map<String, Object> data = this.getData(); if (data == null) return null; @SuppressWarnings("unchecked") T value = (T)data.get(name); return value; }
         public <T> T getData(Type type)
-        { Gson gson = JSON.getGson(); return gson.fromJson(gson.toJsonTree(this.entry.getData()), type); }
+        { return Scarlet.GSON.fromJson(ScarletAuditData.json(this.entry.getData()), type); }
         public <T> T getData(Class<T> type)
-        { Gson gson = JSON.getGson(); return gson.fromJson(gson.toJsonTree(this.entry.getData()), type); }
+        { return Scarlet.GSON.fromJson(ScarletAuditData.json(this.entry.getData()), type); }
         public <T> T getData(TypeToken<T> type)
-        { Gson gson = JSON.getGson(); return gson.fromJson(gson.toJsonTree(this.entry.getData()), type); }
+        { return Scarlet.GSON.fromJson(ScarletAuditData.json(this.entry.getData()), type); }
         
         public JsonElement getAuxData(String name)
         { JsonObject auxData = this.auxData; return auxData == null ? null : auxData.get(name); }
@@ -937,24 +1045,38 @@ public class ScarletData
         public void setAuxData(String name, JsonElement value)
         { this.setAuxData().add(name, value); }
     }
-    public void linkIdToSnowflake(String userId, String userSnowflake)
+    public synchronized void linkIdToSnowflake(String userId, String userSnowflake)
     {
+        java.util.Objects.requireNonNull(userId, "userId");
+        java.util.Objects.requireNonNull(userSnowflake, "userSnowflake");
+        String previousSnowflake = this.userMetadata_getSnowflake(userId);
+        String previousUser = this.globalMetadata_getSnowflakeId(userSnowflake);
+        if (previousSnowflake != null && !previousSnowflake.equals(userSnowflake)
+            && userId.equals(this.globalMetadata_getSnowflakeId(previousSnowflake)))
+            this.globalMetadata_removeSnowflakeId(previousSnowflake);
+        if (previousUser != null && !previousUser.equals(userId)
+            && userSnowflake.equals(this.userMetadata_getSnowflake(previousUser)))
+            this.userMetadata_setSnowflake(previousUser, null);
         this.userMetadata_setSnowflake(userId, userSnowflake);
         this.globalMetadata_setSnowflakeId(userSnowflake, userId);
+        this.global.save();
+        if (this.global.pollDirty()) throw persistenceFailure();
     }
     /**
      * Removes the Discord&lt;-&gt;VRChat link for the given Discord snowflake, clearing both
      * sides of the association (the global snowflake-&gt;id map and the per-user snowflake).
      * Returns the VRChat user id that was linked, or null if there was no link.
      */
-    public String unlinkBySnowflake(String userSnowflake)
+    public synchronized String unlinkBySnowflake(String userSnowflake)
     {
         if (userSnowflake == null)
             return null;
         String userId = this.globalMetadata_getSnowflakeId(userSnowflake);
         this.globalMetadata_removeSnowflakeId(userSnowflake);
-        if (userId != null)
+        if (userId != null && userSnowflake.equals(this.userMetadata_getSnowflake(userId)))
             this.userMetadata_setSnowflake(userId, null);
+        this.global.save();
+        if (this.global.pollDirty()) throw persistenceFailure();
         return userId;
     }
     /**
@@ -962,14 +1084,16 @@ public class ScarletData
      * sides of the association (the per-user snowflake and the global snowflake-&gt;id map).
      * Returns the Discord snowflake that was linked, or null if there was no link.
      */
-    public String unlinkById(String userId)
+    public synchronized String unlinkById(String userId)
     {
         if (userId == null)
             return null;
         String userSnowflake = this.userMetadata_getSnowflake(userId);
         this.userMetadata_setSnowflake(userId, null);
-        if (userSnowflake != null)
+        if (userSnowflake != null && userId.equals(this.globalMetadata_getSnowflakeId(userSnowflake)))
             this.globalMetadata_removeSnowflakeId(userSnowflake);
+        this.global.save();
+        if (this.global.pollDirty()) throw persistenceFailure();
         return userSnowflake;
     }
 

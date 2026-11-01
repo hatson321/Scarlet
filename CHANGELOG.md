@@ -5,7 +5,8 @@
 
 - **Published stable:** [0.6.0](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0).
 - **Published preview:** [0.6.1-a11](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11).
-- **Development source:** `0.6.1-a12`, not a published release. Plain `0.6.1` remains a draft, not the current stable download.
+- **Repository `main`:** the published `0.6.0` stable application baseline, with refreshed documentation and the approved Help → Credits cleanup. Preview descriptions below do not imply those changes are in stable `main`.
+- **Separate local release preparation:** `0.6.1-a12`, not a published release or the version on `main`. Plain `0.6.1` remains a draft, not the current stable download.
 
 The dated summaries below describe published releases. Older entries are retained
 as development history, with historical release-note links repaired: labels such as “unpublished candidate” and older

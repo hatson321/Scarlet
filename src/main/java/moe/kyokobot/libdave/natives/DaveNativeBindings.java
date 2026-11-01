@@ -16,31 +16,18 @@ import moe.kyokobot.libdave.RosterMap;
 import moe.kyokobot.libdave.callbacks.DaveLogSink;
 import moe.kyokobot.libdave.callbacks.EncryptorProtocolVersionChangedCallback;
 import moe.kyokobot.libdave.callbacks.MLSFailureCallback;
-import net.sybyline.scarlet.server.discord.dave.AndroidDaveJvmLibraryLoader;
 import net.sybyline.scarlet.util.Platform;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Local override of impl-jni's DaveNativeBindings with Android/Termux support.
+ * Local override of impl-jni's DaveNativeBindings with explicit desktop-native loading.
  */
 public class DaveNativeBindings {
     private static final Logger LOG = LoggerFactory.getLogger(DaveNativeBindings.class);
     private static volatile boolean loaded;
 
     private DaveNativeBindings() {
-    }
-
-    private static boolean isAndroidRuntime() {
-        if (Platform.isAndroid() || Platform.isTermux()) {
-            return true;
-        }
-        try {
-            Class.forName("android.os.Build");
-            return true;
-        } catch (ClassNotFoundException e) {
-            return false;
-        }
     }
 
     public static DaveNativeBindings inst() {
@@ -50,11 +37,6 @@ public class DaveNativeBindings {
 
     private static synchronized void ensureLoaded() {
         if (loaded) {
-            return;
-        }
-        if (isAndroidRuntime()) {
-            AndroidDaveJvmLibraryLoader.loadIfNeeded();
-            loaded = true;
             return;
         }
         Path extracted = extractBundledNative();

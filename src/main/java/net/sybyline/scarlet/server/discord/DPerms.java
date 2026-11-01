@@ -135,6 +135,7 @@ public class DPerms
     }
 
     final File file;
+    private volatile boolean loadFailed;
     final Set<String> guildSfs = new HashSet<>();
 
     public Set<String> getGuildSnowflakesMutable()
@@ -270,7 +271,20 @@ public class DPerms
                 Role role = isMember ? null : event.getOption("target").getAsRole();
                 
                 String mention = isMember ? member.getAsMention() : role.getAsMention();
-                Boolean prev = isMember ? this.set(type, member, name, value) : this.set(type, role, name, value);
+                Boolean prev;
+                synchronized (this)
+                {
+                    prev = isMember ? this.set(type, member, name, value) : this.set(type, role, name, value);
+                    try { this.save(); }
+                    catch (RuntimeException failure)
+                    {
+                        if (isMember) this.set(type, member, name, prev);
+                        else this.set(type, role, name, prev);
+                        event.reply("The permission change could not be saved and was not applied. Previous permissions remain in effect; check storage and retry.")
+                            .setEphemeral(true).queue();
+                        return;
+                    }
+                }
 
                 event.replyFormat(Objects.equals(prev, value)
                         ? "The %s permission `%s` for %s is already %s" // Mismatched format args count is intentional
@@ -331,37 +345,102 @@ public class DPerms
         static final TypeToken<Map<PermType, PermSetSpec>> TYPE_TOKEN = new TypeToken<Map<PermType, PermSetSpec>>(){};
         public Map<String, Map<String, Boolean>> byUser, byRole;
     }
-    public void load()
+    public synchronized void load()
     {
-        if (!this.file.isFile())
-            return;
-        Map<PermType, PermSetSpec> specs;
-        try (Reader in = MiscUtils.reader(this.file))
+        boolean previouslyFailed = this.loadFailed;
+        this.loadFailed = true;
+        try
         {
-            specs = Scarlet.GSON.fromJson(in, PermSetSpec.TYPE_TOKEN);
+            try
+            {
+                java.nio.file.attribute.BasicFileAttributes attributes = java.nio.file.Files.readAttributes(this.file.toPath(),
+                    java.nio.file.attribute.BasicFileAttributes.class, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                if (!attributes.isRegularFile() || attributes.isSymbolicLink() || attributes.isOther())
+                    throw new java.io.IOException("Permission storage is not a regular file");
+            }
+            catch (java.nio.file.NoSuchFileException absent)
+            {
+                if (previouslyFailed) throw new java.io.IOException("Restore the previously unreadable permission file before reloading", absent);
+                this.loadFailed = false;
+                return;
+            }
+            Map<PermType, PermSetSpec> specs;
+            try (Reader in = MiscUtils.reader(this.file);
+                com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(in))
+            {
+                reader.setStrictness(com.google.gson.Strictness.STRICT);
+                com.google.gson.JsonElement json = new com.google.gson.Gson().getAdapter(com.google.gson.JsonElement.class).read(reader);
+                if (json == null || !json.isJsonObject() || reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT)
+                    throw new java.io.IOException("Permission storage must contain exactly one JSON object");
+                validatePermissionJson(json.getAsJsonObject());
+                specs = Scarlet.GSON.fromJson(json, PermSetSpec.TYPE_TOKEN);
+            }
+            if (specs == null || specs.containsKey(null) || specs.containsValue(null))
+                throw new java.io.IOException("Permission storage contains an unknown type or null entry");
+            // Validate/build everything before touching live permissions. Missing types mean no explicit grants.
+            EnumMap<PermType, PermSet> replacement = new EnumMap<>(PermType.class);
+            for (PermType type : PermType.values())
+            {
+                PermSet set = new PermSet();
+                if (specs.containsKey(type)) set.load(specs.get(type));
+                replacement.put(type, set);
+            }
+            replacement.forEach((type, set) -> {
+                PermSet current = this.permissions.get(type);
+                current.byUser.clear();
+                current.byRole.clear();
+                current.load(set.store(new PermSetSpec()));
+            });
+            this.loadFailed = false;
         }
         catch (Exception ex)
         {
-            return;
+            throw new IllegalStateException("Discord permissions could not be read. Existing bytes were preserved and authorization is blocked; restore or repair the file before restarting Discord.", ex);
         }
-        if (specs != null)
-            specs.forEach((type, spec) -> this.permissions.get(type).load(spec));
     }
 
-    public void save()
+    private static void validatePermissionJson(com.google.gson.JsonObject root) throws java.io.IOException
     {
+        for (Map.Entry<String, com.google.gson.JsonElement> type : root.entrySet())
+        {
+            if (!type.getValue().isJsonObject()) throw new java.io.IOException("Invalid permission type record");
+            for (String name : new String[]{"byUser", "byRole"})
+            {
+                com.google.gson.JsonElement targets = type.getValue().getAsJsonObject().get(name);
+                if (targets == null || targets.isJsonNull()) continue;
+                if (!targets.isJsonObject()) throw new java.io.IOException("Invalid permission target map");
+                for (Map.Entry<String, com.google.gson.JsonElement> target : targets.getAsJsonObject().entrySet())
+                {
+                    if (!target.getValue().isJsonObject()) throw new java.io.IOException("Invalid permission target record");
+                    for (com.google.gson.JsonElement value : target.getValue().getAsJsonObject().asMap().values())
+                        if (!value.isJsonNull() && (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()))
+                            throw new java.io.IOException("Permission values must be booleans or null");
+                }
+            }
+        }
+    }
+
+    public synchronized void save()
+    {
+        this.requireWritable();
         Map<PermType, PermSetSpec> specs = new HashMap<>();
         for (PermType permType : PermType.values())
             specs.put(permType, this.permissions.get(permType).store(new PermSetSpec()));
-        if (!this.file.getParentFile().isDirectory())
-            this.file.getParentFile().mkdirs();
-        try (Writer out = net.sybyline.scarlet.util.FileBackups.writer(this.file))
+        try
         {
-            Scarlet.GSON.toJson(specs, PermSetSpec.TYPE_TOKEN.getType(), out);
+            net.sybyline.scarlet.util.FileBackups.write(this.file,
+                out -> Scarlet.GSON.toJson(specs, PermSetSpec.TYPE_TOKEN.getType(), out));
         }
         catch (Exception ex)
         {
+            throw new IllegalStateException("Discord permissions could not be saved. The previous file was preserved; check storage and retry.", ex);
         }
+    }
+
+    private void requireWritable()
+    {
+        if (this.loadFailed)
+            throw new IllegalStateException("Discord permissions are unreadable; refusing to overwrite stored authority with defaults.");
     }
 
     final EnumMap<PermType, PermSet> permissions = new EnumMap<>(PermType.class);
@@ -518,6 +597,7 @@ public class DPerms
 
     public Boolean get(PermType kind, Member member, String perm)
     {
+        if (this.loadFailed) return Boolean.FALSE;
         if (member.isOwner())
             return Boolean.TRUE;
         if (member.hasPermission(Permission.ADMINISTRATOR))
@@ -526,16 +606,19 @@ public class DPerms
     }
     public Boolean get(PermType kind, Role role, String perm)
     {
+        if (this.loadFailed) return Boolean.FALSE;
         if (role.hasPermission(Permission.ADMINISTRATOR))
             return Boolean.TRUE;
         return this.permissions.get(kind).get(role, perm);
     }
-    public Boolean set(PermType kind, Member member, String perm, Boolean value)
+    public synchronized Boolean set(PermType kind, Member member, String perm, Boolean value)
     {
+        this.requireWritable();
         return this.permissions.get(kind).set(member, perm, value);
     }
-    public Boolean set(PermType kind, Role role, String perm, Boolean value)
+    public synchronized Boolean set(PermType kind, Role role, String perm, Boolean value)
     {
+        this.requireWritable();
         return this.permissions.get(kind).set(role, perm, value);
     }
     public Map<String, Boolean> list(PermType kind, Member member)
@@ -613,6 +696,21 @@ public class DPerms
     public boolean check(SlashCommandInteractionEvent event)
     {
         return this.isInGuild(event) && this.checkSlashCommand(event.getMember(), event.getName(), event.getSubcommandGroup(), event.getSubcommandName(), false);
+    }
+
+    /** Recheck the same slash-command authorization at a later, state-changing confirmation. */
+    public boolean checkSlash(Member member, String commandPath)
+    {
+        if (member == null || !this.isInGuild(member)) return false;
+        String[] parts = commandPath.split(" ", 3);
+        return this.checkSlashCommand(member, parts[0], parts.length == 3 ? parts[1] : null,
+            parts.length > 1 ? parts[parts.length - 1] : null, false);
+    }
+    /** Recheck a component/modal permission against a freshly retrieved member. */
+    public boolean checkOperation(Member member, PermType type, String operation)
+    {
+        return member != null && this.isInGuild(member)
+            && type != null && operation != null && this.check(type, member, operation, false);
     }
     public boolean check(CommandAutoCompleteInteractionEvent event)
     {

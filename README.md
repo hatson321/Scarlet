@@ -26,7 +26,7 @@ Release status checked **November 1, 2026**:
 
 The feature details and command reference below describe the **published 0.6.1-a11 preview**, unless stated otherwise. Do not assume that every preview change is in 0.6.0. Consult the notes attached to your exact release; a local build or unpublished draft is not evidence of publication.
 
-**Need matching source?** Download the `scarlet-<version>-source.zip` attached to that release. The repository's default branch and GitHub's **Code → Download ZIP** are not necessarily the source used for the published JAR. This documentation refresh does not synchronize the runtime source on the default branch.
+**Need matching source?** The repository's `main` application source is based on the published **0.6.0 stable release**, with refreshed documentation and the approved Help → Credits cleanup. It is not the a11 preview source, and these overlays mean GitHub's **Code → Download ZIP** is not byte-for-byte identical to the original release archive. For exact release-source reproduction, download the `scarlet-<version>-source.zip` attached to your release. The a11 feature reference below does not add those features to stable `main`.
 
 ## What Scarlet does
 

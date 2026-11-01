@@ -11,7 +11,7 @@ Choose the ready-to-run `scarlet-<version>.jar` attached to the release you want
 - [0.6.0 stable](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0)
 - [0.6.1-a11 preview](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11)
 
-The attached `scarlet-<version>-source.zip` is for source review or building, not the application installer. The default branch and **Code → Download ZIP** may not match the source used for a published JAR. Prefer the release's frozen source attachment when reproducing that release. An unpublished draft is not a public update.
+The attached `scarlet-<version>-source.zip` is for source review or building, not the application installer. Repository `main` uses the **0.6.0 stable application baseline**, with refreshed documentation and the approved Help → Credits cleanup; it does not contain the a11 preview changes described in this FAQ. Those overlays mean **Code → Download ZIP** is not byte-for-byte identical to the original stable source archive. Prefer the release's frozen source attachment when reproducing that release. An unpublished draft is not a public update.
 
 Windows and Linux use the same release JAR. No PowerPC JAR is attached to these public releases.
 

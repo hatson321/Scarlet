@@ -12,7 +12,7 @@ import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.github.vrchatapi.model.GroupAuditLogEntry;
+import io.github.vrchatapi.model.GroupAuditLogEntryUnknown;
 import io.github.vrchatapi.model.InventoryItem;
 import io.github.vrchatapi.model.ModelFile;
 import io.github.vrchatapi.model.Print;
@@ -48,15 +48,160 @@ public interface ScarletDiscord extends Closeable
 
     public boolean isEmitting(GroupAuditTypeEx auditTypeEx);
 
-    public default void process(Scarlet scarlet, GroupAuditLogEntry entry)
+    /** Current locally observed roster; null location means caught up with no matching group instance. */
+    default void updateLivePlayerList(String location, List<ScarletLivePlayerlist.PlayerSnapshot> roster) {}
+
+    /** The local VRChat client stopped observing this instance; this is not a group-close audit. */
+    default void endLivePlayerList(String location) {}
+
+    public default void observeClientExitAudit(Scarlet scarlet, GroupAuditLogEntryUnknown entry)
     {
+        // Local client lifecycle must not depend on a Discord channel or delivery status.
+        if (scarlet.eventListener != null && scarlet.eventListener.clientExitMonitor != null) try
+        {
+            scarlet.eventListener.clientExitMonitor.audit(entry);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("Client exit audit observation failed; normal audit delivery continues", ex);
+        }
+    }
+
+    public default void process(Scarlet scarlet, GroupAuditLogEntryUnknown entry)
+    {
+        this.observeClientExitAudit(scarlet, entry);
+        // Timer cancellation is independent of Discord deduplication, channel configuration,
+        // redaction and delivery retries. A failed timer save must not drop the audit event.
+        if (scarlet.pendingModActions != null) try
+        {
+            scarlet.pendingModActions.observeTimedBanAudit(entry);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("Timed-ban reconciliation could not be saved; expiry still requires fresh server proof", ex);
+        }
+        synchronized (this)
+        {
+            ScarletAuditOutbox outbox = new ScarletAuditOutbox(scarlet.data.dir);
+            boolean pending = outbox.exists(entry.getId());
+            if (!pending && scarlet.data.auditEntryMetadataExists(entry.getId()))
+                return;
+            ScarletData.AuditEntryMetadata metadata = pending ? outbox.read(entry.getId()) : new ScarletData.AuditEntryMetadata();
+            if (!pending) metadata.entry = entry;
+            if (ScarletAuditOutbox.complete(metadata)) { outbox.finish(scarlet, metadata); return; }
+            if (!ScarletAuditOutbox.due(metadata, System.currentTimeMillis()) && !outbox.dependencyMayProceed(scarlet, metadata)) return;
+            if (ScarletAuditOutbox.isFollowup(metadata))
+            {
+                this.scheduleAuditFollowup(scarlet, entry.getId());
+                return;
+            }
+            metadata.setAuxData("deliveryState", "pending");
+            outbox.save(metadata);
+            try
+            {
+                this.processAuditEntry(scarlet, metadata);
+                if (this.requiresAuditFollowup(metadata))
+                {
+                    // The acknowledged parent is visible now. Persist the follow-up phase before
+                    // handing off: restart/retry must never resend it or repeat foreground work.
+                    metadata.setAuxData("deliveryState", "followup_pending");
+                    metadata.setAuxData("deliveryRetryAt", 0L);
+                    outbox.save(metadata);
+                    scarlet.data.auditEntryMetadata(entry.getId(), metadata);
+                    this.scheduleAuditFollowup(scarlet, entry.getId());
+                    return;
+                }
+                metadata.setAuxData("deliveryState", metadata.getAuxData("deliveryAcknowledged", false, e -> e.getAsBoolean())
+                    ? "delivered" : "suppressed");
+                outbox.finish(scarlet, metadata);
+            }
+            catch (ScarletAuditDependencyPending wait)
+            {
+                ScarletAuditOutbox.waitForDependency(metadata, wait.parentEventId, System.currentTimeMillis());
+                outbox.save(metadata);
+                LOG.debug("Audit event {} is waiting for its associated moderation thread {}; receipt retained",
+                    entry.getId(), wait.parentEventId);
+            }
+            catch (Exception ex)
+            {
+                // A terminal receipt must never become pending again after a local save failure.
+                if (!ScarletAuditOutbox.complete(metadata))
+                {
+                    int attempts = metadata.getAuxData("deliveryAttempts", 0, e -> e.getAsInt()) + 1;
+                    metadata.setAuxData("deliveryAttempts", attempts);
+                    metadata.setAuxData("deliveryRetryAt", System.currentTimeMillis() + ScarletAuditOutbox.retryDelay(attempts));
+                    outbox.save(metadata);
+                    if (attempts == 1 || (attempts & (attempts - 1)) == 0)
+                        this.emitOpsAlert("Audit delivery pending", "An audit event could not be delivered. Scarlet retained it and will retry. Check local logs and channel permissions.", 0xFEE75C);
+                }
+                LOG.error("Audit delivery remains pending for event {} ({}). Retry record retained.", entry.getId(), ex.getClass().getSimpleName());
+            }
+        }
+    }
+
+    public default boolean requiresAuditFollowup(ScarletData.AuditEntryMetadata metadata) { return false; }
+
+    /** Implementations enqueue only the durable identifier, not a stale mutable metadata object. */
+    public default void scheduleAuditFollowup(Scarlet scarlet, String id) {}
+
+    /** Mark dependent receipts eligible, then enqueue identifiers only; never deliver inline. */
+    public default void wakeAuditDependents(Scarlet scarlet, String parentId)
+    {
+        synchronized (this)
+        {
+            ScarletAuditOutbox outbox = new ScarletAuditOutbox(scarlet.data.dir);
+            int scheduled = 0;
+            for (String id : outbox.ids()) try
+            {
+                ScarletData.AuditEntryMetadata waiting = outbox.read(id);
+                if (!ScarletAuditOutbox.isDependency(waiting) || !Objects.equals(parentId, ScarletAuditOutbox.dependency(waiting))) continue;
+                waiting.setAuxData("deliveryRetryAt", 0L);
+                outbox.save(waiting);
+                this.scheduleAuditFollowup(scarlet, id);
+                if (++scheduled >= 100) break; // Remaining durable receipts are recovered by polling.
+            }
+            catch (RuntimeException ex)
+            {
+                LOG.warn("Unable to wake dependent audit {} ({}); polling will retry", id, ex.getClass().getSimpleName());
+            }
+        }
+    }
+
+    public default boolean isAuditProcessed(Scarlet scarlet, String id)
+    {
+        ScarletAuditOutbox outbox = new ScarletAuditOutbox(scarlet.data.dir);
+        return !outbox.exists(id) && scarlet.data.auditEntryMetadataExists(id);
+    }
+
+    public default void retryPending(Scarlet scarlet)
+    {
+        ScarletAuditOutbox outbox = new ScarletAuditOutbox(scarlet.data.dir);
+        int attempted = 0;
+        for (String id : outbox.ids()) try
+        {
+            ScarletData.AuditEntryMetadata metadata = outbox.read(id);
+            if (!ScarletAuditOutbox.due(metadata, System.currentTimeMillis()) && !outbox.dependencyMayProceed(scarlet, metadata)) continue;
+            if (++attempted > 100) break;
+            this.process(scarlet, metadata.entry);
+        }
+        catch (Exception ex)
+        {
+            LOG.error("Unable to replay audit outbox record {} ({}); record retained.", id, ex.getClass().getSimpleName());
+        }
+    }
+
+    public default void saveAuditDeliveryProgress(Scarlet scarlet, ScarletData.AuditEntryMetadata metadata)
+    {
+        ScarletAuditOutbox outbox = new ScarletAuditOutbox(scarlet.data.dir);
+        if (outbox.exists(metadata.entry.getId())) outbox.save(metadata);
+    }
+
+    public default void processAuditEntry(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta)
+    {
+        GroupAuditLogEntryUnknown entry = entryMeta.entry;
         GroupAuditType latype = GroupAuditType.of(entry.getEventType());
         if (latype == null)
             return;
-        if (scarlet.data.auditEntryMetadataExists(entry.getId()))
-            return; // Avoid logging events duplicated by the new
-        ScarletData.AuditEntryMetadata entryMeta = new ScarletData.AuditEntryMetadata();
-        entryMeta.entry = entry;
         if (entry.getActorDisplayName() == null)
         {
             User actor = scarlet.vrc.getUser(entry.getActorId());
@@ -66,7 +211,7 @@ public interface ScarletDiscord extends Closeable
             }
         }
         
-        if (scarlet.vrc.currentUserId == null || Objects.equals(scarlet.vrc.currentUserId, entry.getActorId()))
+        if (!entryMeta.hasAuxActor() && (scarlet.vrc.currentUserId == null || Objects.equals(scarlet.vrc.currentUserId, entry.getActorId())))
         {
             String pendingActorId = scarlet.pendingModActions.pollPending(latype, entry.getTargetId());
             if (pendingActorId != null)
@@ -155,7 +300,6 @@ public interface ScarletDiscord extends Closeable
         }
         finally
         {
-            scarlet.data.auditEntryMetadata(entry.getId(), entryMeta);
             if (entryMeta.hasMessage())
             {
                 LOG.info(entry.getEventType().replace('.', ' ')+" ("+entryMeta.getMessageDelineated()+")");
@@ -166,6 +310,8 @@ public interface ScarletDiscord extends Closeable
     public void emitUserModeration(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, User actor, User target, ScarletData.UserMetadata actorMeta, ScarletData.UserMetadata targetMeta, String history, String recent, ScarletData.AuditEntryMetadata parentEntryMeta, boolean reactiveKickFromBan);
     public default void processUserModeration(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta)
     {
+        long moderationStarted = System.nanoTime();
+        LOG.info("Preparing moderation audit {} for Discord", entryMeta.entry.getId());
         boolean isSecretStaff = scarlet.secretStaffList.isSecretStaffId(entryMeta.entry.getActorId())
                 || scarlet.secretStaffList.isSecretStaffId(entryMeta.auxActorId);
         String //type = entryMeta.entry.getEventType(),
@@ -190,9 +336,8 @@ public interface ScarletDiscord extends Closeable
         if (targetMeta == null)
             targetMeta = new ScarletData.UserMetadata();
         List<ScarletData.AuditEntryMetadata> auditEntryMetas = null;
+        targetMeta = scarlet.data.updateUserMetadata(targetId, metadata -> { metadata.addAuditEntryId(auditId); return metadata; });
         String[] auditEntryIds = targetMeta.auditEntryIds;
-        targetMeta.addAuditEntryId(auditId);
-        scarlet.data.userMetadata(targetId, targetMeta);
         
         if (auditEntryIds != null)
         {
@@ -203,7 +348,8 @@ public interface ScarletDiscord extends Closeable
                     ScarletData.AuditEntryMetadata found = scarlet.data.auditEntryMetadata(auditEntryId);
                     if (found != null)
                     {
-                        if (!isSecretStaff || (scarlet.secretStaffList.isSecretStaffId(found.entry.getActorId()) || scarlet.secretStaffList.isSecretStaffId(found.auxActorId)))
+                        if (!Objects.equals(auditId, auditEntryId)
+                            && ScarletAuditPrivacy.visible(found, scarlet.secretStaffList::isSecretStaffId, isSecretStaff))
                         {
                             if (auditEntryMetas == null)
                                 auditEntryMetas = new ArrayList<>();
@@ -321,6 +467,8 @@ public interface ScarletDiscord extends Closeable
             }
         }
         this.emitUserModeration(scarlet, entryMeta, actor, target, actorMeta, targetMeta, history, recent, parentEntryMeta, reactiveKickFromBan);
+        if (entryMeta.hasMessage()) LOG.info("Moderation audit {} parent delivery stage finished after {} ms",
+            entryMeta.entry.getId(), java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - moderationStarted));
     }
 
     public void emitInstanceCreate(Scarlet scarlet, ScarletData.AuditEntryMetadata entryMeta, String location);
@@ -493,10 +641,22 @@ public interface ScarletDiscord extends Closeable
             this.targetId = targetId;
             this.location = location;
         }
+        public Action(String action, String actorId, String targetId, String location, String requesterDiscordId,
+            String discordGuildId, String vrchatGroupId)
+        {
+            this(action, actorId, targetId, location);
+            this.requesterDiscordId = requesterDiscordId;
+            this.discordGuildId = discordGuildId;
+            this.vrchatGroupId = vrchatGroupId;
+        }
         public String action;
         public String actorId;
         public String targetId;
         public String location;
+        /** Original human requester; legacy queued bans without this identity are refused. */
+        public String requesterDiscordId;
+        public String discordGuildId;
+        public String vrchatGroupId;
     }
 
 }

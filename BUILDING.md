@@ -3,9 +3,10 @@
 ## Choose the matching source
 
 As of November 1, 2026, the published stable release is **0.6.0** and the latest
-published preview is **0.6.1-a11**. The plain **0.6.1** release is still a draft;
-the current development source identifies itself as **0.6.1-a12**. A development
-version or draft does not establish that a release is publicly available.
+published preview is **0.6.1-a11**. Repository `main` uses the **0.6.0 stable
+application baseline**. The plain **0.6.1** release is still a draft, and
+**0.6.1-a12** is separate local release preparation, not the version on `main` or
+a published release.
 
 To rebuild a published version, use its attached `scarlet-<version>-source.zip`
 and verify it against that release's `SHA256SUMS.txt` on the
@@ -14,10 +15,18 @@ frozen source snapshot prepared for the matching JAR. GitHub's **Code → Downlo
 ZIP** follows the selected branch, and the automatically generated tag archives
 are not a substitute for the attached release source archive.
 
-The default GitHub branch has not yet been aligned with the latest release source.
-Do not assume its version marker, dependency setup or build-script paths match
-these instructions. A documentation refresh alone does not synchronize that code.
-Use the matching attached archive for the entrypoints described here.
+The default GitHub branch is based on the frozen 0.6.0 release source, with
+refreshed documentation and the approved Help → Credits cleanup. These overlays
+mean the branch is not byte-for-byte identical to the original release archive.
+The accompanying feature reference remains labeled for the a11 preview; it does
+not change the stable application code. Use the matching attached archive for
+exact release-source reproduction and the entrypoints described here.
+
+Historical mobile/Android sources already on `main` are retained unchanged for
+history, but the two legacy Java integration classes are explicitly excluded
+from the desktop compiler. The obsolete Android build workflow is no longer
+active. Retaining these files does not restore mobile support or add a mobile
+artifact to the stable desktop build.
 
 Run the commands below from the extracted source directory containing `pom.xml`,
 `scripts/` and `libdave-maven/`. If you only want to run Scarlet, download the

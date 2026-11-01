@@ -1,10 +1,11 @@
 
 # Settings
 
-This reference describes the current development source and the features already
-available in the published 0.6.1-a11 preview. As of November 1, 2026, stable is
-0.6.0; plain 0.6.1 is still a draft and development 0.6.1-a12 is not a published
-release. A feature marked as added in a preview is not promised in stable 0.6.0.
+This reference describes the published **0.6.1-a11 preview**. Repository `main`
+uses the **0.6.0 stable application baseline**, not that preview. As of November 1,
+2026, plain 0.6.1 is still a draft and 0.6.1-a12 is separate local release
+preparation, not a published release. Do not assume every setting or protection
+described for a11 exists in stable 0.6.0.
 
 Use Scarlet's settings UI and authorized Discord configuration commands whenever
 possible. Save settings through the UI; do not replace a working configuration
@@ -418,7 +419,7 @@ Parameters are as such:
 ## file `settings.json`
 
 General settings for Scarlet. Settings below are separate controls, not a single
-“automatic mode.” Current source defaults for the main monitoring/client controls are:
+“automatic mode.” The 0.6.1-a11 preview defaults for the main monitoring/client controls are:
 
 | Setting key | Default | Meaning |
 |---|---|---|

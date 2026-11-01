@@ -19,7 +19,7 @@ public class DaveEncryptor implements Closeable
         this.handle = handle;
     }
 
-    final DaveLibrary.DAVEEncryptorHandle handle;
+    volatile DaveLibrary.DAVEEncryptorHandle handle;
     DaveLibrary.DAVEEncryptorProtocolVersionChangedCallback _callback;
 
     public boolean _isHandleValid()
@@ -28,9 +28,11 @@ public class DaveEncryptor implements Closeable
     }
 
     @Override
-    public void close()
+    public synchronized void close()
     {
-        DaveLibrary.INSTANCE.daveEncryptorDestroy(this.handle);
+        DaveLibrary.DAVEEncryptorHandle previous = this.handle;
+        this.handle = null;
+        if (previous != null) DaveLibrary.INSTANCE.daveEncryptorDestroy(previous);
     }
 
     public void setKeyRatchet(DaveKeyRatchet keyRatchet)

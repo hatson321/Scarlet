@@ -29,12 +29,14 @@ public class ScarletStaffList
         this.staffListFile = staffListFile;
         this.staffUserIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
         this.staffNames = new ConcurrentHashMap<>();
-        this.load();
+        if (!this.load())
+            throw new IllegalStateException("Staff list could not be loaded. Original data was preserved; restore or repair the file before restarting.");
     }
 
     final File staffListFile;
     final Set<String> staffUserIds;
     final Map<String, String> staffNames;
+    private boolean loadFailed;
 
     public String[] getStaffIds()
     {
@@ -100,18 +102,26 @@ public class ScarletStaffList
         return true;
     }
 
-    public boolean load()
+    public synchronized boolean load()
     {
-        if (!this.staffListFile.isFile())
+        boolean failedBefore = this.loadFailed;
+        this.loadFailed = true;
+        try
         {
-            this.save();
-            return true;
+            if (!ScarletData.existingRecord(this.staffListFile))
+            {
+                if (failedBefore) throw new java.io.IOException("Previously unreadable staff list must be restored or repaired before reload");
+                this.loadFailed = false;
+                return this.save();
+            }
         }
+        catch (Exception ex) { LOG.error("Could not inspect staff list storage", ex); return false; }
         List<String> ids;
         try (Reader r = MiscUtils.reader(this.staffListFile))
         {
             String[] loaded = Scarlet.GSON_PRETTY.fromJson(r, String[].class);
-            ids = loaded == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(Arrays.asList(loaded));
+            if (loaded == null) throw new java.io.IOException("Existing staff list must contain a JSON array");
+            ids = new java.util.ArrayList<>(Arrays.asList(loaded));
         }
         catch (Exception ex)
         {
@@ -121,15 +131,22 @@ public class ScarletStaffList
         ids.removeIf(Objects::isNull);
         this.staffUserIds.clear();
         this.staffUserIds.addAll(ids);
+        this.loadFailed = false;
         return true;
     }
 
-    public boolean save()
+    public synchronized boolean save()
     {
+        if (this.loadFailed)
+        {
+            LOG.error("Staff list storage was not loaded; refusing to overwrite the original data");
+            return false;
+        }
         String[] ids = this.getStaffIds();
-        try (Writer w = net.sybyline.scarlet.util.FileBackups.writer(this.staffListFile))
+        try (net.sybyline.scarlet.util.FileBackups.AtomicWriter w = net.sybyline.scarlet.util.FileBackups.writer(this.staffListFile))
         {
             Scarlet.GSON_PRETTY.toJson(ids, String[].class, w);
+            w.commit();
         }
         catch (Exception ex)
         {

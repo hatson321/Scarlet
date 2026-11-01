@@ -47,11 +47,6 @@ public interface DEnum<DE extends Enum<DE> & DEnum<DE, V>, V>
 
     public abstract V map(OptionMapping mapping);
 
-    public default DE mapEnum(OptionMapping mapping)
-    {
-        return of(this.self(), this.map(mapping));
-    }
-
     public abstract SelectOption option();
 
     public default SelectOption[] options()
@@ -60,11 +55,6 @@ public interface DEnum<DE extends Enum<DE> & DEnum<DE, V>, V>
     }
 
     public abstract V map(ModalMapping mapping);
-
-    public default DE mapEnum(ModalMapping mapping)
-    {
-        return of(this.self(), this.map(mapping));
-    }
 
     interface DEnumString<DES extends Enum<DES> & DEnumString<DES>> extends DEnum<DES, String>
     {
@@ -385,21 +375,18 @@ public interface DEnum<DE extends Enum<DE> & DEnum<DE, V>, V>
             this.choices = new Command.Choice[count];
             this.options = new SelectOption[count];
             this.byValue = new HashMap<>(count);
-            this.toValue = new HashMap<>(count);
             for (int ord = 0; ord < count; ord++)
             {
                 DE de = enums[ord];
                 this.choices[ord] = de.choice();
                 this.options[ord] = de.option();
                 this.byValue.put(de.value(), de);
-                this.toValue.put(de, de.value());
             }
         }
         final DE[] values;
         final Command.Choice[] choices;
         final SelectOption[] options;
         final Map<V, DE> byValue;
-        final Map<DE, V> toValue;
         public Command.Choice[] choices()
         {
             return this.choices;

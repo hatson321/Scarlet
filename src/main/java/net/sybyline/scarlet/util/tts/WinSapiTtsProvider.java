@@ -52,7 +52,12 @@ public class WinSapiTtsProvider implements TtsProvider
     public WinSapiTtsProvider(Path dir) throws InterruptedException, ExecutionException
     {
         this.dir = TtsProviderUtil.checkDir(dir);
-        this.executor.submit(this::initVoices).get();
+        net.sybyline.scarlet.util.BoundedInitialization.run(this.executor, () ->
+        {
+            this.comInitState = initializeComForLegacyWindows();
+            this.synth = new Invoker(CLSID_SpVoice, IID_ISpVoice);
+            this.initVoices();
+        }, 10_000L);
     }
 
     private final Path dir;
@@ -60,6 +65,7 @@ public class WinSapiTtsProvider implements TtsProvider
     private final Map<String, Invoker> voiceById = new LinkedHashMap<>();
     private final List<String> voices = new ArrayList<>();
     private volatile Invoker synth = null;
+    private ComInitState comInitState;
     private volatile String defaultVoiceId = null;
 
     private void initVoices()
@@ -72,7 +78,7 @@ public class WinSapiTtsProvider implements TtsProvider
         }
         if (this.voices.isEmpty())
         {
-            LOG.warn("No Windows TTS voices were discovered through SAPI. KozyBlake/Scarlet will keep TTS enabled, but announcements cannot speak until a compatible voice is installed.");
+            LOG.warn("No Windows TTS voices were discovered through SAPI. Hatson321/Scarlet Logger will keep TTS enabled, but announcements cannot speak until a compatible voice is installed.");
         }
         else
         {
@@ -127,7 +133,7 @@ public class WinSapiTtsProvider implements TtsProvider
             {
                 LOG.info("TTS: Voice '{}' appears to be an Online/Natural voice. "
                     + "It will work if NaturalVoiceSAPIAdapter is installed (see {}), "
-                    + "otherwise KozyBlake/Scarlet will automatically fall back to a Desktop voice if it fails.",
+                    + "otherwise Hatson321/Scarlet Logger will automatically fall back to a Desktop voice if it fails.",
                     label, NaturalVoiceSAPIAdapter_URL);
             }
         }
@@ -279,21 +285,26 @@ public class WinSapiTtsProvider implements TtsProvider
     @Override
     public void close()
     {
-        this.executor.submit(this::releaseVoices);
         this.executor.shutdown();
         try
         {
             if (this.executor.awaitTermination(10_000L, TimeUnit.MILLISECONDS))
                 return;
         }
-        catch (Exception ex)
+        catch (InterruptedException ex)
         {
+            Thread.currentThread().interrupt();
         }
         this.executor.shutdownNow();
     }
     private void releaseVoices()
     {
-        this.voiceById.values().forEach(Invoker::close);
+        // Release each token independently so a broken native voice cannot skip the rest.
+        this.voiceById.values().forEach(token -> {
+            try { token.close(); }
+            catch (RuntimeException ex) { LOG.warn("Unable to release a Windows TTS voice token", ex); }
+        });
+        this.voiceById.clear();
     }
 
     private class TtsThread extends Thread
@@ -306,18 +317,23 @@ public class WinSapiTtsProvider implements TtsProvider
         @Override
         public void run()
         {
-            ComInitState initState = initializeComForLegacyWindows();
-            try (Invoker spV = new Invoker(CLSID_SpVoice, IID_ISpVoice))
+            try
             {
-                WinSapiTtsProvider.this.synth = spV;
-                LOG.debug("Windows TTS COM initialized in {} mode", initState.mode);
                 super.run();
             }
             finally
             {
-                WinSapiTtsProvider.this.synth = null;
-                if (initState.shouldUninitialize)
-                    Ole32.INSTANCE.CoUninitialize();
+                try
+                {
+                    WinSapiTtsProvider.this.releaseVoices();
+                    if (WinSapiTtsProvider.this.synth != null) WinSapiTtsProvider.this.synth.close();
+                }
+                finally
+                {
+                    WinSapiTtsProvider.this.synth = null;
+                    if (WinSapiTtsProvider.this.comInitState != null && WinSapiTtsProvider.this.comInitState.shouldUninitialize)
+                        Ole32.INSTANCE.CoUninitialize();
+                }
             }
         }
     }

@@ -163,7 +163,7 @@ public class ScarletCacheCleanup
         if (this.isActivelyInUse())
         {
             // Show a non-blocking popup warning — don't delete while active
-            LOG.info("Cache cleanup deferred: {} file(s) eligible but KozyBlake/Scarlet is actively in use. "
+            LOG.info("Cache cleanup deferred: {} file(s) eligible but Hatson321/Scarlet Logger is actively in use. "
                 + "Will retry in {} minutes.", eligible.size(), RETRY_DELAY_MINUTES);
             this.scarlet.splash.queueFeedbackPopup(
                 null,

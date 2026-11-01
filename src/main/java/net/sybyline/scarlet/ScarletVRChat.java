@@ -16,7 +16,9 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -26,6 +28,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import javax.swing.JLabel;
@@ -82,10 +85,10 @@ import io.github.vrchatapi.model.CreateGroupInviteRequest;
 import io.github.vrchatapi.model.CreateInstanceRequest;
 import io.github.vrchatapi.model.CurrentUser;
 import io.github.vrchatapi.model.FileAnalysis;
-import io.github.vrchatapi.model.GetGroupPosts200Response;
+import io.github.vrchatapi.model.GroupPostsResponse;
 import io.github.vrchatapi.model.Group;
 import io.github.vrchatapi.model.GroupAnnouncement;
-import io.github.vrchatapi.model.GroupAuditLogEntry;
+import io.github.vrchatapi.model.GroupAuditLogEntryUnknown;
 import io.github.vrchatapi.model.GroupGalleryImage;
 import io.github.vrchatapi.model.GroupInstance;
 import io.github.vrchatapi.model.GroupJoinRequestAction;
@@ -98,6 +101,7 @@ import io.github.vrchatapi.model.GroupTransferable;
 import io.github.vrchatapi.model.Instance;
 import io.github.vrchatapi.model.InventoryItem;
 import io.github.vrchatapi.model.LimitedUserGroups;
+import io.github.vrchatapi.model.LimitedUserInstance;
 import io.github.vrchatapi.model.LimitedUserSearch;
 import io.github.vrchatapi.model.LimitedWorld;
 import io.github.vrchatapi.model.ModelFile;
@@ -106,7 +110,7 @@ import io.github.vrchatapi.model.PaginatedGroupAuditLogEntryList;
 import io.github.vrchatapi.model.Print;
 import io.github.vrchatapi.model.Prop;
 import io.github.vrchatapi.model.RespondGroupJoinRequest;
-import io.github.vrchatapi.model.SearchGroupMembers200Response;
+import io.github.vrchatapi.model.GroupMemberSearchResponse;
 import io.github.vrchatapi.model.SortOption;
 import io.github.vrchatapi.model.Success;
 import io.github.vrchatapi.model.TransferGroupRequest;
@@ -141,17 +145,25 @@ public class ScarletVRChat implements Closeable
         "/net/sybyline/scarlet/compat/SectigoPublicServerAuthenticationRootE46.pem"
     };
 
-    public static final Comparator<GroupAuditLogEntry> OLDEST_TO_NEWEST = Comparator.comparing(GroupAuditLogEntry::getCreatedAt);
+    public static final Comparator<GroupAuditLogEntryUnknown> OLDEST_TO_NEWEST = Comparator.comparing(GroupAuditLogEntryUnknown::getCreatedAt);
 
-    static void initJson()
+    private static Gson configuredJson;
+
+    static synchronized void initJson()
     {
-        Gson prev = JSON.getGson();
-        JSON.setGson(JSON.createGson().registerTypeAdapterFactory(new TypeAdapterFactory() {
+        Gson previous = JSON.getGson();
+        if (previous == configuredJson)
+            return;
+        // The SDK installs its model, date and byte-array adapters after createGson().
+        // Preserve those registrations while adding Scarlet's compatibility layer.
+        configuredJson = previous.newBuilder().registerTypeAdapterFactory(new TypeAdapterFactory() {
             @Override
             public <T> TypeAdapter<T> create(Gson gson, TypeToken<T> type) {
                 TypeAdapter<T> fbTA = Scarlet.GSON.getAdapter(type);
-                TypeAdapter<T> prevTA = prev.getAdapter(type);
-                TypeAdapter<JsonElement> prevJE = prev.getAdapter(JsonElement.class);
+                // Use this Gson's delegates so nested response objects also use Scarlet's
+                // audit-data adapter rather than an earlier Gson's generated model adapters.
+                TypeAdapter<T> prevTA = gson.getDelegateAdapter(this, type);
+                TypeAdapter<JsonElement> prevJE = gson.getAdapter(JsonElement.class);
                 return new TypeAdapter<T>() {
                     @Override
                     public void write(JsonWriter out, T value) throws IOException {
@@ -178,6 +190,7 @@ public class ScarletVRChat implements Closeable
                         // Based on Chloethecat's compatibility fix in
                         // https://github.com/Chloethecat/Scarlet (commit 17e6ca4).
                         normalizeCurrentUserPresenceAvatarTags(type, je);
+                        normalizeInstanceUserJoinDates(type, je);
 
                         T value;
                         try {
@@ -214,7 +227,8 @@ public class ScarletVRChat implements Closeable
                     }
                 };
             }
-        }).create());
+        }).registerTypeAdapterFactory(new ScarletAuditData.Factory(true)).create();
+        JSON.setGson(configuredJson);
     }
 
     public ScarletVRChat(Scarlet scarlet, String domain, File cookieFile)
@@ -255,7 +269,7 @@ public class ScarletVRChat implements Closeable
                     Request req = chain.request();
                     String u = ScarletVRChat.this.pendingUsername;
                     String p = ScarletVRChat.this.pendingPassword;
-                    if (u != null && !u.isEmpty() && p != null && !p.isEmpty())
+                    if (req.tag(SnapshotIdentity.class) == null && u != null && !u.isEmpty() && p != null && !p.isEmpty())
                     {
                         String uEnc = encodeVrchatBasicAuthComponent(u);
                         String pEnc = encodeVrchatBasicAuthComponent(p);
@@ -266,22 +280,9 @@ public class ScarletVRChat implements Closeable
                     }
                     return chain.proceed(req);
                 })
-                // ── Central VRChat API rate limiter ───────────────────────────────────
-                // Every VRChat call passes through here: wait for a token (burst
-                // smoothing) plus any active global backoff, then on a 429 response
-                // back the whole client off, honoring Retry-After when present.
-                .addInterceptor(chain ->
-                {
-                    ScarletVRChat.this.rateLimiter.acquire();
-                    Response response = chain.proceed(chain.request());
-                    if (response.code() == 429)
-                    {
-                        long backoffMs = parseRetryAfterMillis(response, 30_000L);
-                        ScarletVRChat.this.rateLimiter.penalize(backoffMs);
-                        ScarletVRChat.this.maybeAlertHardRateLimit(backoffMs);
-                    }
-                    return response;
-                })
+                // All calls share backoff; audit GETs additionally share a slow,
+                // single-permit pacer. Only scoped historical reads retry 429s.
+                .addInterceptor(this.auditRequests)
                 .addNetworkInterceptor(this::intercept)
                 .cookieJar(this.cookies)
                 .build())
@@ -293,6 +294,7 @@ public class ScarletVRChat implements Closeable
         Configuration.setDefaultApiClient(this.client);
         this.cookies.setup(this.client);
         this.groupId = MiscUtils.extractTypedUuid("grp", "", scarlet.settings.getStringOrRequireInput("vrchat_group_id", "VRChat Group ID", false));
+        ExtendedUserAgent.setCurrentUserId(null);
         ExtendedUserAgent.setCurrentGroupId(this.groupId);
         this.groupOwnerId = null;
         this.group = null;
@@ -324,6 +326,7 @@ public class ScarletVRChat implements Closeable
      * backoff.
      */
     final net.sybyline.scarlet.util.VrcRateLimiter rateLimiter = new net.sybyline.scarlet.util.VrcRateLimiter(10.0, 20.0);
+    final ScarletAuditRequestPolicy auditRequests = new ScarletAuditRequestPolicy(this.rateLimiter, this::maybeAlertHardRateLimit);
     final ScarletSettings.RegistryStringEncrypted username, password, totpsecret;
     final ScarletVRChatCookieJar cookies;
     final ApiClient client;
@@ -341,7 +344,10 @@ public class ScarletVRChat implements Closeable
     final Map<String, GroupRole> groupRoles;
     VrcAllGroupPermissions allGroupPermissions;
     CurrentUser currentUser;
-    String currentUserId;
+    volatile String currentUserId;
+    private static final Object SNAPSHOT_LIFECYCLE_LOCK = new Object();
+    private ScarletSnapshotFetch snapshotFetch;
+    private volatile boolean snapshotsStopped;
     final ScarletJsonCache<User> cachedUsers;
     final ScarletJsonCache<World> cachedWorlds;
     final ScarletJsonCache<Group> cachedGroups;
@@ -404,11 +410,6 @@ public class ScarletVRChat implements Closeable
         return "HTTP " + code + " " + MiscUtils.maybeEllipsis(512, body);
     }
 
-    /**
-     * Backoff duration for a 429, from the {@code Retry-After} header when present
-     * (seconds, or an HTTP-date), otherwise {@code defaultMs}. Clamped to a sane
-     * ceiling so a hostile/oversized value can't stall the client for minutes.
-     */
     /** Whether Scarlet currently holds a valid VRChat session (logged in). */
     public boolean isSessionValid()
     {
@@ -427,6 +428,7 @@ public class ScarletVRChat implements Closeable
      */
     public Boolean probeSession()
     {
+        long headerGeneration = ExtendedUserAgent.currentAuthenticationGeneration();
         try
         {
             AuthenticationApi auth = new AuthenticationApi(this.client);
@@ -434,10 +436,13 @@ public class ScarletVRChat implements Closeable
             if (user == null)
                 return null;
             this.currentUserId = (this.currentUser = user).getId();
+            ExtendedUserAgent.setCurrentUserIdIfUnchanged(user.getId(), headerGeneration);
             return Boolean.TRUE;
         }
         catch (ApiException apiex)
         {
+            if (apiex.getCode() == 401)
+                ExtendedUserAgent.setCurrentUserIdIfUnchanged(null, headerGeneration);
             return apiex.getCode() == 401 ? Boolean.FALSE : null;
         }
         catch (Exception ex)
@@ -504,32 +509,10 @@ public class ScarletVRChat implements Closeable
         return this.currentUser == null ? null : this.currentUser.getDisplayName();
     }
 
+    /** Conservative floor for missing/zero hints; longer server cooldowns are preserved. */
     static long parseRetryAfterMillis(Response response, long defaultMs)
     {
-        String header = response.header("Retry-After");
-        long ms = defaultMs;
-        if (header != null && !header.trim().isEmpty())
-        {
-            header = header.trim();
-            try
-            {
-                ms = Long.parseLong(header) * 1_000L;
-            }
-            catch (NumberFormatException nfe)
-            {
-                try
-                {
-                    long epoch = java.time.ZonedDateTime.parse(header, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME)
-                        .toInstant().toEpochMilli();
-                    ms = epoch - System.currentTimeMillis();
-                }
-                catch (Exception ignored)
-                {
-                    ms = defaultMs;
-                }
-            }
-        }
-        return Math.max(1_000L, Math.min(ms, 300_000L));
+        return ScarletAuditRequestPolicy.retryAfterMillis(response, defaultMs, System.currentTimeMillis());
     }
 
     private Response intercept(Interceptor.Chain chain) throws IOException
@@ -552,7 +535,7 @@ public class ScarletVRChat implements Closeable
             SSLContext sslContext = SSLContext.getInstance("TLS");
             sslContext.init(null, new TrustManager[] { composite }, null);
             builder.sslSocketFactory(sslContext.getSocketFactory(), composite);
-            LOG.warn("Using KozyBlake/Scarlet's bundled VRChat TLS compatibility certificates");
+            LOG.warn("Using Hatson321/Scarlet Logger's bundled VRChat TLS compatibility certificates");
         }
         catch (GeneralSecurityException | IOException ex)
         {
@@ -633,8 +616,8 @@ public class ScarletVRChat implements Closeable
         boolean enable = this.scarlet.settings.requireConfirmYesNo(
             "Scarlet detected that this Java runtime cannot validate VRChat's HTTPS certificate chain.\n\n"
             + "This usually happens on older Windows and Java installs with outdated root certificates.\n\n"
-            + "Would you like KozyBlake/Scarlet to enable its built-in VRChat compatibility certificates on next launch?\n\n"
-            + "This only affects KozyBlake/Scarlet's VRChat HTTPS client.\n"
+            + "Would you like Hatson321/Scarlet Logger to enable its built-in VRChat compatibility certificates on next launch?\n\n"
+            + "This only affects Hatson321/Scarlet Logger's VRChat HTTPS client.\n"
             + "It does NOT modify your Windows certificate store or Java installation.",
             "Enable VRChat TLS compatibility?");
         if (!enable)
@@ -643,13 +626,13 @@ public class ScarletVRChat implements Closeable
         if (!GraphicsEnvironment.isHeadless())
         {
             JOptionPane.showMessageDialog(null,
-                "KozyBlake/Scarlet saved the VRChat TLS compatibility setting.\nPlease restart KozyBlake/Scarlet and try logging in again.",
-                "Restart KozyBlake/Scarlet",
+                "Hatson321/Scarlet Logger saved the VRChat TLS compatibility setting.\nPlease restart Hatson321/Scarlet Logger and try logging in again.",
+                "Restart Hatson321/Scarlet Logger",
                 JOptionPane.INFORMATION_MESSAGE);
         }
         else
         {
-            LOG.warn("KozyBlake/Scarlet saved the VRChat TLS compatibility setting. Restart KozyBlake/Scarlet and try logging in again.");
+            LOG.warn("Hatson321/Scarlet Logger saved the VRChat TLS compatibility setting. Restart Hatson321/Scarlet Logger and try logging in again.");
         }
         return true;
     }
@@ -738,6 +721,11 @@ public class ScarletVRChat implements Closeable
 
     private void login(boolean isRefresh)
     {
+        // Keep cached account state for the existing recovery scheduler, but do not
+        // identify avatar queries with a prior account while re-authenticating.
+        long headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
+        String authenticatedPrimaryUserId = null;
+        boolean loginFinalized = false;
 try
 {
         try
@@ -785,7 +773,7 @@ try
                     LOG.info("Logged in (cached-verified)");
                     try
                     {
-                        this.currentUserId = (this.currentUser = this.getCurrentUser(auth)).getId();
+                        authenticatedPrimaryUserId = this.currentUserId = (this.currentUser = this.getCurrentUser(auth)).getId();
                     }
                     catch (ApiException apiex)
                     {
@@ -811,7 +799,7 @@ try
                 if (data.has("id"))
                 {
                     LOG.info("Logged in (cached)");
-                    this.currentUserId = (this.currentUser = JSON.getGson().fromJson(data, CurrentUser.class)).getId();
+                    authenticatedPrimaryUserId = this.currentUserId = (this.currentUser = JSON.getGson().fromJson(data, CurrentUser.class)).getId();
                     return;
                 }
             }
@@ -860,7 +848,7 @@ try
                         if (data.has("id"))
                         {
                             LOG.info("Logged in (credentials)");
-                            this.currentUserId = (this.currentUser = JSON.getGson().fromJson(data, CurrentUser.class)).getId();
+                            authenticatedPrimaryUserId = this.currentUserId = (this.currentUser = JSON.getGson().fromJson(data, CurrentUser.class)).getId();
                             return;
                         }
                     }
@@ -886,7 +874,11 @@ try
                             + "(You do NOT need to touch the Registry or AppData.)",
                             "Invalid credentials - reset?");
                         if (reset)
+                        {
                             this.clearCredentials();
+                            // The retry is a new primary authentication attempt after the reset.
+                            headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
+                        }
                     }
                     data = null;
                 }
@@ -973,7 +965,7 @@ try
 
             try
             {
-                this.currentUserId = (this.currentUser = this.getCurrentUser(auth)).getId();
+                authenticatedPrimaryUserId = this.currentUserId = (this.currentUser = this.getCurrentUser(auth)).getId();
             }
             catch (ApiException apiex)
             {
@@ -986,11 +978,12 @@ try
         {
             this.save();
             this.updateGroupInfo();
+            loginFinalized = true;
         }
 }
 finally
 {
-    ExtendedUserAgent.setCurrentUserId(this.currentUserId);
+    ExtendedUserAgent.completePrimaryAuthentication(loginFinalized ? authenticatedPrimaryUserId : null, headerGeneration);
 }
     }
 
@@ -1035,8 +1028,10 @@ finally
         String getP() { return this.altPassword == null ? null : this.altPassword.getOrNull(); }
         String getS() { return this.altSecret == null ? null : this.altSecret.getOrNull(); }
     }
-    private String loginAlt(String context, boolean isRefresh)
+    private synchronized String loginAlt(String context, boolean isRefresh)
     {
+        if (context != null && this.cookies.isRemoved(context))
+            return null;
         try (AltCred alt = new AltCred(context))
         {
             try
@@ -1288,8 +1283,16 @@ finally
             {
                 if (this.scarlet.settings.requireConfirmYesNo("The main VRChat account does not appear\nto be part of the group, delete credentials?", "Wrong account?"))
                 {
-                    this.cookies.clear();
-                    this.cookies.save();
+                    long headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
+                    try
+                    {
+                        this.cookies.clear();
+                        this.cookies.save();
+                    }
+                    finally
+                    {
+                        ExtendedUserAgent.completePrimaryAuthentication(null, headerGeneration);
+                    }
                     throw new IllegalStateException();
                 }
             }
@@ -1391,6 +1394,49 @@ finally
         return tags.contains(adminTag.value);
     }
     /**
+     * The SDK models LimitedUserInstance.date_joined as OffsetDateTime, but instance
+     * responses can contain a calendar date. UTC midnight is only an SDK-compatible
+     * representation of that date, not a claim about the exact account-creation time.
+     * Keep this local to this model/field: closure timestamps still require a time.
+     */
+    private static void normalizeInstanceUserJoinDates(TypeToken<?> type, JsonElement element)
+    {
+        if (element == null || !element.isJsonObject())
+            return;
+        Class<?> rawType = type.getRawType();
+        JsonObject object = element.getAsJsonObject();
+        if (rawType == LimitedUserInstance.class)
+        {
+            normalizeInstanceUserJoinDate(object);
+        }
+        else if (rawType == Instance.class)
+        {
+            // Normalize here too: if generated Instance validation rejects an
+            // unrelated new field, the fallback parser uses its own nested adapters.
+            JsonElement users = object.get("users");
+            if (users != null && users.isJsonArray())
+                for (JsonElement user : users.getAsJsonArray())
+                    if (user != null && user.isJsonObject())
+                        normalizeInstanceUserJoinDate(user.getAsJsonObject());
+        }
+    }
+
+    private static void normalizeInstanceUserJoinDate(JsonObject user)
+    {
+        JsonElement joined = user.get("date_joined");
+        if (joined == null || !joined.isJsonPrimitive() || !joined.getAsJsonPrimitive().isString())
+            return;
+        String value = joined.getAsString();
+        if (value.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}"))
+        {
+            // ISO LocalDate parsing is strict: impossible dates must not become
+            // a different day or be silently removed from the response.
+            LocalDate date = LocalDate.parse(value);
+            user.addProperty("date_joined", date.atStartOfDay().atOffset(ZoneOffset.UTC).toString());
+        }
+    }
+
+    /**
      * Compatibility shim for VRChat's current auth-user payload. The 1.21.0 SDK
      * models presence.currentAvatarTags as a String although the API returns an array.
      * <u><i><b>REMOVE AFTER THE API SDK MODELS THE PRESENCE FIELD AS AN ARRAY</b></i></u>
@@ -1454,6 +1500,7 @@ finally
 
     private boolean logout(boolean isRefresh)
     {
+        long headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
         try
         {
             AuthenticationApi auth = new AuthenticationApi(this.client);
@@ -1465,10 +1512,16 @@ finally
             LOG.error("Error logging out", apiex);
             return false;
         }
+        finally
+        {
+            ExtendedUserAgent.completePrimaryAuthentication(null, headerGeneration);
+        }
     }
 
     private boolean logoutAlt(String context, boolean isRefresh)
     {
+        if (context != null && this.cookies.isRemoved(context))
+            return false;
         try (ScarletVRChatCookieJar.AltCredContext alt = this.cookies.new AltCredContext(context))
         {
             AuthenticationApi auth = new AuthenticationApi(this.client);
@@ -1514,41 +1567,54 @@ finally
         }
     }
 
-    public List<GroupAuditLogEntry> auditQuery(OffsetDateTime from, OffsetDateTime to)
+    public List<GroupAuditLogEntryUnknown> auditQuery(OffsetDateTime from, OffsetDateTime to)
     {
         return this.auditQuery(from, to, null, null, null);
     }
-    public List<GroupAuditLogEntry> auditQueryTargeting(String targetIds, int daysBack)
+    public List<GroupAuditLogEntryUnknown> auditQueryHistorical(OffsetDateTime from, OffsetDateTime to,
+            String actorIds, String eventTypes, String targetIds)
+    {
+        try (ScarletAuditRequestPolicy.History scope = this.auditRequests.historicalRead())
+        {
+            List<GroupAuditLogEntryUnknown> result = this.auditQuery(from, to, actorIds, eventTypes, targetIds);
+            if (scope.expired())
+            {
+                LOG.warn("Historical audit query exceeded its time budget; no complete summary result returned");
+                return null;
+            }
+            return result;
+        }
+    }
+    public List<GroupAuditLogEntryUnknown> auditQueryTargeting(String targetIds, int daysBack)
     {
         OffsetDateTime to = OffsetDateTime.now(),
                        from = to.minusDays(daysBack);
         return this.auditQuery(from, to, null, null, targetIds);
     }
-    public List<GroupAuditLogEntry> auditQueryActored(String actorIds, int daysBack)
+    public List<GroupAuditLogEntryUnknown> auditQueryActored(String actorIds, int daysBack)
     {
         OffsetDateTime to = OffsetDateTime.now(),
                        from = to.minusDays(daysBack);
         return this.auditQuery(from, to, actorIds, null, null);
     }
-    public List<GroupAuditLogEntry> auditQuery(OffsetDateTime from, OffsetDateTime to, String actorIds, String eventTypes, String targetIds)
+    public List<GroupAuditLogEntryUnknown> auditQuery(OffsetDateTime from, OffsetDateTime to, String actorIds, String eventTypes, String targetIds)
     {
         GroupsApi groups = new GroupsApi(this.client);
         try
         {
-            List<GroupAuditLogEntry> audits = new ArrayList<>();
+            List<GroupAuditLogEntryUnknown> audits = new ArrayList<>();
             int offset = 0, batchSize = 100;
             PaginatedGroupAuditLogEntryList pgalel;
             pgalel = groups.getGroupAuditLogs(this.groupId, batchSize, offset, from, to, actorIds, eventTypes, targetIds);
             while (Boolean.TRUE.equals(pgalel.getHasNext()))
             {
                 if (pgalel.getResults() != null)
-                    audits.addAll(pgalel.getResults());
+                    audits.addAll(ScarletAuditData.entries(pgalel));
                 offset += batchSize;
-                MiscUtils.sleep(250L);
                 pgalel = groups.getGroupAuditLogs(this.groupId, batchSize, offset, from, to, actorIds, eventTypes, targetIds);
             }
             if (pgalel.getResults() != null)
-                audits.addAll(pgalel.getResults());
+                audits.addAll(ScarletAuditData.entries(pgalel));
             audits.sort(OLDEST_TO_NEWEST);
             return audits;
         }
@@ -1557,7 +1623,7 @@ finally
             this.scarlet.checkVrcRefresh(apiex);
             if (this.isAuditEndpointNotImplemented(apiex))
             {
-                List<GroupAuditLogEntry> fallback = this.auditQueryFallback(from, to, actorIds, eventTypes, targetIds);
+                List<GroupAuditLogEntryUnknown> fallback = this.auditQueryFallback(from, to, actorIds, eventTypes, targetIds);
                 if (fallback != null)
                     return fallback;
             }
@@ -1594,46 +1660,31 @@ finally
         return message != null && message.toLowerCase().contains("not implemented by our system");
     }
 
-    private List<GroupAuditLogEntry> auditQueryFallback(OffsetDateTime from, OffsetDateTime to, String actorIds, String eventTypes, String targetIds)
+    private List<GroupAuditLogEntryUnknown> auditQueryFallback(OffsetDateTime from, OffsetDateTime to, String actorIds, String eventTypes, String targetIds)
     {
         for (AuditFallbackMode mode : AuditFallbackMode.values())
         {
             try
             {
-                LOG.warn("VRChat rejected the generated audit-log request for group `{}`; retrying with KozyBlake/Scarlet audit fallback mode `{}`", this.groupId, mode.name());
-                List<GroupAuditLogEntry> audits = new ArrayList<>();
-                int offset = 0, batchSize = 100;
-                PaginatedGroupAuditLogEntryList page = this.getGroupAuditLogsRaw(batchSize, offset, from, to, actorIds, eventTypes, targetIds, mode);
-                if (page == null)
-                    return Collections.emptyList();
-                while (Boolean.TRUE.equals(page.getHasNext()))
-                {
-                    if (page.getResults() != null)
-                        audits.addAll(page.getResults());
-                    offset += batchSize;
-                    MiscUtils.sleep(250L);
-                    page = this.getGroupAuditLogsRaw(batchSize, offset, from, to, actorIds, eventTypes, targetIds, mode);
-                    if (page == null)
-                        break;
-                }
-                if (page != null && page.getResults() != null)
-                    audits.addAll(page.getResults());
-                audits.sort(OLDEST_TO_NEWEST);
-                LOG.warn("KozyBlake/Scarlet audit fallback mode `{}` succeeded for group `{}` with {} entrie(s)", mode.name(), this.groupId, Integer.valueOf(audits.size()));
+                LOG.warn("VRChat rejected the generated audit-log request for group `{}`; retrying with Hatson321/Scarlet Logger audit fallback mode `{}`", this.groupId, mode.name());
+                List<GroupAuditLogEntryUnknown> audits = ScarletAuditQueryFallback.collect((batchSize, offset) -> {
+                    return this.getGroupAuditLogsRaw(batchSize, offset, from, to, actorIds, eventTypes, targetIds, mode);
+                }, from, to, actorIds, eventTypes, targetIds);
+                LOG.warn("Hatson321/Scarlet Logger audit fallback mode `{}` succeeded for group `{}` with {} entrie(s)", mode.name(), this.groupId, Integer.valueOf(audits.size()));
                 return audits;
             }
             catch (ApiException apiex)
             {
                 if (!this.isAuditEndpointNotImplemented(apiex))
                 {
-                    LOG.error("KozyBlake/Scarlet audit fallback mode `{}` failed", mode.name(), apiex);
+                    LOG.error("Hatson321/Scarlet Logger audit fallback mode `{}` failed", mode.name(), apiex);
                     return null;
                 }
-                LOG.warn("KozyBlake/Scarlet audit fallback mode `{}` still hit VRChat's `not implemented` response", mode.name());
+                LOG.warn("Hatson321/Scarlet Logger audit fallback mode `{}` still hit VRChat's `not implemented` response", mode.name());
             }
             catch (Exception ex)
             {
-                LOG.error("KozyBlake/Scarlet audit fallback mode `{}` failed", mode.name(), ex);
+                LOG.error("Hatson321/Scarlet Logger audit fallback mode `{}` failed", mode.name(), ex);
                 return null;
             }
         }
@@ -1642,29 +1693,10 @@ finally
 
     private Integer auditQueryCountFallback(OffsetDateTime from, OffsetDateTime to, String actorIds, String eventTypes, String targetIds)
     {
-        for (AuditFallbackMode mode : AuditFallbackMode.values())
-        {
-            try
-            {
-                PaginatedGroupAuditLogEntryList page = this.getGroupAuditLogsRaw(1, 0, from, to, actorIds, eventTypes, targetIds, mode);
-                if (page != null)
-                    return page.getTotalCount();
-            }
-            catch (ApiException apiex)
-            {
-                if (!this.isAuditEndpointNotImplemented(apiex))
-                {
-                    LOG.error("KozyBlake/Scarlet audit-count fallback mode `{}` failed", mode.name(), apiex);
-                    return null;
-                }
-            }
-            catch (Exception ex)
-            {
-                LOG.error("KozyBlake/Scarlet audit-count fallback mode `{}` failed", mode.name(), ex);
-                return null;
-            }
-        }
-        return null;
+        // A weakened request's server totalCount includes entries excluded by the
+        // original filters. Count only a complete, locally filtered collection.
+        List<GroupAuditLogEntryUnknown> entries = this.auditQueryFallback(from, to, actorIds, eventTypes, targetIds);
+        return entries == null ? null : Integer.valueOf(entries.size());
     }
 
     private PaginatedGroupAuditLogEntryList getGroupAuditLogsRaw(int n, int offset, OffsetDateTime from, OffsetDateTime to, String actorIds, String eventTypes, String targetIds, AuditFallbackMode mode) throws ApiException
@@ -1723,7 +1755,7 @@ finally
         UsersApi users = new UsersApi(this.client);
         try
         {
-            return users.searchUsers(name, null, n, offset, null);
+            return users.searchUsers(name, null, null, null, n, offset, null);
         }
         catch (ApiException apiex)
         {
@@ -1758,7 +1790,9 @@ finally
         UsersApi users = new UsersApi(this.client);
         try
         {
-            user = users.getUser(userId);
+            // The SDK's UserResponse also contains private self-account fields. Retain
+            // only the public User projection in Scarlet's existing profile cache.
+            user = this.client.<User>execute(users.getUserCall(userId, null), User.class).getData();
             this.cachedUsers.put(userId, user);
             return user;
         }
@@ -1782,7 +1816,7 @@ finally
         UsersApi users = new UsersApi(this.client);
         try
         {
-            User user = users.getUser(userId);
+            User user = this.client.<User>execute(users.getUserCall(userId, null), User.class).getData();
             this.cachedUsers.put(userId, user);
             this.cachedUsers.remove404(userId);
             return user;
@@ -2096,6 +2130,86 @@ finally
         }
         return null;
     }
+    /** Fresh primary-session occupancy only; no cache, model defaults or fallback endpoint. */
+    JsonElement readIdleInstance(String location, java.util.function.BooleanSupplier allowed)
+    {
+        return this.idleInstanceRequest(location, false, allowed);
+    }
+
+    /** Optional unattended closure never requests a hard close and never retries a mutation. */
+    boolean softCloseIdleInstance(String location, java.util.function.BooleanSupplier allowed)
+    {
+        return this.idleInstanceRequest(location, true, allowed) != null;
+    }
+
+    private JsonElement idleInstanceRequest(String location, boolean close, java.util.function.BooleanSupplier allowed)
+    {
+        final String group = this.groupId, user = this.currentUserId;
+        final long generation = ExtendedUserAgent.currentAuthenticationGeneration();
+        java.util.function.BooleanSupplier valid = () -> allowed.getAsBoolean()
+            && !Thread.currentThread().isInterrupted()
+            && Objects.equals(group, this.groupId) && Objects.equals(user, this.currentUserId)
+            && ExtendedUserAgent.isPrimaryAuthenticationStable(generation)
+            && this.pendingUsername == null && this.pendingPassword == null
+            && ScarletVRChatCookieJar._context.get() == null && ScarletVRChatCookieJar._context2.get() == null;
+        if (user == null || ScarletIdleInstanceClose.groupLocation(location, group) == null || !valid.getAsBoolean())
+            return null;
+        try
+        {
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Accept", "application/json");
+            Request request = this.client.buildCall(null, "/instances/" + location, close ? "DELETE" : "GET",
+                new ArrayList<>(), new ArrayList<>(), null, headers, new HashMap<>(), new HashMap<>(),
+                new String[]{"authCookie"}, null).request();
+            if (close) request = request.newBuilder().url(request.url().newBuilder()
+                .addQueryParameter("hardClose", "false").build()).build();
+            OkHttpClient http = idleCloseHttpClient(this.client.getHttpClient(), this.cookies.copy(), valid);
+            if (!valid.getAsBoolean()) return null;
+            try (Response response = http.newCall(request).execute())
+            {
+                if (!response.isSuccessful() || !valid.getAsBoolean()) return null;
+                if (close) return new JsonPrimitive(true);
+                if (response.body() == null) return null;
+                response.body().source().request(2L * 1024L * 1024L + 1L);
+                if (response.body().source().buffer().size() > 2L * 1024L * 1024L) return null;
+                JsonElement result = parseBanResponse(response.body().string());
+                return valid.getAsBoolean() ? result : null;
+            }
+        }
+        catch (ApiException | IOException | RuntimeException ex)
+        {
+            // Optional enforcement fails closed. Never log credentials or response bodies.
+            LOG.debug("Idle instance {} unavailable ({})", close ? "soft close" : "occupancy", ex.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    static OkHttpClient idleCloseHttpClient(OkHttpClient base, List<okhttp3.Cookie> primaryCookies,
+        java.util.function.BooleanSupplier allowed)
+    {
+        java.util.concurrent.atomic.AtomicBoolean dispatched = new java.util.concurrent.atomic.AtomicBoolean();
+        return snapshotHttpClient(base, primaryCookies, allowed).newBuilder()
+            .cache(null).retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false)
+            .authenticator(okhttp3.Authenticator.NONE).proxyAuthenticator(okhttp3.Authenticator.NONE)
+            // Runs after existing application interceptors, including shared rate-limit waits.
+            .addInterceptor(chain -> {
+                checkIdleDispatch(chain, allowed);
+                return chain.proceed(chain.request().newBuilder().removeHeader("Authorization").removeHeader("Cookie").build());
+            })
+            // Last check after connection establishment; reject automatic HTTP follow-ups too.
+            .addNetworkInterceptor(chain -> {
+                checkIdleDispatch(chain, allowed);
+                if (!dispatched.compareAndSet(false, true)) throw new IOException("Idle instance request already dispatched");
+                return chain.proceed(chain.request());
+            }).build();
+    }
+
+    private static void checkIdleDispatch(Interceptor.Chain chain, java.util.function.BooleanSupplier allowed) throws IOException
+    {
+        if (chain.call().isCanceled() || Thread.currentThread().isInterrupted() || !allowed.getAsBoolean())
+            throw new IOException("Idle instance request cancelled");
+    }
+
     public Instance closeInstance(String worldId, String instanceId, Boolean hardClose, OffsetDateTime closedAt)
     {
         InstancesApi instances = new InstancesApi(this.client);
@@ -2309,6 +2423,13 @@ finally
         GroupMember member = this.getGroupMembership(groupId, targetUserId);
         return member == null ? null : member.getMembershipStatus();
     }
+
+    /** A suspended timer must not query a newly selected group's membership. */
+    GroupMemberStatus getTimedBanMembershipStatus(String expectedGroupId, String targetUserId)
+    {
+        if (expectedGroupId == null || !expectedGroupId.equals(this.groupId)) return null;
+        return this.getGroupMembershipStatus(expectedGroupId, targetUserId);
+    }
     public GroupMember getGroupMembership(String groupId, String targetUserId)
     {
         // Validate required parameters
@@ -2434,7 +2555,7 @@ finally
             while (members.size() < limit)
             {
                 int n = Math.min(batchSize, limit - members.size());
-                SearchGroupMembers200Response response = groups.searchGroupMembers(groupId, query, n, offset);
+                GroupMemberSearchResponse response = groups.searchGroupMembers(query, groupId, n, offset);
                 List<GroupMember> page = response == null ? null : response.getResults();
                 if (page == null || page.isEmpty())
                     break;
@@ -2599,7 +2720,7 @@ finally
             while (posts.size() < limit)
             {
                 int n = Math.min(batchSize, limit - posts.size());
-                GetGroupPosts200Response response = groups.getGroupPosts(groupId, n, offset, Boolean.valueOf(publicOnly));
+                GroupPostsResponse response = groups.getGroupPosts(groupId, n, offset, Boolean.valueOf(publicOnly));
                 List<GroupPost> page = response == null ? null : response.getPosts();
                 if (page == null || page.isEmpty())
                     break;
@@ -2704,26 +2825,20 @@ finally
         {
             List<GroupGalleryImage> images = new ArrayList<>();
             int offset = 0, batchSize = 100;
-            List<GroupGalleryImage> ggil;
-            {
-                io.github.vrchatapi.model.GetGroupGalleryImages200Response ggResp = groups.getGroupGalleryImages(groupId, galleryId, batchSize, offset, null, approved);
-                Object ggInst = ggResp == null ? null : ggResp.getActualInstance();
-                @SuppressWarnings("unchecked")
-                List<GroupGalleryImage> ggilResolved = ggInst instanceof List ? (List<GroupGalleryImage>) ggInst : null;
-                ggil = ggilResolved;
-            }
+            // With v omitted the endpoint returns an array. SDK 1.22 exposes Object,
+            // which would otherwise produce maps instead of GroupGalleryImage models.
+            Type imageListType = new TypeToken<List<GroupGalleryImage>>(){}.getType();
+            List<GroupGalleryImage> ggil = this.client.<List<GroupGalleryImage>>execute(
+                groups.getGroupGalleryImagesCall(groupId, galleryId, batchSize, offset, null, approved, null),
+                imageListType).getData();
             while (ggil != null && !ggil.isEmpty())
             {
                 images.addAll(ggil);
                 offset += ggil.size();
                 MiscUtils.sleep(250L);
-                {
-                io.github.vrchatapi.model.GetGroupGalleryImages200Response ggResp = groups.getGroupGalleryImages(groupId, galleryId, batchSize, offset, null, approved);
-                Object ggInst = ggResp == null ? null : ggResp.getActualInstance();
-                @SuppressWarnings("unchecked")
-                List<GroupGalleryImage> ggilResolved = ggInst instanceof List ? (List<GroupGalleryImage>) ggInst : null;
-                ggil = ggilResolved;
-            }
+                ggil = this.client.<List<GroupGalleryImage>>execute(
+                    groups.getGroupGalleryImagesCall(groupId, galleryId, batchSize, offset, null, approved, null),
+                    imageListType).getData();
             }
             return images;
         }
@@ -2737,33 +2852,226 @@ finally
 
     public boolean banFromGroup(String targetUserId)
     {
+        return this.banFromGroupDetailed(targetUserId) == GroupModerationResult.SUCCEEDED;
+    }
+
+    public enum GroupModerationResult
+    {
+        SUCCEEDED, REJECTED, UNKNOWN
+    }
+
+    static GroupModerationResult groupModerationFailure(int status)
+    {
+        switch (status)
+        {
+        case 400: case 401: case 403: case 404: case 405: case 409: case 422: case 429:
+            return GroupModerationResult.REJECTED;
+        default:
+            // A timeout, transport failure or server error does not establish that
+            // the server did not apply the request before its response was lost.
+            return GroupModerationResult.UNKNOWN;
+        }
+    }
+
+    public GroupModerationResult banFromGroupDetailed(String targetUserId)
+    {
+        // Desktop-origin operations act as the locally authenticated account, not a Discord requester.
+        GroupBanResult result = this.banFromGroupAs(this.currentUserId, targetUserId, false);
+        return result.authorization.allowed() ? result.outcome : GroupModerationResult.REJECTED;
+    }
+
+    public static final class GroupBanResult
+    {
+        public final ScarletBanAuthorization.Decision authorization;
+        public final GroupModerationResult outcome;
+        public final OffsetDateTime serverBanAt;
+        public final String serverActorId;
+
+        GroupBanResult(ScarletBanAuthorization.Decision authorization, GroupModerationResult outcome)
+        {
+            this(authorization, outcome, null, null);
+        }
+
+        GroupBanResult(ScarletBanAuthorization.Decision authorization, GroupModerationResult outcome,
+            OffsetDateTime serverBanAt, String serverActorId)
+        {
+            this.authorization = authorization;
+            this.outcome = outcome;
+            this.serverBanAt = serverBanAt;
+            this.serverActorId = serverActorId;
+        }
+    }
+
+    static final class GroupBanSubmission
+    {
+        final GroupModerationResult outcome;
+        final OffsetDateTime bannedAt;
+        GroupBanSubmission(GroupModerationResult outcome, OffsetDateTime bannedAt)
+        {
+            this.outcome = outcome;
+            this.bannedAt = bannedAt;
+        }
+    }
+
+    public ScarletBanAuthorization.Decision checkBanAuthorization(String actorId, String targetId, boolean allowPermissionOverride)
+    {
+        return this.checkBanAuthorization(this.groupId, this.currentUserId, actorId, targetId, allowPermissionOverride);
+    }
+
+    private ScarletBanAuthorization.Decision checkBanAuthorization(String expectedGroupId, String expectedBotId,
+            String actorId, String targetId, boolean allowPermissionOverride)
+    {
+        if (expectedGroupId == null || expectedBotId == null || actorId == null || targetId == null)
+            return ScarletBanAuthorization.Decision.unverified();
+        try
+        {
+            // Never use cached models or the null-on-403/404 convenience membership wrapper here.
+            // Strict raw parsing prevents generated defaults from making malformed responses look roleless.
+            Group group = ScarletBanSnapshot.group(this.readBanGroup(expectedGroupId), expectedGroupId);
+            GroupMember actor = ScarletBanSnapshot.member(this.readBanMember(expectedGroupId, actorId), expectedGroupId, actorId);
+            GroupMember bot = actorId.equals(expectedBotId) ? actor
+                : ScarletBanSnapshot.member(this.readBanMember(expectedGroupId, expectedBotId), expectedGroupId, expectedBotId);
+            JsonElement targetJson = this.readBanMember(expectedGroupId, targetId);
+            GroupMember target = ScarletBanSnapshot.member(targetJson, expectedGroupId, targetId);
+            if (!Objects.equals(expectedGroupId, this.groupId) || !Objects.equals(expectedBotId, this.currentUserId))
+                return ScarletBanAuthorization.Decision.unverified();
+            return ScarletBanAuthorization.evaluate(group, actorId, targetId, expectedBotId, actor, target, bot,
+                allowPermissionOverride, targetJson != null && targetJson.isJsonNull());
+        }
+        catch (ApiException ex)
+        {
+            LOG.warn("VRChat ban authorization could not be verified (HTTP {}); no ban sent", ex.getCode());
+            return ScarletBanAuthorization.Decision.unverified();
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("VRChat ban authorization received unverifiable state; no ban sent");
+            return ScarletBanAuthorization.Decision.unverified();
+        }
+    }
+
+    JsonElement readBanGroup(String selectedGroupId) throws ApiException
+    {
+        return readBanResponse(new GroupsApi(this.client).getGroupCall(selectedGroupId, true, null, null));
+    }
+
+    JsonElement readBanMember(String selectedGroupId, String userId) throws ApiException
+    {
+        return readBanResponse(new GroupsApi(this.client).getGroupMemberCall(selectedGroupId, userId, null));
+    }
+
+    static JsonElement readBanResponse(okhttp3.Call call) throws ApiException
+    {
+        // Bypass the compatibility model adapter: it collapses explicit JSON null into Java null.
+        // Only a successful, explicit JSON null can establish that a target is not a member.
+        try (Response response = call.execute())
+        {
+            if (!response.isSuccessful()) throw new ApiException(response.code(), "Ban authorization lookup failed");
+            if (response.body() == null) throw new IllegalArgumentException("Missing authorization response");
+            response.body().source().request(2L * 1024L * 1024L + 1L);
+            if (response.body().source().buffer().size() > 2L * 1024L * 1024L)
+                throw new IllegalArgumentException("Oversized authorization response");
+            return parseBanResponse(response.body().string());
+        }
+        catch (IOException ex)
+        {
+            throw new ApiException(ex);
+        }
+    }
+
+    static JsonElement parseBanResponse(String body)
+    {
+        if (body == null || body.trim().isEmpty()) throw new IllegalArgumentException("Missing authorization response");
+        try (JsonReader reader = new JsonReader(new java.io.StringReader(body)))
+        {
+            reader.setStrictness(com.google.gson.Strictness.STRICT);
+            JsonElement value = new Gson().getAdapter(JsonElement.class).read(reader);
+            if (reader.peek() != JsonToken.END_DOCUMENT) throw new IllegalArgumentException("Trailing authorization data");
+            return value;
+        }
+        catch (IOException ex)
+        {
+            throw new IllegalArgumentException("Malformed authorization response", ex);
+        }
+    }
+
+    public GroupBanResult banFromGroupAs(String actorId, String targetId, boolean allowPermissionOverride)
+    {
+        return this.banFromGroupAs(this.groupId, actorId, targetId, allowPermissionOverride);
+    }
+
+    /** Bind a persisted timed-ban intent to the same group throughout authorization and submission. */
+    public GroupBanResult banFromGroupAs(String selectedGroupId, String actorId, String targetId, boolean allowPermissionOverride)
+    {
+        if (selectedGroupId == null || !selectedGroupId.equals(this.groupId))
+            return new GroupBanResult(ScarletBanAuthorization.Decision.unverified(), null);
+        String selectedBotId = this.currentUserId;
+        ScarletBanAuthorization.Decision decision = this.checkBanAuthorization(selectedGroupId, selectedBotId,
+            actorId, targetId, allowPermissionOverride);
+        if (!decision.allowed()) return new GroupBanResult(decision, null);
+        // This fresh target-specific check is intentionally repeated after any UI/queue precheck.
+        GroupBanSubmission submitted = this.submitGroupBanWithIdentity(selectedGroupId, targetId);
+        return new GroupBanResult(decision, submitted.outcome, submitted.bannedAt, selectedBotId);
+    }
+
+    GroupModerationResult submitGroupBan(String selectedGroupId, String targetUserId)
+    {
+        return this.submitGroupBanWithIdentity(selectedGroupId, targetUserId).outcome;
+    }
+
+    GroupBanSubmission submitGroupBanWithIdentity(String selectedGroupId, String targetUserId)
+    {
+        if (selectedGroupId == null || !selectedGroupId.equals(this.groupId))
+            return new GroupBanSubmission(GroupModerationResult.REJECTED, null);
         GroupsApi groups = new GroupsApi(this.client);
         try
         {
-            groups.banGroupMember(this.groupId, new BanGroupMemberRequest().userId(targetUserId));
-            return true;
+            GroupMember member = groups.banGroupMember(selectedGroupId, new BanGroupMemberRequest().userId(targetUserId));
+            // Only this response establishes the ban created by this request. A later GET
+            // could already describe a replacement ban imposed by another moderator.
+            OffsetDateTime bannedAt = member != null && selectedGroupId.equals(member.getGroupId())
+                && targetUserId.equals(member.getUserId()) && member.getMembershipStatus() == GroupMemberStatus.BANNED
+                    ? member.getBannedAt() : null;
+            return new GroupBanSubmission(GroupModerationResult.SUCCEEDED, bannedAt);
         }
         catch (ApiException apiex)
         {
             this.scarlet.checkVrcRefresh(apiex);
             LOG.error("Error during ban from group: "+apiex.getMessage());
-            return false;
+            return new GroupBanSubmission(groupModerationFailure(apiex.getCode()), null);
+        }
+        catch (RuntimeException ex)
+        {
+            LOG.warn("VRChat group ban outcome could not be confirmed; preserve the pending action for reconciliation");
+            return new GroupBanSubmission(GroupModerationResult.UNKNOWN, null);
         }
     }
 
     public boolean unbanFromGroup(String targetUserId)
     {
+        return this.unbanFromGroupDetailed(targetUserId) == GroupModerationResult.SUCCEEDED;
+    }
+
+    public GroupModerationResult unbanFromGroupDetailed(String targetUserId)
+    {
+        return this.unbanFromGroupDetailed(this.groupId, targetUserId);
+    }
+
+    public GroupModerationResult unbanFromGroupDetailed(String expectedGroupId, String targetUserId)
+    {
+        if (expectedGroupId == null || !expectedGroupId.equals(this.groupId))
+            return GroupModerationResult.REJECTED;
         GroupsApi groups = new GroupsApi(this.client);
         try
         {
-            groups.unbanGroupMember(this.groupId, targetUserId);
-            return true;
+            groups.unbanGroupMember(expectedGroupId, targetUserId);
+            return GroupModerationResult.SUCCEEDED;
         }
         catch (ApiException apiex)
         {
             this.scarlet.checkVrcRefresh(apiex);
             LOG.error("Error during unban from group: "+apiex.getMessage());
-            return false;
+            return groupModerationFailure(apiex.getCode());
         }
     }
 
@@ -3177,49 +3485,145 @@ finally
     static final TypeToken<List<LimitedUserGroups>> LIST_LUGROUPS = new TypeToken<List<LimitedUserGroups>>(){};
     public List<LimitedUserGroups> snapshot(ScarletData.AuditEntryMetadata entryMeta)
     {
-        List<LimitedUserGroups> lugs = null;
+        if (entryMeta == null) return null;
+        final String targetId, auditId;
+        final GroupAuditLogEntryUnknown entry;
+        synchronized (entryMeta)
+        {
+            // Clear old captures even when this attempt is redacted, cancelled or rejected.
+            entryMeta.snapshotTargetUser = null;
+            entryMeta.snapshotTargetUserGroups = null;
+            entryMeta.snapshotTargetUserRepresentedGroup = null;
+            entry = entryMeta.entry;
+            if (entry == null || entryMeta.entryRedacted) return null;
+            targetId = entry.getTargetId();
+            auditId = entry.getId();
+        }
+        if (targetId == null || !net.sybyline.scarlet.util.VrcIds.id_user.matcher(targetId).matches()
+            || ScarletVRChatCookieJar._context.get() != null || ScarletVRChatCookieJar._context2.get() != null
+            || this.cookies == null || this.currentUserId == null) return null;
+
+        // Snapshots run only in the normal primary account context. Do not copy an
+        // alternate/temp login context or a live mutable credential store to workers.
+        SnapshotIdentity identity = new SnapshotIdentity(this);
+        List<okhttp3.Cookie> primaryCookies = this.cookies.copy();
+        ScarletSnapshotFetch fetcher;
+        synchronized (SNAPSHOT_LIFECYCLE_LOCK)
+        {
+            if (this.snapshotsStopped) return null;
+            if (this.snapshotFetch == null) this.snapshotFetch = new ScarletSnapshotFetch();
+            fetcher = this.snapshotFetch;
+        }
+        java.util.function.BooleanSupplier allowed = () -> identity.valid()
+            && !Thread.currentThread().isInterrupted();
+        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[3];
         try
         {
-            Map<String, String> localVarHeaderParams = new HashMap<>();
-            localVarHeaderParams.put("Accept", "application/json");
-            okhttp3.Call localVarCall = this.client.buildCall(null, "/users/"+entryMeta.entry.getTargetId(), "GET", new ArrayList<>(), new ArrayList<>(), null, localVarHeaderParams, new HashMap<>(), new HashMap<>(), new String[]{"authCookie"}, null);
-            entryMeta.snapshotTargetUser = this.client.<JsonObject>execute(localVarCall, JsonObject.class).getData();
-        }
-        catch (Exception ex)
-        {
-            LOG.error("Exception whilst fetching user", ex);
-        }
-        try
-        {
-            Map<String, String> localVarHeaderParams = new HashMap<>();
-            localVarHeaderParams.put("Accept", "application/json");
-            okhttp3.Call localVarCall = this.client.buildCall(null, "/users/"+entryMeta.entry.getTargetId()+"/groups", "GET", new ArrayList<>(), new ArrayList<>(), null, localVarHeaderParams, new HashMap<>(), new HashMap<>(), new String[]{"authCookie"}, null);
-            entryMeta.snapshotTargetUserGroups = this.client.<JsonArray>execute(localVarCall, JsonArray.class).getData();
-            try
+            OkHttpClient http = snapshotHttpClient(this.client.getHttpClient(), primaryCookies, identity::valid);
+            String[] suffixes = {"", "/groups", "/groups/represented"};
+            for (int i = 0; i < reads.length; i++)
             {
-                lugs = JSON.getGson().fromJson(entryMeta.snapshotTargetUserGroups, LIST_LUGROUPS);
+                Map<String, String> headers = new HashMap<>();
+                headers.put("Accept", "application/json");
+                Request request = this.client.buildCall(null, "/users/" + targetId + suffixes[i], "GET",
+                    new ArrayList<>(), new ArrayList<>(), null, headers, new HashMap<>(), new HashMap<>(),
+                    new String[]{"authCookie"}, null).request().newBuilder()
+                    .removeHeader("Authorization").removeHeader("Cookie").tag(SnapshotIdentity.class, identity).build();
+                final okhttp3.Call call = http.newCall(request);
+                reads[i] = new ScarletSnapshotFetch.Read() {
+                    public JsonElement read() throws Exception {
+                        if (!identity.valid() || call.isCanceled()) return null;
+                        return ScarletVRChat.this.client.<JsonElement>execute(call, JsonElement.class).getData();
+                    }
+                    public void cancel() { call.cancel(); }
+                };
             }
-            catch (Exception ex)
+            ScarletSnapshotFetch.Result result = fetcher.fetch(targetId, allowed, reads);
+            if (result == null) return null;
+            synchronized (entryMeta)
             {
-                LOG.error("Exception whilst deserializing user groups", ex);
+                // One caller-owned commit after all workers end. Late responses cannot
+                // restore fields after an account/group change, replacement or redaction.
+                if (!identity.valid() || Thread.currentThread().isInterrupted() || entryMeta.entryRedacted
+                    || entryMeta.entry != entry || !Objects.equals(auditId, entry.getId())
+                    || !Objects.equals(targetId, entry.getTargetId())) return null;
+                List<LimitedUserGroups> groups = result.groups == null ? null : JSON.getGson().fromJson(result.groups, LIST_LUGROUPS);
+                entryMeta.snapshotTargetUser = result.user;
+                entryMeta.snapshotTargetUserGroups = result.groups;
+                entryMeta.snapshotTargetUserRepresentedGroup = result.representedGroup;
+                return groups;
             }
         }
         catch (Exception ex)
         {
-            LOG.error("Exception whilst fetching user groups", ex);
+            // Do not log response bodies or credentials from optional lookup failures.
+            LOG.debug("Public moderation snapshot unavailable ({})", ex.getClass().getSimpleName());
+            return null;
         }
-        try
+        finally
         {
-            Map<String, String> localVarHeaderParams = new HashMap<>();
-            localVarHeaderParams.put("Accept", "application/json");
-            okhttp3.Call localVarCall = this.client.buildCall(null, "/users/"+entryMeta.entry.getTargetId()+"/groups/represented", "GET", new ArrayList<>(), new ArrayList<>(), null, localVarHeaderParams, new HashMap<>(), new HashMap<>(), new String[]{"authCookie"}, null);
-            entryMeta.snapshotTargetUserRepresentedGroup = this.client.<JsonObject>execute(localVarCall, JsonObject.class).getData();
+            for (ScarletSnapshotFetch.Read read : reads) if (read != null) read.cancel();
         }
-        catch (Exception ex)
+    }
+
+    static OkHttpClient snapshotHttpClient(OkHttpClient base, List<okhttp3.Cookie> primaryCookies,
+        java.util.function.BooleanSupplier allowed)
+    {
+        List<okhttp3.Cookie> frozen = new ArrayList<>(primaryCookies);
+        return base.newBuilder()
+            .connectTimeout(5L, TimeUnit.SECONDS).readTimeout(5L, TimeUnit.SECONDS)
+            .writeTimeout(5L, TimeUnit.SECONDS).callTimeout(5L, TimeUnit.SECONDS)
+            .cookieJar(new okhttp3.CookieJar() {
+                public List<okhttp3.Cookie> loadForRequest(okhttp3.HttpUrl url) {
+                    if (!allowed.getAsBoolean()) return Collections.emptyList();
+                    long now = System.currentTimeMillis();
+                    return frozen.stream().filter(cookie -> cookie.expiresAt() > now && cookie.matches(url))
+                        .collect(Collectors.toList());
+                }
+                public void saveFromResponse(okhttp3.HttpUrl url, List<okhttp3.Cookie> cookies) {
+                    // Read-only enrichment cannot change the current login session.
+                }
+            }).build();
+    }
+
+    private static final class SnapshotIdentity
+    {
+        final ScarletVRChat owner;
+        final String userId, groupId;
+        final long generation;
+        SnapshotIdentity(ScarletVRChat owner)
         {
-            LOG.error("Exception whilst fetching user represented group", ex);
+            this.owner = owner;
+            this.generation = ExtendedUserAgent.currentAuthenticationGeneration();
+            this.userId = owner.currentUserId;
+            this.groupId = owner.groupId;
         }
-        return lugs;
+        boolean valid()
+        {
+            return !this.owner.snapshotsStopped && Objects.equals(this.userId, this.owner.currentUserId)
+                && Objects.equals(this.groupId, this.owner.groupId)
+                && ExtendedUserAgent.isPrimaryAuthenticationStable(this.generation)
+                && this.owner.pendingUsername == null && this.owner.pendingPassword == null;
+        }
+    }
+
+    static void checkSnapshotRequest(Interceptor.Chain chain) throws IOException
+    {
+        SnapshotIdentity identity = chain.request().tag(SnapshotIdentity.class);
+        if (identity != null && (chain.call().isCanceled() || Thread.currentThread().isInterrupted() || !identity.valid()))
+            throw new IOException("Public snapshot cancelled");
+    }
+
+    /** Must finish before offline export saves the session and closes credential stores. */
+    public boolean shutdownSnapshots()
+    {
+        ScarletSnapshotFetch fetcher;
+        synchronized (SNAPSHOT_LIFECYCLE_LOCK)
+        {
+            this.snapshotsStopped = true;
+            fetcher = this.snapshotFetch;
+        }
+        return fetcher == null || fetcher.shutdown();
     }
 
     public void addAlternateCredentials()
@@ -3256,9 +3660,31 @@ finally
         {
             if (selected == null)
                 return;
-            boolean loggedOut = this.logoutAlt(selected.id, false);
-            boolean removed = this.cookies.removeAlt(selected.id);
-            this.scarlet.splash.queueFeedbackPopup(null, 5_000L, "Removed "+selected.name, selected.id, removed ? loggedOut ? Color.WHITE : Color.YELLOW : loggedOut ? Color.ORANGE : Color.RED);
+            synchronized (this)
+            {
+                boolean loggedOut = false;
+                try
+                {
+                    loggedOut = this.logoutAlt(selected.id, false);
+                }
+                catch (RuntimeException ex)
+                {
+                    LOG.warn("Alternate logout could not be confirmed; continuing local credential removal");
+                }
+                try
+                {
+                    this.cookies.removeAlt(selected.id);
+                    this.scarlet.splash.queueFeedbackPopup(null, 5_000L, "Removed local credentials for "+selected.name,
+                        loggedOut ? "Remote session logout confirmed." : "Remote logout was not confirmed; revoke that session in VRChat if needed.",
+                        loggedOut ? Color.WHITE : Color.YELLOW);
+                }
+                catch (RuntimeException ex)
+                {
+                    LOG.error("Could not finish persisting alternate credential removal", ex);
+                    this.scarlet.splash.queueFeedbackPopup(null, 5_000L, "Credential removal incomplete",
+                        "A storage error prevented confirmation. Check storage and retry removal.", Color.RED);
+                }
+            }
         });
     }
 
@@ -3301,21 +3727,31 @@ finally
     }
 
     /**
-     * Clears all stored VRChat credentials (username, password, TOTP secret,
-     * and session cookies) from the encrypted registry store and from memory.
-     * The user will be prompted to re-enter credentials on the next login.
+     * Clears the main VRChat account's stored username, password, TOTP secret,
+     * and session cookies from encrypted storage and memory. Alternate accounts
+     * remain configured; remove each through Remove alternate credentials.
+     * The user will be prompted to re-enter main-account credentials on the next login.
      * This is safe to call at any time and does not require the user to
      * manually touch the Registry or AppData folders.
      */
     public void clearCredentials()
     {
-        this.username.clear();
-        this.password.clear();
-        this.totpsecret.clear();
-        this.cookies.clear();
-        this.cookies.save();
-        LOG.info("Credentials cleared by user request");
-        this.scarlet.splash.queueFeedbackPopup(null, 5_000L, "Credentials cleared", "You will be prompted to log in again.", Color.CYAN);
+        long headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
+        try
+        {
+            this.username.clear();
+            this.password.clear();
+            this.totpsecret.clear();
+            this.cookies.clear();
+            this.cookies.save();
+        }
+        finally
+        {
+            ExtendedUserAgent.completePrimaryAuthentication(null, headerGeneration);
+        }
+        LOG.info("Main account credentials cleared by user request; alternate accounts are unchanged");
+        this.scarlet.splash.queueFeedbackPopup(null, 5_000L, "Main account credentials cleared",
+            "Log in again when prompted. Alternate accounts are unchanged.", Color.CYAN);
     }
 
     public void modalNeedPerms(GroupPermissions perms)
@@ -3346,8 +3782,8 @@ finally
     public void modalNeedGroupId()
     {
         this.scarlet.settings.requireConfirmYesNoAsync(
-            "KozyBlake/Scarlet could not determine a valid VRChat group ID for the logged-in account `"+this.currentUserId+"`.\n\n"
-          + "Please set the correct `vrchat_group_id` in KozyBlake/Scarlet's settings, or make sure the account is representing the intended group before launching KozyBlake/Scarlet.",
+            "Hatson321/Scarlet Logger could not determine a valid VRChat group ID for the logged-in account `"+this.currentUserId+"`.\n\n"
+          + "Please set the correct `vrchat_group_id` in Hatson321/Scarlet Logger's settings, or make sure the account is representing the intended group before launching Hatson321/Scarlet Logger.",
             "Missing group ID",
             () -> MiscUtils.AWTDesktop.browse(URI.create("https://vrchat.com/home/groups")),
             null);
@@ -3361,6 +3797,9 @@ finally
     @Override
     public void close() throws IOException
     {
+        if (!this.shutdownSnapshots()) throw new IOException("Snapshot lookups did not stop safely");
+        // Do not let any late/new session probe identify requests after shutdown.
+        ExtendedUserAgent.beginPrimaryAuthentication();
         this.cookies.close();
     }
 

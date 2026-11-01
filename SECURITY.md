@@ -6,9 +6,11 @@ data locally. This document is a plain-language inventory of reviewed behavior
 that touches the network, your credentials, or your operating system — so you
 can verify what it does instead of taking anyone's word for it (including ours).
 
-This inventory covers the 0.6.1-a11 application and the current 0.6.1 source line.
-Older releases can behave differently; use the source archive matching your JAR
-when verifying a specific build. Documentation is not a security certification.
+This inventory describes reviewed **0.6.1-a11 preview** behavior. Repository
+`main` now uses the **0.6.0 stable application baseline**; preview controls and
+protections must not be assumed to exist in that older build. Use the source
+archive matching your JAR when verifying a specific build. Documentation is not
+a security certification.
 If you find a discrepancy, please report it without sharing secrets (see the bottom).
 
 ---

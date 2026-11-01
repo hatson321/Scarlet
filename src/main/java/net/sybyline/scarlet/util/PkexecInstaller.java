@@ -7,13 +7,16 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.GraphicsEnvironment;
 import java.awt.Window;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -54,6 +57,9 @@ import net.sybyline.scarlet.ui.Swing;
 public final class PkexecInstaller
 {
     static final Logger LOG = LoggerFactory.getLogger("Scarlet/PkexecInstaller");
+    public static final int NOT_STARTED = -1;
+    static final long INSTALL_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(10);
+    static final int MAX_OUTPUT_BYTES = 1024 * 1024;
 
     private PkexecInstaller()
     {
@@ -98,11 +104,15 @@ public final class PkexecInstaller
         String dialogTitle = title == null || title.trim().isEmpty() ? "Installing" : title;
         if (GraphicsEnvironment.isHeadless())
             return runHeadless("[install]", "sh", "-lc", wrapped);
-        int exit = runWithDialog(parent, dialogTitle, "install", true, "sh", "-lc", wrapped);
-        if (exit != -1 || !Sys.hasInPath("script"))
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(INSTALL_TIMEOUT_MILLIS);
+        int exit = runWithDialog(parent, dialogTitle, "install", true, INSTALL_TIMEOUT_MILLIS, "sh", "-lc", wrapped);
+        if (exit != NOT_STARTED || !Sys.hasInPath("script"))
             return exit;
+        long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+        if (remaining <= 0)
+            return BoundedProcess.TIMED_OUT;
         LOG.warn("PTY installer failed to start; trying embedded script(1) fallback");
-        return runWithDialog(parent, dialogTitle, "install", false,
+        return runWithDialog(parent, dialogTitle, "install", false, remaining,
             "script", "-q", "-f", "-e", "-c", wrapped, "/dev/null");
     }
 
@@ -116,27 +126,24 @@ public final class PkexecInstaller
 
     private static int runHeadless(String prefix, String... command)
     {
-        try
-        {
-            Process p = new ProcessBuilder(command).redirectErrorStream(true).start();
-            streamOutput(p, text -> System.out.print(prefixLines(prefix, text)));
-            return p.waitFor();
-        }
-        catch (Exception ex)
-        {
-            LOG.error("Headless install failed", ex);
-            return -1;
-        }
+        InstallSession session = new InstallSession(() -> new ProcessBuilder(command).redirectErrorStream(true).start(), INSTALL_TIMEOUT_MILLIS);
+        return session.run(text -> System.out.print(prefixLines(prefix, text)), process -> { });
     }
 
     private static int runWithDialog(Component parent, String title, String action, boolean usePty,
         String... command)
     {
+        return runWithDialog(parent, title, action, usePty, INSTALL_TIMEOUT_MILLIS, command);
+    }
+
+    private static int runWithDialog(Component parent, String title, String action, boolean usePty,
+        long timeoutMillis, String... command)
+    {
         final AtomicInteger exitCode = new AtomicInteger(Integer.MIN_VALUE);
-        final AtomicBoolean cancelled = new AtomicBoolean(false);
-        final AtomicReference<Process> processRef = new AtomicReference<>();
         final AtomicReference<OutputStream> inputRef = new AtomicReference<>();
         final AtomicInteger enterKeyRef = new AtomicInteger('\n');
+        final InstallSession session = new InstallSession(() -> usePty
+            ? startPty(command, enterKeyRef) : new ProcessBuilder(command).redirectErrorStream(true).start(), timeoutMillis);
         final boolean privileged = command != null && command.length > 0 && "pkexec".equals(command[0]);
         final boolean terminal = usePty || (command != null && command.length > 0 && "script".equals(command[0]));
 
@@ -183,16 +190,22 @@ public final class PkexecInstaller
             input.addActionListener(e -> sendInput(inputRef, enterKeyRef, input, outputRef[0]));
             send.addActionListener(e -> sendInput(inputRef, enterKeyRef, input, outputRef[0]));
             showInput.addActionListener(e -> input.setEchoChar(showInput.isSelected() ? (char)0 : hiddenEchoChar));
-            button.addActionListener(e ->
+            Runnable cancelOrClose = () ->
             {
                 if (exitCode.get() == Integer.MIN_VALUE)
                 {
-                    cancelled.set(true);
-                    Process p = processRef.get();
-                    if (p != null && p.isAlive())
-                        p.destroy();
+                    session.cancel();
+                    status.setText("Stopping installer... waiting for the owned process to finish.");
+                    button.setEnabled(false);
+                    input.setEnabled(false);
+                    send.setEnabled(false);
                 }
-                dialog.dispose();
+                else
+                    dialog.dispose();
+            };
+            button.addActionListener(e -> cancelOrClose.run());
+            dialog.addWindowListener(new WindowAdapter() {
+                @Override public void windowClosing(WindowEvent event) { cancelOrClose.run(); }
             });
 
             JPanel south = new JPanel(new BorderLayout());
@@ -217,7 +230,7 @@ public final class PkexecInstaller
             dialog.setContentPane(rootPanel);
             dialog.pack();
             dialog.setLocationRelativeTo(parent);
-            dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+            dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
 
             dialogRef[0] = dialog;
             outputRef[0] = output;
@@ -230,37 +243,26 @@ public final class PkexecInstaller
 
         Thread worker = new Thread(() ->
         {
-            int code;
-            try
+            int code = session.run(text -> SwingUtilities.invokeLater(() ->
             {
-                Process p = usePty
-                    ? startPty(command, enterKeyRef)
-                    : new ProcessBuilder(command).redirectErrorStream(true).start();
-                processRef.set(p);
+                JTextArea o = outputRef[0];
+                if (o != null)
+                {
+                    o.append(text);
+                    o.setCaretPosition(o.getDocument().getLength());
+                }
+            }), p ->
+            {
                 inputRef.set(p.getOutputStream());
-                SwingUtilities.invokeLater(() ->
-                {
-                    if (inputFieldRef[0] != null)
-                        inputFieldRef[0].setEnabled(true);
-                    if (sendRef[0] != null)
-                        sendRef[0].setEnabled(true);
-                });
-                streamOutput(p, text -> SwingUtilities.invokeLater(() ->
-                {
-                    JTextArea o = outputRef[0];
-                    if (o != null)
+                SwingUtilities.invokeLater(() -> {
+                    if (!session.cancelled.get())
                     {
-                        o.append(text);
-                        o.setCaretPosition(o.getDocument().getLength());
+                        inputFieldRef[0].setEnabled(true);
+                        sendRef[0].setEnabled(true);
                     }
-                }));
-                code = p.waitFor();
-            }
-            catch (Throwable ex)
-            {
-                LOG.error("{} failed", action, ex);
-                code = -1;
-            }
+                });
+            });
+            inputRef.set(null);
             exitCode.set(code);
             final int finalCode = code;
             SwingUtilities.invokeLater(() ->
@@ -273,10 +275,15 @@ public final class PkexecInstaller
                 if (statusRef[0] != null)
                     statusRef[0].setText(finalCode == 0
                         ? "Installation finished. You can close this window."
-                        : finalCode == -1 ? "Could not start the installer."
+                        : finalCode == NOT_STARTED ? "Could not start the installer; no child was launched."
+                        : finalCode == BoundedProcess.CANCELLED ? "Installation cancelled; verify package-manager state before retrying."
+                        : finalCode == BoundedProcess.TIMED_OUT ? "Installation timed out; verify package-manager state before retrying."
                         : "Installation failed (exit code " + finalCode + ").");
                 if (buttonRef[0] != null)
+                {
                     buttonRef[0].setText("Close");
+                    buttonRef[0].setEnabled(true);
+                }
                 if (inputFieldRef[0] != null)
                     inputFieldRef[0].setEnabled(false);
                 if (sendRef[0] != null)
@@ -290,10 +297,131 @@ public final class PkexecInstaller
         // pumps the streamed output. The worker fills it in concurrently.
         Swing.invokeWait(() -> dialogRef[0].setVisible(true));
 
-        if (cancelled.get())
-            return 126;
         int code = exitCode.get();
-        return code == Integer.MIN_VALUE ? -1 : code;
+        if (code == Integer.MIN_VALUE)
+        {
+            // Owner disposal must not be mistaken for a failed start/fallback.
+            session.cancel();
+            return BoundedProcess.CANCELLED;
+        }
+        return code;
+    }
+
+    @FunctionalInterface
+    interface ProcessStarter
+    {
+        Process start() throws Exception;
+    }
+
+    /** Child lifecycle has no Swing dependencies and is exercised with fake processes. */
+    static final class InstallSession
+    {
+        final AtomicBoolean cancelled = new AtomicBoolean();
+        final AtomicBoolean abandonedStart = new AtomicBoolean(), cleanupClaimed = new AtomicBoolean();
+        final AtomicReference<Process> process = new AtomicReference<>();
+        final ProcessStarter starter;
+        final long timeoutMillis;
+
+        InstallSession(ProcessStarter starter, long timeoutMillis)
+        {
+            if (timeoutMillis <= 0) throw new IllegalArgumentException("Invalid install deadline");
+            this.starter = starter;
+            this.timeoutMillis = timeoutMillis;
+        }
+
+        void cancel()
+        {
+            this.cancelled.set(true);
+        }
+
+        int run(Consumer<String> output, Consumer<Process> started)
+        {
+            if (SwingUtilities.isEventDispatchThread())
+                throw new IllegalStateException("Installer process work must not run on the Swing event thread");
+            if (this.cancelled.get()) return BoundedProcess.CANCELLED;
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(this.timeoutMillis);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            CountDownLatch startFinished = new CountDownLatch(1);
+            Thread start = new Thread(() -> {
+                try
+                {
+                    if (!this.cancelled.get())
+                    {
+                        this.process.set(this.starter.start());
+                        this.cleanupAbandonedStart();
+                    }
+                }
+                catch (Throwable ex) { failure.set(ex); }
+                finally { startFinished.countDown(); }
+            }, "scarlet-install-start");
+            start.setDaemon(true);
+            start.start();
+            try
+            {
+                while (!startFinished.await(25L, TimeUnit.MILLISECONDS))
+                {
+                    if (this.cancelled.get() || System.nanoTime() >= deadline)
+                    {
+                        this.abandonedStart.set(true);
+                        this.cleanupAbandonedStart();
+                        return this.cancelled.get() ? BoundedProcess.CANCELLED : BoundedProcess.TIMED_OUT;
+                    }
+                }
+                Process child = this.process.get();
+                if (child == null)
+                {
+                    if (this.cancelled.get()) return BoundedProcess.CANCELLED;
+                    if (failure.get() != null) LOG.warn("Installer process could not be started", failure.get());
+                    return NOT_STARTED;
+                }
+                this.cleanupClaimed.set(true);
+                started.accept(child);
+                long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (remaining <= 0)
+                {
+                    BoundedProcess.await(child, 1L, MAX_OUTPUT_BYTES, () -> true, null);
+                    return BoundedProcess.TIMED_OUT;
+                }
+                BoundedProcess.Result result = BoundedProcess.await(child, remaining, MAX_OUTPUT_BYTES, this.cancelled::get, output);
+                if (!result.terminated)
+                {
+                    LOG.error("Installer termination could not be confirmed; no automatic fallback will be started");
+                    return result.exitCode == 0 || result.exitCode == NOT_STARTED ? 1 : result.exitCode;
+                }
+                return result.exitCode == NOT_STARTED ? 1 : result.exitCode;
+            }
+            catch (InterruptedException ex)
+            {
+                this.cancel();
+                this.abandonedStart.set(true);
+                this.cleanupAbandonedStart();
+                Thread.currentThread().interrupt();
+                return BoundedProcess.CANCELLED;
+            }
+            catch (RuntimeException ex)
+            {
+                this.cancel();
+                LOG.error("Installer failed after start; no automatic fallback will be started", ex);
+                Process child = this.process.get();
+                if (child != null) try { BoundedProcess.await(child, 1L, MAX_OUTPUT_BYTES, () -> true, null); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+                return 1;
+            }
+        }
+
+        private void cleanupAbandonedStart()
+        {
+            Process child = this.process.get();
+            if (this.abandonedStart.get() && child != null && this.cleanupClaimed.compareAndSet(false, true))
+            {
+                try
+                {
+                    if (!BoundedProcess.await(child, 1L, MAX_OUTPUT_BYTES, () -> true, null).terminated)
+                        LOG.error("Late installer child termination could not be confirmed; check package-manager state before retrying");
+                }
+                catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
+            }
+        }
     }
 
     private static Process startPty(String[] command, AtomicInteger enterKeyRef) throws IOException
@@ -374,22 +502,6 @@ public final class PkexecInstaller
         output.setCaretPosition(output.getDocument().getLength());
     }
 
-    private static void streamOutput(Process process, OutputConsumer consumer) throws IOException
-    {
-        try (InputStream in = process.getInputStream();
-             InputStreamReader reader = new InputStreamReader(in, StandardCharsets.UTF_8))
-        {
-            char[] buffer = new char[512];
-            int read;
-            while ((read = reader.read(buffer)) >= 0)
-            {
-                String text = new String(buffer, 0, read);
-                if (!text.isEmpty())
-                    consumer.accept(text);
-            }
-        }
-    }
-
     private static String prefixLines(String prefix, String text)
     {
         if (text == null || text.isEmpty())
@@ -397,8 +509,4 @@ public final class PkexecInstaller
         return prefix + " " + text.replace("\n", "\n" + prefix + " ");
     }
 
-    interface OutputConsumer
-    {
-        void accept(String text) throws IOException;
-    }
 }

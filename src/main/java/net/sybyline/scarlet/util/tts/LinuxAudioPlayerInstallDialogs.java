@@ -228,7 +228,7 @@ public class LinuxAudioPlayerInstallDialogs
     private static InstallDialogResult handleHeadlessMode()
     {
         System.out.println("\n========================================");
-        System.out.println("[KozyBlake/Scarlet/TTS] No audio player found");
+        System.out.println("[Hatson321/Scarlet Logger/TTS] No audio player found");
         System.out.println("========================================");
         System.out.println("Scarlet needs pw-play, paplay, or aplay to play TTS on your selected output device.");
         System.out.println("Install one, e.g.:");

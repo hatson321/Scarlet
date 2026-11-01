@@ -4,7 +4,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.net.URLDecoder;
+import java.net.JarURLConnection;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -50,30 +50,22 @@ public class MavenDepsLoader
 
     static void clinit()
     {
-        String depsUrlPrefix = "jar:file:/",
-               depsAbsPath = "/META-INF/MANIFEST.MF",
-               depsUrlSuffix = "!" + depsAbsPath;
-        
-        URL url = MavenDepsLoader.class.getResource(depsAbsPath);
-        if (url == null)
-            return;
-        String urlString = url.toString();
-        if (!urlString.startsWith(depsUrlPrefix) || !urlString.endsWith(depsUrlSuffix))
-            return;
-        
-        String unescapedPath;
+        Path jarPath;
+        URL url;
         try
         {
-            unescapedPath = URLDecoder.decode(urlString.substring(depsUrlPrefix.length(), urlString.length() - depsUrlSuffix.length()), "utf-8");
+            URL owner = MavenDepsLoader.class.getProtectionDomain().getCodeSource().getLocation();
+            jarPath = owningJar(owner);
+            if (jarPath == null) return;
+            // Resolve this class's own archive, not the first dependency manifest on the classpath.
+            url = new URL("jar:" + jarPath.toUri().toASCIIString() + "!/META-INF/MANIFEST.MF");
         }
         catch (Exception ex)
         {
-            throw new Error(ex);
+            System.err.println("Scarlet/MavenDepsLoader: Cannot resolve the owning JAR path");
+            return;
         }
-        
-        
-        Path jarPath = Paths.get(unescapedPath),
-             jarDir = jarPath.getParent(),
+        Path jarDir = jarPath.getParent(),
              depsDir = jarDir.resolve("libraries");
         
         MavenDepsLoader.jarPath = jarPath;
@@ -84,7 +76,7 @@ public class MavenDepsLoader
         }
         catch (Exception ex)
         {
-            System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Exception creating dependencies directory '%s'", depsDir));
+            System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Exception creating dependencies directory '%s'", depsDir));
             ex.printStackTrace(System.err);
             return;
         }
@@ -96,13 +88,13 @@ public class MavenDepsLoader
         }
         catch (Exception ex)
         {
-            System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Exception reading manifest from '%s'", url));
+            System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Exception reading manifest from '%s'", url));
             ex.printStackTrace(System.err);
             return;
         }
         
         String cpEntriesString = mf.getMainAttributes().getValue("Class-Path");
-//        System.out.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Class-Path: %s", cpEntriesString));
+//        System.out.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Class-Path: %s", cpEntriesString));
         if (cpEntriesString == null || cpEntriesString.trim().isEmpty())
             return;
         
@@ -114,11 +106,21 @@ public class MavenDepsLoader
         {
             if (cpEntry.startsWith(libPrefix))
             {
-//                System.out.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Checking dependency '%s'", cpEntry));
+//                System.out.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Checking dependency '%s'", cpEntry));
                 dlDep(depsDir, cpEntry.substring(libPrefix.length()));
             }
         }
         
+    }
+
+    static Path owningJar(URL owner) throws Exception
+    {
+        if (owner == null) return null;
+        if ("jar".equals(owner.getProtocol()))
+            owner = ((JarURLConnection)owner.openConnection()).getJarFileURL();
+        if (!"file".equals(owner.getProtocol())) return null;
+        Path path = Paths.get(owner.toURI()).toAbsolutePath().normalize();
+        return Files.isRegularFile(path) && path.getFileName().toString().endsWith(".jar") ? path : null;
     }
 
     static void dlDep(Path depsDir, String line)
@@ -137,7 +139,7 @@ public class MavenDepsLoader
             return;
         if (!ALLOW_RUNTIME_DOWNLOADS)
         {
-            System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Refusing to download missing dependency '%s' because runtime downloads are disabled. Start with -Dscarlet.allowRuntimeDependencyDownloads=true to allow this.", depName));
+            System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Refusing to download missing dependency '%s' because runtime downloads are disabled. Start with -Dscarlet.allowRuntimeDependencyDownloads=true to allow this.", depName));
             return;
         }
         
@@ -145,7 +147,7 @@ public class MavenDepsLoader
         
         if (depUrl == null)
         {
-            System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Failed to locate dependency '%s' from '%s' to '%s'", depName, depUrl, depPath));
+            System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Failed to locate dependency '%s' from '%s' to '%s'", depName, depUrl, depPath));
             return;
         }
         
@@ -157,7 +159,7 @@ public class MavenDepsLoader
         }
         catch (Exception ex)
         {
-            System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Exception creating directories '%s'", depPath.getParent()));
+            System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Exception creating directories '%s'", depPath.getParent()));
             ex.printStackTrace(System.err);
             return;
         }
@@ -167,7 +169,7 @@ public class MavenDepsLoader
             String expectedSha256 = fetchRemoteChecksum(depUrl, ".sha256");
             if (expectedSha256 == null)
             {
-                System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Refusing to download dependency '%s' because no remote SHA-256 checksum was available at '%s.sha256'", depName, depUrl));
+                System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Refusing to download dependency '%s' because no remote SHA-256 checksum was available at '%s.sha256'", depName, depUrl));
                 return;
             }
             try (HttpURLInputStream depIn = HttpURLInputStream.get(depUrl, HttpURLInputStream.PUBLIC_ONLY))
@@ -186,12 +188,12 @@ public class MavenDepsLoader
             {
                 Files.deleteIfExists(tmp);
             }
-            System.out.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Located and copied dependency '%s' from '%s' to '%s'", depName, depUrl, depPath));
+            System.out.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Located and copied dependency '%s' from '%s' to '%s'", depName, depUrl, depPath));
             }
         }
         catch (Exception ex)
         {
-            System.err.println(String.format("KozyBlake/Scarlet/MavenDepsLoader: Exception copying dependency '%s' from '%s' to '%s'", depName, depUrl, depPath));
+            System.err.println(String.format("Hatson321/Scarlet Logger/MavenDepsLoader: Exception copying dependency '%s' from '%s' to '%s'", depName, depUrl, depPath));
             ex.printStackTrace(System.err);
         }
     }

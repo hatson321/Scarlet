@@ -33,11 +33,6 @@ public class LDaveSessionFactory implements DaveSessionFactory {
             LOG.warn("{}; Discord voice E2EE will be disabled", unsupportedReason);
             return null;
         }
-        if (Platform.isAndroid() || Platform.isTermux()) {
-            LOG.info("Android/Termux runtime detected ({}); trying libdave-jvm first, then KozyBlake/Scarlet bundled DAVE as fallback",
-                Platform.describe());
-        }
-
         try {
             NativeDaveFactory.ensureAvailable();
             LOG.info("DAVE native library loaded successfully");
@@ -47,7 +42,7 @@ public class LDaveSessionFactory implements DaveSessionFactory {
 
             return new LDaveSessionFactory(jdaFactory, false);
         } catch (Throwable t) {
-            LOG.warn("libdave-jvm session factory unavailable on {}; trying KozyBlake/Scarlet bundled DAVE fallback ({})",
+            LOG.warn("libdave-jvm session factory unavailable on {}; trying Hatson321/Scarlet Logger bundled DAVE fallback ({})",
                 Platform.describe(), t.toString());
             LOG.debug("libdave-jvm session factory initialization failed", t);
             LDaveSessionFactory bundled = createBundledFactory();
@@ -63,16 +58,16 @@ public class LDaveSessionFactory implements DaveSessionFactory {
     private static LDaveSessionFactory createBundledFactory() {
         try {
             short maxProtocolVersion = Dave.INSTANCE.maxSupportedProtocolVersion();
-            LOG.info("KozyBlake/Scarlet bundled DAVE library loaded successfully (max protocol version {})",
+            LOG.info("Hatson321/Scarlet Logger bundled DAVE library loaded successfully (max protocol version {})",
                 Short.toUnsignedInt(maxProtocolVersion));
             return new LDaveSessionFactory(
                 (callbacks, userId, channelId) -> new DAudioDaveSession(callbacks, userId, channelId),
                 true
             );
         } catch (Throwable t) {
-            LOG.warn("KozyBlake/Scarlet bundled DAVE library unavailable on {} ({})",
+            LOG.warn("Hatson321/Scarlet Logger bundled DAVE library unavailable on {} ({})",
                 Platform.describe(), t.toString());
-            LOG.debug("KozyBlake/Scarlet bundled DAVE library initialization failed", t);
+            LOG.debug("Hatson321/Scarlet Logger bundled DAVE library initialization failed", t);
             return null;
         }
     }

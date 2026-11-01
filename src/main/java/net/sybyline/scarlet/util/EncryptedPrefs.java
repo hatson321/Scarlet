@@ -1,6 +1,7 @@
 package net.sybyline.scarlet.util;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -75,7 +76,8 @@ public final class EncryptedPrefs
     private static final String MIRROR_FILENAME = "secure-prefs.dat",
                                 MIRROR_TEMP_SUFFIX = ".tmp",
                                 MIRROR_BACKUP_SUFFIX = ".bak",
-                                PRIMARY_MARKER = "__scarlet_secure_store_primary__";
+                                PRIMARY_MARKER = "__scarlet_secure_store_primary__",
+                                INTEGRITY_MARKER = "__scarlet_secure_store_integrity_v1__";
     private static final int    PREFERRED_KEY_SIZE = 256,
                                 KEYGEN_ITERATIONS = 100_000,
                                 IV_LENGTH = 12,
@@ -147,8 +149,11 @@ public final class EncryptedPrefs
     public EncryptedPrefs(Preferences prefs, String globalPassword, File dataDir)
     {
         this.prefs = prefs;
+        this.validationPassword = globalPassword;
         this.dataDir = dataDir;
         this.mirrorEnabled = dataDir != null && prefs != null;
+        this.validationKey = this.mirrorEnabled && globalPassword != null && SUPPORTED_KEY_SIZE >= 128
+            ? derive(globalPassword.toCharArray(), prefs.absolutePath()) : null;
         this.mirrorFile = this.mirrorEnabled ? new File(dataDir, MIRROR_FILENAME) : null;
         this.mirror = new Properties();
         this.keyCache = new ConcurrentHashMap<>();
@@ -177,20 +182,83 @@ public final class EncryptedPrefs
     {
         if (prefs == null || globalPassword == null)
             return null;
+        return tryReadLocalPasswordForPath(prefs, null, prefs.absolutePath(), globalPassword);
+    }
+
+    /**
+     * Reads a local-password seed whose encrypted record may have been moved to a different
+     * Preferences node during a package-namespace migration. The record is looked up in
+     * {@code prefs} (and, when supplied, the data-folder mirror), but its key and wrapping key are
+     * derived from {@code sourceAbsolutePath}. This lets callers verify and re-wrap the seed for the
+     * destination node without importing or mutating the earlier node.
+     */
+    public static String tryReadLocalPasswordForPath(Preferences prefs, File dataDir, String sourceAbsolutePath, String globalPassword)
+    {
+        if (prefs == null || sourceAbsolutePath == null || globalPassword == null)
+            return null;
         try
         {
-            String absolutePath = prefs.absolutePath(),
-                   hash = masterPasswordKey(absolutePath, globalPassword);
-            String localPassword = readLocalPasswordAt(prefs, globalPassword, absolutePath, hash);
+            String hash = masterPasswordKey(sourceAbsolutePath, globalPassword);
+            String localPassword = readLocalPasswordAt(prefs, globalPassword, sourceAbsolutePath, hash);
             if (localPassword != null)
                 return localPassword;
-            return readLocalPasswordAt(prefs, globalPassword, absolutePath, legacyMasterPasswordKey(absolutePath, globalPassword));
+            localPassword = readLocalPasswordAt(prefs, globalPassword, sourceAbsolutePath, legacyMasterPasswordKey(sourceAbsolutePath, globalPassword));
+            if (localPassword != null || dataDir == null)
+                return localPassword;
         }
         catch (Exception ex)
         {
-            return null;
+            // A broken Preferences backing store must not prevent recovery from the file mirror.
         }
+
+        if (dataDir == null)
+            return null;
+
+        File primary = new File(dataDir, MIRROR_FILENAME);
+        File backup = new File(dataDir, MIRROR_FILENAME + MIRROR_BACKUP_SUFFIX);
+        for (File candidate : new File[] { primary, backup })
+        {
+            if (!candidate.isFile())
+                continue;
+            try (InputStream in = Files.newInputStream(candidate.toPath()))
+            {
+                Properties stored = new Properties();
+                stored.load(in);
+                String[] hashes = {
+                    masterPasswordKey(sourceAbsolutePath, globalPassword),
+                    legacyMasterPasswordKey(sourceAbsolutePath, globalPassword)
+                };
+                for (String hash : hashes)
+                {
+                    String plain = stored.getProperty(FALLBACK_PREFIX + hash);
+                    if (plain != null)
+                        return plain;
+                    String encoded = stored.getProperty(hash);
+                    if (encoded == null)
+                        continue;
+                    byte[] encrypted = Base64.getDecoder().decode(encoded);
+                    String decrypted = decryptQuiet(derive(globalPassword.toCharArray(), sourceAbsolutePath), encrypted);
+                    if (decrypted != null)
+                        return decrypted;
+                }
+            }
+            catch (Exception ex)
+            {
+                LOG.warn("secure store: could not verify an earlier local-password seed from {}", candidate, ex);
+            }
+        }
+        return null;
     }
+
+    /**
+     * Reads a verified local-password seed from either the supplied Preferences node or its
+     * data-folder mirror.
+     */
+    public static String tryReadLocalPassword(Preferences prefs, File dataDir, String globalPassword)
+    {
+        return prefs == null ? null : tryReadLocalPasswordForPath(prefs, dataDir, prefs.absolutePath(), globalPassword);
+    }
+
     private static String readLocalPasswordAt(Preferences prefs, String globalPassword, String absolutePath, String hash)
     {
         try
@@ -364,6 +432,8 @@ public final class EncryptedPrefs
     }
 
     private final Preferences prefs;
+    private final String validationPassword;
+    private final SecretKey validationKey;
     private final char[] localPassword;
     private final Map<String, SecretKey> keyCache;
     private final boolean plaintextFallback;
@@ -377,7 +447,7 @@ public final class EncryptedPrefs
     private volatile boolean filePrimary;
     private String localPwKey;
 
-    public void put(String key, String value)
+    public synchronized void put(String key, String value)
     {
         if (value == null)
         {
@@ -399,7 +469,7 @@ public final class EncryptedPrefs
             this.storeBytes(bk, encrypted);
     }
 
-    public String get(String key)
+    public synchronized String get(String key)
     {
         String bk = hash(key), fk = FALLBACK_PREFIX + bk;
         if (this.plaintextFallback)
@@ -414,13 +484,51 @@ public final class EncryptedPrefs
         return this.readEncrypted(bk, key);
     }
 
-    public void remove(String key)
+    public synchronized void remove(String key)
     {
         if (this.prefs == null && !this.mirrorEnabled)
             return;
         String bk = hash(key), fk = FALLBACK_PREFIX + bk;
-        this.removeBoth(bk);
-        this.removeBoth(fk);
+        try
+        {
+            if (this.mirrorEnabled)
+            {
+                synchronized (this.mirrorLock) { this.mirror.remove(bk); this.mirror.remove(fk); }
+                Properties verified = this.saveMirrorVerified();
+                // Recovery must not resurrect a deliberately deleted active credential.
+                FileBackups.writeBytes(this.backupFile(), 0, output -> verified.store(output, "Scarlet secure store verified recovery copy"));
+                if (!verified.equals(readProperties(this.backupFile()))) throw new IOException("Credential recovery copy failed verification");
+            }
+            if (this.prefs != null)
+            {
+                this.prefs.remove(bk); this.prefs.remove(fk); this.prefs.flush();
+                if (this.prefs.get(bk, null) != null || this.prefs.get(fk, null) != null)
+                    throw new IOException("Credential registry deletion failed verification");
+            }
+        }
+        catch (IOException | BackingStoreException ex)
+        { throw new java.io.UncheckedIOException("Credential removal was not fully persisted", ex instanceof IOException ? (IOException) ex : new IOException(ex)); }
+    }
+
+    public synchronized void putVerified(String key, String value)
+    {
+        this.put(key, value);
+        try
+        {
+            if (this.mirrorEnabled)
+            {
+                synchronized (this.mirrorLock)
+                {
+                    Properties reopened = readProperties(this.mirrorFile);
+                    if (!this.mirror.equals(reopened) || !this.isValidMirror(reopened))
+                        throw new IOException("Saved credential mirror failed durable read-back verification");
+                }
+            }
+            if (!this.filePrimary && this.prefs != null) this.prefs.flush();
+            if (!java.util.Objects.equals(value, this.get(key))) throw new IOException("Saved credential failed verification");
+        }
+        catch (IOException | BackingStoreException ex)
+        { throw new java.io.UncheckedIOException("Credential write was not fully persisted", ex instanceof IOException ? (IOException) ex : new IOException(ex)); }
     }
 
     public boolean contains(String key)
@@ -574,60 +682,151 @@ public final class EncryptedPrefs
     {
         synchronized (this.mirrorLock)
         {
-            try
+            boolean existing = false;
+            for (File candidate : new File[] { this.mirrorFile, this.backupFile() })
             {
-                if (this.mirrorFile != null && this.mirrorFile.isFile())
+                if (candidate == null || !candidate.exists()) continue;
+                existing = true;
+                try
                 {
-                    try (InputStream in = Files.newInputStream(this.mirrorFile.toPath()))
+                    Properties loaded = readProperties(candidate);
+                    if (!this.isValidMirror(loaded))
+                        throw new IOException("Credential store seed or whole-file integrity failed validation");
+                    if (candidate.equals(this.mirrorFile) && !loaded.containsKey(INTEGRITY_MARKER) && this.backupFile().isFile())
                     {
-                        this.mirror.clear();
-                        this.mirror.load(in);
+                        Properties recovery = readProperties(this.backupFile());
+                        if (this.isValidMirror(recovery))
+                            for (String key : recovery.stringPropertyNames())
+                                if (isCredentialKey(key) && !loaded.containsKey(key))
+                                    throw new AmbiguousLegacyMirrorException();
+                    }
+                    this.mirror.putAll(loaded);
+                    if (!candidate.equals(this.mirrorFile))
+                    {
+                        // Preserve the damaged primary as evidence, and do not copy it over .bak.
+                        if (this.mirrorFile.isFile())
+                            Files.copy(this.mirrorFile.toPath(), new File(this.dataDir,
+                                MIRROR_FILENAME + ".quarantine-" + java.util.UUID.randomUUID()).toPath());
+                        LOG.warn("secure store: recovered validated credential mirror from backup");
                     }
                     return;
                 }
-                File backup = this.backupFile();
-                if (backup != null && backup.isFile())
+                catch (AmbiguousLegacyMirrorException ambiguous) { throw ambiguous; }
+                catch (IOException | RuntimeException ex)
                 {
-                    try (InputStream in = Files.newInputStream(backup.toPath()))
-                    {
-                        this.mirror.clear();
-                        this.mirror.load(in);
-                    }
-                    LOG.warn("secure store: primary mirror file missing; recovered {} from backup {}", this.mirror.size(), backup);
+                    LOG.warn("secure store: credential mirror candidate failed validation; checking recovery copy", ex);
                 }
             }
-            catch (Throwable t)
+            if (existing && tryReadLocalPassword(this.prefs, this.validationPassword) == null)
             {
-                LOG.warn("secure store: failed to load mirror file; continuing with an empty mirror", t);
+                throw new IllegalStateException("Credential storage is damaged and no valid recovery seed is available. "
+                    + "Existing files were preserved; restore a verified backup before continuing.");
             }
         }
     }
 
-    private void saveMirror(String reason)
+    private static Properties readProperties(File file) throws IOException
     {
-        if (this.mirrorFile == null) return;
-        synchronized (this.mirrorLock)
+        Properties values = new Properties();
+        try (InputStream input = Files.newInputStream(file.toPath())) { values.load(input); }
+        return values;
+    }
+
+    private static final class AmbiguousLegacyMirrorException extends IllegalStateException
+    {
+        private static final long serialVersionUID = 1L;
+        AmbiguousLegacyMirrorException()
+        { super("Legacy credential primary omits entries present in its recovery copy. Both were preserved; explicit backup recovery is required before continuing."); }
+    }
+
+    private boolean isValidMirror(Properties values)
+    {
+        String expected = values.getProperty(INTEGRITY_MARKER);
+        return this.hasValidSeed(values) && (expected == null || expected.equals(mirrorIntegrity(values)));
+    }
+
+    /** Detect accidental truncation anywhere in new stores, including after a valid seed. */
+    private static String mirrorIntegrity(Properties values)
+    {
+        try
         {
+            MessageDigest digest = MessageDigest.getInstance(DIGEST_METHOD);
+            for (String key : new TreeSet<>(values.stringPropertyNames()))
+            {
+                if (INTEGRITY_MARKER.equals(key)) continue;
+                for (String component : new String[] { key, values.getProperty(key) })
+                {
+                    byte[] bytes = component.getBytes(StandardCharsets.UTF_8);
+                    digest.update(java.nio.ByteBuffer.allocate(4).putInt(bytes.length).array());
+                    digest.update(bytes);
+                }
+            }
+            return Base64.getEncoder().encodeToString(digest.digest());
+        }
+        catch (NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }
+    }
+
+    private boolean hasValidSeed(Properties values)
+    {
+        if (values.isEmpty()) return false;
+        if (this.validationPassword == null || SUPPORTED_KEY_SIZE < 128)
+            return values.stringPropertyNames().stream().anyMatch(k -> k.startsWith(FALLBACK_PREFIX));
+        String path = this.prefs.absolutePath();
+        SecretKey wrappingKey = this.validationKey;
+        for (String key : new String[] { masterPasswordKey(path, this.validationPassword), legacyMasterPasswordKey(path, this.validationPassword) })
+        {
+            if (values.getProperty(FALLBACK_PREFIX + key) != null) return true;
             try
             {
-                Path target = this.mirrorFile.toPath();
-                Path tmp = new File(this.mirrorFile.getParentFile(), MIRROR_FILENAME + MIRROR_TEMP_SUFFIX).toPath();
-                try (OutputStream out = Files.newOutputStream(tmp))
-                {
-                    this.mirror.store(out, "Scarlet secure store mirror - encrypted; do not edit by hand");
-                }
-                if (this.mirrorFile.isFile())
-                {
-                    try { Files.copy(target, this.backupFile().toPath(), StandardCopyOption.REPLACE_EXISTING); }
-                    catch (Throwable ignore) { /* best-effort previous-generation backup */ }
-                }
-                try { Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
-                catch (Throwable atomicUnsupported) { Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING); }
+                String encoded = values.getProperty(key);
+                if (encoded != null && decryptQuiet(wrappingKey, Base64.getDecoder().decode(encoded)) != null)
+                    return true;
             }
-            catch (Throwable t)
+            catch (IllegalArgumentException ignored) { }
+        }
+        return false;
+    }
+
+    private void saveMirror(String reason)
+    {
+        try { this.saveMirrorVerified(); }
+        catch (IOException | RuntimeException ex)
+        {
+            LOG.warn("secure store: failed to save mirror file while {}", reason, ex);
+        }
+    }
+
+    /** Publish only durable output, then verify a newly opened disk copy before cutover. */
+    private Properties saveMirrorVerified() throws IOException
+    {
+        if (this.mirrorFile == null) throw new IOException("Credential mirror is unavailable");
+        synchronized (this.mirrorLock)
+        {
+            Properties snapshot = new Properties();
+            snapshot.putAll(this.mirror);
+            if (!this.hasValidSeed(snapshot)) throw new IOException("Refusing to save a credential mirror without a valid seed");
+            snapshot.setProperty(INTEGRITY_MARKER, mirrorIntegrity(snapshot));
+            if (this.mirrorFile.isFile())
             {
-                LOG.warn("secure store: failed to save mirror file while {}", reason, t);
+                try
+                {
+                    Properties previous = readProperties(this.mirrorFile);
+                    if (this.isValidMirror(previous))
+                        FileBackups.writeBytes(this.backupFile(), 0,
+                            output -> previous.store(output, "Scarlet secure store verified recovery copy"));
+                }
+                catch (IllegalArgumentException ex)
+                {
+                    LOG.warn("secure store: malformed primary was not copied over the recovery backup");
+                }
             }
+            FileBackups.writeBytes(this.mirrorFile, 0,
+                output -> snapshot.store(output, "Scarlet secure store mirror - encrypted; do not edit by hand"));
+            Properties reopened = readProperties(this.mirrorFile);
+            if (!snapshot.equals(reopened) || !this.isValidMirror(reopened))
+                throw new IOException("Credential mirror failed disk read-back verification");
+            this.mirror.setProperty(INTEGRITY_MARKER, snapshot.getProperty(INTEGRITY_MARKER));
+            return reopened;
         }
     }
 
@@ -671,25 +870,27 @@ public final class EncryptedPrefs
         if (this.dataDir == null || this.prefs == null) return;
         try
         {
-            Properties dump = new Properties();
-            for (String k : this.safeKeys())
-            {
-                byte[] b = this.getRegBytes(k);
-                if (b != null) { dump.setProperty("b:" + k, Base64.getEncoder().encodeToString(b)); continue; }
-                String s = this.getRegString(k);
-                if (s != null) dump.setProperty("s:" + k, s);
-            }
-            File f = new File(this.dataDir, "secure-prefs.registry-backup-" + ts() + ".dat");
-            try (OutputStream out = Files.newOutputStream(f.toPath()))
-            {
-                dump.store(out, "Scarlet registry snapshot (" + reason + ")");
-            }
-            LOG.warn("secure store: wrote registry snapshot to {} ({} entries)", f, dump.size());
+            this.snapshotRegistryVerified(reason);
         }
         catch (Throwable t)
         {
             LOG.warn("secure store: failed to snapshot registry", t);
         }
+    }
+
+    private void snapshotRegistryVerified(String reason) throws IOException, BackingStoreException
+    {
+        Properties dump = new Properties();
+        for (String key : this.prefs.keys())
+        {
+            // Preserve Preferences' exact stored string representation, including metadata.
+            String value = this.prefs.get(key, null);
+            if (value == null) throw new IOException("Registry changed while preparing its snapshot");
+            dump.setProperty("s:" + key, value);
+        }
+        File snapshot = new File(this.dataDir, "secure-prefs.registry-backup-" + ts() + "-" + java.util.UUID.randomUUID() + ".dat");
+        FileBackups.writeBytes(snapshot, 0, output -> dump.store(output, "Scarlet registry snapshot (" + reason + ")"));
+        if (!dump.equals(readProperties(snapshot))) throw new IOException("Registry snapshot failed read-back verification");
     }
 
     private void snapshotEverything(String reason)
@@ -763,6 +964,7 @@ public final class EncryptedPrefs
         List<String> mismatched = new ArrayList<>();
         for (String k : keys)
         {
+            if (!isCredentialKey(k)) continue;
             if (k.startsWith(FALLBACK_PREFIX))
             {
                 String r = this.getRegString(k), m = this.mirrorGetString(k);
@@ -820,6 +1022,7 @@ public final class EncryptedPrefs
         List<String> uncovered = new ArrayList<>();
         for (String k : regKeys)
         {
+            if (!isCredentialKey(k)) continue;
             if (k.startsWith(FALLBACK_PREFIX))
             {
                 String r = this.getRegString(k), m = this.mirrorGetString(k);
@@ -838,16 +1041,50 @@ public final class EncryptedPrefs
             return sb.toString();
         }
 
-        this.snapshotRegistry("pre-cutover");
-        int removed = 0;
-        for (String k : regKeys) { this.removeReg(k); removed++; }
-        flushPrefs(this.prefs, "cutover: clearing registry");
-        synchronized (this.mirrorLock) { this.mirror.setProperty(PRIMARY_MARKER, "file"); }
-        this.saveMirror("cutover: marking file as primary");
+        try
+        {
+            Properties durable = this.saveMirrorVerified();
+            for (String key : regKeys)
+            {
+                if (!isCredentialKey(key)) continue;
+                String registry = this.prefs.get(key, null);
+                // Byte-array Preferences use the same base64 representation as the mirror.
+                if (registry == null || !registry.equals(durable.getProperty(key)))
+                    throw new IOException("Registry changed or durable mirror does not match");
+            }
+            this.snapshotRegistryVerified("pre-cutover");
+            synchronized (this.mirrorLock) { this.mirror.setProperty(PRIMARY_MARKER, "file"); }
+            this.saveMirrorVerified();
+        }
+        catch (Exception ex)
+        {
+            synchronized (this.mirrorLock) { this.mirror.remove(PRIMARY_MARKER); }
+            LOG.warn("secure store: cutover stopped before registry deletion", ex);
+            sb.append("Cutover SKIPPED: durable mirror/snapshot verification failed. No registry entries were removed.");
+            return sb.toString();
+        }
         this.filePrimary = true;
+        int removed = 0;
+        try
+        {
+            for (String k : regKeys) if (isCredentialKey(k)) { this.prefs.remove(k); removed++; }
+            this.prefs.flush();
+        }
+        catch (Exception ex)
+        {
+            LOG.warn("secure store: verified file-primary cutover completed but registry cleanup failed", ex);
+            sb.append("File store verified and primary; registry cleanup incomplete. Credentials remain in the verified file and snapshot.");
+            return sb.toString();
+        }
         sb.append("Cutover COMPLETE: a registry snapshot was saved, ").append(removed)
           .append(" registry entr(ies) were removed, and the data-folder file is now the primary store.");
         return sb.toString();
+    }
+
+    private static boolean isCredentialKey(String key)
+    {
+        String hashKey = key.startsWith(FALLBACK_PREFIX) ? key.substring(FALLBACK_PREFIX.length()) : key;
+        return hashKey.matches("[0-9a-f]{64}");
     }
 
     private static String firstNonNull(String a, String b)
