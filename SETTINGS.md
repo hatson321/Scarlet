@@ -1,12 +1,37 @@
 
 # Settings
 
-All settings files for KozyBlake/Scarlet can be found in the directory `%LOCALAPPDATA%\KozyBlake\Scarlet`.
-When upgrading from the upstream default folder, KozyBlake/Scarlet asks before copying existing data into the KozyBlake/Scarlet folder and leaves the legacy folder in place for rollback.
-Some internal volatile data can be found in the Windows registry.
-These registry entries exist because of the use of classes in the [`java.util.prefs`](https://docs.oracle.com/javase/8/docs/api/java/util/prefs/package-summary.html) package.
+This reference describes the current development source and the features already
+available in the published 0.6.1-a11 preview. As of November 1, 2026, stable is
+0.6.0; plain 0.6.1 is still a draft and development 0.6.1-a12 is not a published
+release. A feature marked as added in a preview is not promised in stable 0.6.0.
 
-If it isn't obvious, all nominally sensitive values listed are ficticious.
+Use Scarlet's settings UI and authorized Discord configuration commands whenever
+possible. Save settings through the UI; do not replace a working configuration
+with the examples below. Stop Scarlet before any necessary manual file edit and
+keep an independent, private backup. A new JAR filename does not create a new
+data profile, and two versions must not share a running profile.
+
+### Data location
+
+The default Windows data folder is `%LOCALAPPDATA%\Hatson321\Scarlet Logger`.
+On Linux it is `$XDG_DATA_HOME/Hatson321/Scarlet Logger`, or
+`~/.local/share/Hatson321/Scarlet Logger` when `XDG_DATA_HOME` is unset. An explicit
+`SCARLET_HOME` environment variable or `-DSCARLET_HOME="<data-folder>"` Java option
+selects another profile; the Java option takes precedence. Use a real, writable
+folder, not a virtual location such as Windows “This PC.” Confirm the resolved
+folder in Scarlet's startup log instead of assuming it is next to the JAR.
+
+When transferring from an earlier data folder, Scarlet asks before copying data
+and leaves the earlier folder unchanged for rollback. Some preferences also use
+Java Preferences (the Windows registry on Windows); copying only `settings.json`
+is not a complete credential/configuration backup. Use Scarlet's export/restore
+flow and keep its archive and PIN private.
+
+The illustrated objects below use JSON with full-line `//` comments for explanation,
+not a complete default configuration. Remove comments for a strict JSON validator.
+IDs and paths are placeholders; no token, password, cookie or private join link
+should be copied into documentation, screenshots or support posts.
 
 ## file `logs/scarlet_log_0000-00-00_00-00-00.txt`
 
@@ -15,6 +40,33 @@ Files containing the output of the application log.
 ## file `caches/XXX/XXX_00000000-0000-0000-0000-000000000000.json`
 
 Files containing cached objects from the VRChat API
+
+## file `avatar-provider-cache.json`
+
+Starting with 0.6.1-a11, external avatar-provider results are saved privately inside
+the current Scarlet data profile. Repeated matching lookups can reuse these results
+after restarting Scarlet. This is separate from the VRChat API object cache above.
+
+- Successful results expire after 24 hours; successful empty results expire after
+  five minutes. Errors, timeouts and rate-limit responses are not cached as empty.
+- The cache retains at most 256 entries, with an 8 MiB total size ceiling and a
+  512 KiB ceiling per entry. Oversized successful results can still be used for the
+  current lookup without retaining them. Evicted or expired entries require a new lookup.
+- Results are kept separate for each provider, lookup mode, exact query and requested
+  result count. Avatar names alone are not treated as proof of an avatar's identity.
+- Only public avatar metadata is saved, not image files, login credentials or the
+  operator's identity. Query/provider keys are hashed, but the metadata is encoded,
+  **not encrypted**. Treat the file as private profile data.
+- Existing provider consent and selection still apply to cache hits. Disabling consent
+  prevents further use; it does not delete already saved metadata. Use **Settings →
+  Avatar search providers → Manage… → Clear saved avatar results** to clear it.
+- If Scarlet cannot safely protect or read the cache file, it logs a warning and
+  continues with a bounded memory-only cache. It does not weaken file permissions.
+
+Provider responses also have an 8 MiB transfer/decoded limit and a maximum of 5,000
+records (or the smaller requested count). Initializing or clearing the cache does
+not itself query a provider; normal opted-in searches and automatic avatar lookups
+still run as needed.
 
 ## file `caches/XXX/known_404s.json`
 
@@ -28,13 +80,26 @@ List of ids known to return a `HTTP 404 Not Found` from the VRChat API
 
 ## file `discord_bot.json`
 
-Settings for the Discord bot account
+Settings for the Discord bot account. Enter the bot token through Scarlet's setup
+flow, not a sample JSON file. Legacy plaintext token fields are migration inputs,
+not the recommended storage method. Audit, extended-event, confidential and
+operations-alert destinations are separate assignments: configuring one does not
+configure the others. Use `/set-audit-channel`, `/set-audit-ex-channel` and the
+corresponding secret-channel commands for their respective events.
+
+Use `/scarlet-discord-permissions list` to inspect a role or user's explicit
+interaction permissions, selecting the required `target` and optional `type`.
+Authorized administrators can use `/scarlet-discord-permissions set` with `target`,
+`type`, `name` and `value` (`Allow`, `Deny` or `Default`) to change that policy.
+Use the command's choices and autocomplete rather than inventing permission names.
+Current **Other** permission identifiers include `groupex-bans-manage` and
+`groupex-tags-edit`. Empty explicit listings do not mean the user has no effective
+authority: owner/admin handling, defaults and action-specific checks still apply.
+The old `scarletPermission2roleSf` map is retained for compatibility; its
+`/config-info` display is not the active DPerms policy. Historical keys such as
+`event.set_tags` and `event.submit_evidence` are not current permission identifiers.
 ```json
 {
-    // The Discord bot token
-    "token": "",
-    // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
-    
     // The Discord server snowflake id
     "guildSf": "123456789123456789",
 
@@ -54,10 +119,10 @@ Settings for the Discord bot account
     "ticketToolChannelNameRegex": "(?i).*ticket.*",
 
     // Optional. Discord role snowflake id to ping alongside the ticket opener
-    "ticketToolNotifyRoleSf": "1479385524786696242",
+    "ticketToolNotifyRoleSf": "123456789123456789",
 
     // Message the bot sends after pinging the inferred ticket opener
-    "ticketToolAgeVerificationMessage": "If your ticket is regarding age verification;\n\nYou have 2 options.\n\nTake a photo of your ID with everything but your birthday covered, with a piece of paper next to it with todays date, the server name, your Discord username, and your VRChat username.\n\nIf you're an NSFW content creator and have a verified Fansly account, you can write within your bio the server name. Once that is done, take a screenshot and also send the link of your profile here.",
+    "ticketToolAgeVerificationMessage": "Contact the server's moderation team for its verification process. Do not post sensitive documents in public channels.",
     
     // Optional. The voice channel snowflake id
     "audioChannelSf": "123456789123456789",
@@ -65,17 +130,13 @@ Settings for the Discord bot account
     // Optional. Path to store evidence submitted for certain audit events
     "evidenceRoot": "C:/Users/Scarlet/Desktop/evidence",
     
-    // Map of Scarlet-internal permission to Discord role snowflake id
-    "scarletPermission2roleSf": {
-        "event.set_tags": "123456789123456789",
-        "event.submit_evidence": "123456789123456789"
-    },
+    // Legacy compatibility map, not the current interaction-permission policy.
+    // Manage active permissions with /scarlet-discord-permissions instead.
+    "scarletPermission2roleSf": {},
     
     // Map of auxiliary webhook internal ids to Discord webhook urls
-    "scarletAuxWh2webhookUrl ": {
-        "External Webhook One": "https://discord.com/api/webhooks/123456789123456789/IdzL4t3KvfQQ_CKYWd8Q2NM6Z7IaSOppoTTL4LS1Da_aMZ-eK1MbML-3ILnLjotWcDkp",
-        "External Webhook Two": "https://discord.com/api/webhooks/123456789123456789/irNaGekj1zzccv__Uy4oC7d2GczNDbilnfBtcc5qL41bZ0Ikw1SXoYc7-bJST-yPdUQB"
-    },
+    // Credential-bearing webhook URLs are deliberately omitted from this example.
+    "scarletAuxWh2webhookUrl": {},
     
     // Map of audit entry event type to Discord channel snowflake id
     "auditType2channelSf": {
@@ -113,21 +174,13 @@ Settings for the Discord bot account
         "group.instance.kick": "FF7F00",
         "group.user.ban": "FF0000",
         "group.instance.create": "00FF00"
-    }
+    },
     
-    // Array of queued actions
-    "queuedActions": [
-        {
-            // The kind of action being taken
-            "action": "ban",
-            // The user who queued the action
-            "actorId": "usr_00000000-0000-0000-0000-000000000000",
-            // The target of the queued action
-            "targetId": "usr_11111111-1111-1111-1111-111111111111",
-            // The location of the queued action
-            "location": "wrld_00000000-0000-0000-0000-000000000000:00000~group(grp_00000000-0000-0000-0000-000000000000)~groupAccessType(plus)~region(us)"
-        }
-    ]
+    // Legacy queue migration input, not the current executable queue.
+    // Current receipts are managed in data/moderation_queue.json.
+    // Legacy entries are held for operator review, not automatically replayed.
+    // Submit new actions through the authorized UI/commands; do not hand-edit receipts.
+    "queuedActions": []
 }
 ```
 
@@ -159,8 +212,7 @@ For slash command arguments, it is the full command name of its parent, as above
                 "<PermissionName>": false
             }
         }
-    },
-    ...
+    }
 }
 ```
 
@@ -267,7 +319,7 @@ Specification for scheduled events
                 }
             }
         }
-    }
+    },
     
     // An alternate Discord server snowflake id in which to post the Discord events
     "alternateGuildSf": "123456789123456789"
@@ -365,21 +417,112 @@ Parameters are as such:
 
 ## file `settings.json`
 
-General settings for Scarlet:
+General settings for Scarlet. Settings below are separate controls, not a single
+“automatic mode.” Current source defaults for the main monitoring/client controls are:
+
+| Setting key | Default | Meaning |
+|---|---|---|
+| `audit_polling_interval` | `60` seconds | Audit polling interval, allowed range 10–300 seconds; shared API pacing/cooldowns can add a wait. |
+| `audit_catchup_max_days` | `14` days | Startup catch-up window, allowed range 1–90 days; older missed history is skipped with a local warning. |
+| `auto_close_bot_instance_minutes` | `0` (off) | Separately requests a normal server-instance close after the configured idle period and safety checks. |
+| `vrchat_client_launch_on_instance_create` | `false` | Optional client launch/follow and eligible startup-instance joining. |
+| `vrchat_client_recover_stalled_startup` | `false` | Bounded recovery of a verified Scarlet-owned automatic launch, not any manually started client. |
+| `vrchat_client_exit_closed_empty` | `false` | Exits the qualifying local VRChat client after its monitored instance is already closed and empty of other players. Scarlet itself stays running. |
+| `vrchat_client_force_stalled_startup` | `false` | Separate Windows-only forced-exit fallback for startup recovery. |
+| `vrchat_client_force_closed_empty` | `false` | Separate Windows-only forced-exit fallback for closed/empty client shutdown. |
+
+### Client shutdown is not instance closure
+
+In the 0.6.1 previews, closed/empty client exit requires a matching closure audit,
+a healthy caught-up local log session, known self with no other players, a full
+30-second grace period and fresh exact-process/session checks. It no longer waits
+for an independent API occupancy count. Delayed closure audits can still delay
+exit; missing or unhealthy logs cannot prove that the instance is empty. An empty
+but still-open instance does not qualify.
+
+The only verified same-user client can qualify, including a manually launched
+client; multiple clients block selection. Startup recovery remains stricter and
+requires Scarlet launch ownership. Normal close is attempted first. Each separate
+Windows force-close option requires fresh checks and at least 15 seconds for normal
+exit, and can lose unsaved client state. Leave those options off unless that risk
+is acceptable. Neither option authorizes a blanket process-name kill.
+
+The idle **server-instance** close setting remains separate and retains its fresh
+API occupancy check. A normal soft close prevents new joins but does not eject
+existing occupants. Stable 0.6.0's older client-exit policy is documented in its own
+release notes; do not apply a preview's changed process eligibility to that build.
+
+### Health alerts and saved-history summaries
+
+Use `/set-ops-alert-channel` to choose the optional operations/health destination.
+It does not configure moderation, vote-to-kick or confidential audit routes. Health
+alerts are best-effort notices, not proof that an event was delivered or that a
+particular permission is missing. A log-stall warning can appear after more than
+five minutes without observed log lines while VRChat is running; the known false
+startup log-stall warning is not fixed by this documentation. Check the local log
+and actual tracking state before resetting credentials or changing permissions.
+
+`moderation-summary` reads saved structured audit history on the logger computer,
+not Discord message history or diagnostic text logs. It runs in a dedicated
+background worker, with one summary at a time. Unreadable records are skipped,
+excluded from totals and counted in the result. Missing or never-collected history
+cannot be reconstructed; safety/resource limits can still stop a scan. Other
+commands, including `actor-moderation-summary` and `outstanding-moderation`, remain
+API-backed.
+
+### External avatar-provider consent
+
+External provider lookups are off until the owner explicitly accepts the current
+notice. Selected providers receive the lookup data and Scarlet's identifying
+User-Agent, including configured group and primary signed-in account IDs plus
+public support contacts. Consent covers manual searches and automatic
+avatar-change/hydration/rescan lookups; enabling a provider is not anonymous.
+Older consent keys do not substitute for the current consent-v2 decision.
+
+Disabling consent or deselecting a provider also prevents reuse of its saved
+results. It does not erase already saved metadata; use the clear-cache control
+described under `avatar-provider-cache.json`. That preview feature stores metadata,
+not avatar image files, and does not make its contents encrypted or safe to share.
+
+### Windows rendering compatibility
+
+In **Settings -> General -> Appearance**, enable **Windows rendering compatibility
+(restart required)** only if Scarlet has display corruption that improves when
+launched with `-Dsun.java2d.d3d=false`. The default is off. This option is hidden
+and has no effect on Linux. It is also available in Staff Mode.
+
+Click **Save Settings**, close Scarlet completely, and reopen it. Java chooses
+its rendering pipeline early, so the checkbox does not change the current window.
+The saved option disables Java Direct3D rendering for Scarlet on Windows; it does
+not change the Windows display settings or other applications. It may change UI
+rendering performance and is a compatibility workaround, not a graphics-driver repair.
+
+If the display is difficult to use, launch this build once with
+`java "-Dsun.java2d.d3d=false" -jar "scarlet-<version>.jar"` (replace `<version>` with
+your downloaded build), enable the checkbox and save, then close it and launch
+normally using Java 11 or newer, preferably Java 21. Double-clicking uses the
+Windows JAR association, which may select a different Java installation. Explicit Java options
+(including a `.bat` launcher's `-Dsun.java2d.d3d=false` or `true`) take precedence
+over the checkbox. To return to normal rendering, turn it off, save and restart
+without that explicit option.
+
+The option is read from the resolved data home's `settings.json` before the UI
+starts. When a startup folder chooser or legacy-transfer prompt has multiple
+possible homes, a compatibility request from any offered/eligible home is used
+for that launch so the prompt can be drawn correctly. No home's saved preference
+is changed by that fallback. Missing, malformed, oversized or unsafe settings
+leave the existing Java rendering options unchanged.
+
+### Settings example
+
 ```json
 {
-    // The username used to authenticate with VRChat
-    "vrc_username": "DefinitelyNOTtupper",
-    // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
-    
-    // The password used to authenticate with VRChat
-    "vrc_password": "password_cute_robot",
-    // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
-    
-    // Optional. The TOTP secret used to two-factor authenticate with VRChat
-    "vrc_secret": "abcd efgh ijkl mnop qrst uvxx yz23 4567",
-    // DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
-    
+    // Windows-only Java Direct3D compatibility workaround; save and restart to apply.
+    "windows_rendering_compatibility": false,
+
+    // VRChat credentials belong in Scarlet's setup UI and protected credential store.
+    // Legacy vrc_username/vrc_password/vrc_secret fields are not configuration examples.
+
     // The VRChat groupId of the relevant group
     "vrchat_group_id": "grp_00000000-0000-0000-0000-000000000000",
 
@@ -398,10 +541,7 @@ General settings for Scarlet:
     "auto_invite_group_id": "grp_00000000-0000-0000-0000-000000000000",
     
     // Whether the generated report link appends a footer containing the Group ID, Audit ID, and Scarlet version
-    "vrchat_report_template_footer": "username@example.com",
-    
-    // Whether to announce watched groups with TTS
-    "tts_announce_watched_groups": true,
+    "vrchat_report_template_footer": true,
     
     // The voice in which TTS speaks.
     // On Linux, command-line engines are prefixed, e.g. "flite/slt", "pico2wave/en-US", "festival/default", or "espeak-ng/en".
@@ -455,7 +595,7 @@ General settings for Scarlet:
     "tts_announce_mixed_character_names": true,
 
     // Master switch for suspicious-pronoun detection. When false, Scarlet does not flag pronoun fields
-    // at all: no Advisory entry, no TTS announcement, no mobile alert, and no player-list highlight
+    // at all: no Advisory entry, no TTS announcement, and no player-list highlight
     "tts_flag_suspicious_pronouns": true,
 
     // Whether to speak a TTS line when a pronoun field is flagged
@@ -503,18 +643,36 @@ General settings for Scarlet:
     // Whether to issue a ping to the Discord user whose associated VRChat user issues a User Unban
     "discord_ping_user_unban": false,
     
-    // Whether to launch a new VRChat Client instance on an Instance Create
+    // Whether to launch VRChat for newly created group instances and join an existing
+    // open instance at Scarlet startup. When several are open, startup chooses the
+    // newest using creation-audit timestamps, not the API list order. This runs in
+    // the background even if fast instance polling is disabled. A pre-existing
+    // VRChat client is left alone; an unverifiable choice is skipped with a log message.
     "vrchat_client_launch_on_instance_create": false,
+
+    // Small Discord profile/avatar thumbnails on staff and regular instance join/leave
+    // messages. Toggle in Settings; takes effect on subsequent messages without restart.
+    // Uses cached public profiles only: an uncached/missing image is omitted without
+    // delaying the log or making an additional VRChat request. Discord controls its size.
+    "discord_instance_join_leave_thumbnails": true,
     
     // Whether evidence submission is enabled
     "evidence_enabled": false,
     
+    // Explicit permission for identifying external avatar lookups (off until opted in).
+    // Enabling allows automatic avatar-change/hydration/rescan requests as well as
+    // manual searches; selected services receive lookup data plus the configured
+    // group ID and signed-in primary account ID in the User-Agent, with public support contacts.
+    // Older avatar_search_external_lookups_enabled / avatar_search_identified_lookups_enabled permission is not reused:
+    // owners must opt in again after reviewing the updated provider notice.
+    "avatar_search_identified_lookups_consent_v2": false,
+
     // Whether to use custom VRCX-compatible avatar search providers
     "custom_avatar_search_providers_enabled": false,
     
     // Array of VRCX-compatible avatar search providers
     "custom_avatar_search_providers": [
-        "https://website/vrcx_search.php"
+        "https://example.invalid/vrcx_search.php"
     ]
 }
 ```
@@ -531,12 +689,10 @@ Saved pending moderation actions:
 
 ## file `store.bin`
 
-DEPRECATED: this value is read, but is no longer written. This value now persists in the encrypted store.
-Saved cookies for authentication with VRChat, one cookie per line:
-```txt
-auth=authcookie_00000000-0000-0000-0000-000000000000; expires=Sun, 31 Feb 2069 12:34:56 GMT; path=/; httponly
-twoFactorAuth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJ2RjhPd3NDRVRvIiwibWFjQWRkcmVzcyI6IjU2OjUyOjQzOjY4OjYxOjc0IiwidGltZXN0YW1wIjozMTI5NTYxMjk2MDAwLCJ2ZXJzaW9uIjoxLCJpYXQiOjMxMjk1NjEyOTYsImV4cCI6MzEyOTU2MTI5NiwiYXVkIjoiVlJDaGF0VHdvRmFjdG9yQXV0aCIsImlzcyI6IlZSQ2hhdCJ9.fdmmkOhjs0fas7DjizP_374ZNRuUpZcTPLVnx2vbfAk; expires=Sun, 31 Feb 2069 12:34:56 GMT; path=/; httponly
-```
+Legacy authentication-cookie storage, read for migration rather than written for
+new sessions. Current credentials use the protected credential store. Do not
+manually paste cookies here or share the file; cookies can grant account access.
+Use Scarlet's authentication/setup flow instead.
 
 ## file `data/global.json`
 
@@ -653,7 +809,7 @@ Group audit log event information:
     "auxActorDisplayName": "Somebody",
     
     // Audit entry id of the event that directly and necessarily caused this event
-    "parentEventId": "gaud_00000000-0000-0000-0000-000000000000",
+    "parentEventId": "gaud_00000000-0000-0000-0000-000000000000"
 }
 ```
 
@@ -686,71 +842,44 @@ Extended audit event information:
 }
 ```
 
-## file `./scarlet.version`
+## Legacy launcher files — not current JAR setup steps
 
-Contains th version of Scarlet to be run:
-```txt
-0.4.11-rc2
+Older launcher distributions used `scarlet.version.target`, `scarlet.home`,
+`scarlet.home.java` and `java.options`. The currently published 0.6.0 and 0.6.1-a11
+assets do not include that launcher. Running the standard JAR does not make those
+files a supported way to select a build, Java installation or data profile.
+`scarlet.version` in a source archive is build metadata, not a runtime update switch.
+
+Download the desired JAR from its release, select a supported Java installation
+and launch it directly. For example, after replacing `<version>` with the actual
+filename:
+
+```text
+java -jar "scarlet-<version>.jar"
 ```
 
-## file `./scarlet.version.target`
+An explicit `-DSCARLET_HOME="<data-folder>"` goes before `-jar` when a separate
+profile is intentionally required. Do not reuse the old example JVM-tuning flags:
+some are obsolete or unsupported, and they are not required Scarlet settings.
+See [BUILDING.md](BUILDING.md) for source-build requirements and runtime/platform limits.
 
-Contains the version of Scarlet to which to update (you can "update" backwards if necessary):
-```txt
-0.4.11-rc3
-```
+## Preferences and protected credentials
 
-## file `./scarlet.home`
+Scarlet uses Java Preferences for some saved state, including UI and per-group
+progress. On Windows that backing store is in the user registry. Treat it as
+application-managed state, not a registry-editing setup recipe. A profile also
+contains credential mirrors/recovery data; these are not disposable log files.
 
-If present, specifies the directory in which to place the application's files:
-```txt
-C:\path\to\custom\data\dir
-```
+The normal current setup creates a random profile-specific `global-prefs.key` to
+protect credential storage; it does not ask users to keep a shared default
+password. Keep that key, credential files and backups private. Removing or changing
+them can make saved credentials unreadable. Encryption does not protect secrets
+from someone who can read both the saved ciphertext and its key. If Scarlet warns
+that encrypted storage is unavailable, do not assume the fallback is encrypted.
 
-## file `./scarlet.home.java`
-
-If present, specifies the root directory of the Java installation to use:
-```txt
-C:\path\to\jdk
-```
-
-## file `./java.options`
-
-If present, prepends listed JVM options to the invoked command:
-```txt
--Xms8G
--XX:+AggressiveOpts
--XX:+UnlockExperimentalVMOptions
--XX:+UnlockDiagnosticVMOptions
--XX:+AggressiveUnboxing
--XX:+AllowParallelDefineClass
--XX:+OptoBundling
--XX:+OptoScheduling
--XX:+UseFastAccessorMethods
--XX:+UseFastEmptyMethods
--XX:+ParallelRefProcEnabled
-```
-
-## registry
-
-Volatile data:
-```reg
-[HKEY_CURRENT_USER\Software\JavaSoft\Prefs\net\sybyline\scarlet\grp_00000000-0000-0000-0000-000000000000]
-; The version of Scarlet that had been run previously
-"last/Run/Version"="0.4.9-rc2"
-; The last time Scarlet queried the audit log
-"last/Audit/Query"="2069-02-31/T12:34:56.789/Z"
-; The last time Scarlet refreshed VRChat authentication
-"last/Auth/Refresh"="2069-02-31/T12:34:56.789/Z"
-; The last time Scarlet checked for updates
-"last/Update/Check"="2069-02-31/T12:34:56.789/Z"
-; The bounds of the UI window (x,y,width,height)
-"ui/Bounds"="979,603,846,400"
-```
-As the Windows implementation of the `java.util.prefs` package uses the Windows registry, which is case-insensitive, `/` characters are used to "escape" uppercase characters to avoid clashes.
-
-### Encrypted Store
-
-Particular sensitive values are no longer stored in plain text, but instead are encrypted and stored in prefs.
-You may specify the password used to encrypt/decrypt by either setting the environment variable `SCARLET_GLOBAL_PW` or the Java system property `scarlet.global.pw`.
-It is highly recommended that you use a custom password instead of the default.
+Advanced deployments may override the encryption password with `SCARLET_GLOBAL_PW`
+or `scarlet.global.pw`; the environment value takes precedence. Do not change an
+existing override casually or place its value in a shared launcher, screenshot,
+support post or command example. Preserve a verified private recovery backup and
+use the supported export/restore or credential-reset UI instead of editing the
+registry, cookie store or key file by hand.

@@ -1,6 +1,135 @@
 
 # Changelog
 
+## Release status — November 1, 2026
+
+- **Published stable:** [0.6.0](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0).
+- **Published preview:** [0.6.1-a11](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11).
+- **Development source:** `0.6.1-a12`, not a published release. Plain `0.6.1` remains a draft, not the current stable download.
+
+The dated summaries below describe published releases. Older entries are retained
+as development history, with historical release-note links repaired: labels such as “unpublished candidate” and older
+client-shutdown policies describe their original preparation stage, not today's
+publication status or the final behavior of later previews. Release dates below
+use UTC.
+
+## 0.6.1-a11 — published preview, October 29, 2026
+
+- Add a private, profile-scoped saved avatar-provider metadata cache: successful results last 24 hours, empty results five minutes, and a clear-cache control is available. Provider consent still applies; downloaded avatar images are not stored.
+- Expand vote-to-kick alerts with an available target thumbnail, short bio, pronouns and status snapshot. Missing optional profile information does not prevent the base alert.
+- Include the preceding safety fixes for confidential audit recovery, queued moderation, unban safeguards, scoped cleanup and verified credential-recovery snapshots.
+- The final source and packaged-build runs each recorded 2,158 successful tests and 14 filesystem-capability exclusions. An intermittent Windows IPC shutdown timeout and false startup log-stall warning remain unresolved; Linux/PPC runtime acceptance and end-to-end live vote-to-kick delivery are not established by those results.
+
+## 0.6.1-a9 — published preview, October 26, 2026
+
+- Collect import-progress reporting, updated optional avatar providers, newest-eligible startup instance joining, background player-list enrichment and optional join/leave thumbnails.
+- Improve Staff Mode alerts, speech/advisory handling and first-run prompts; add a saved Windows rendering-compatibility option.
+- Closed/empty client exit uses a matching closure audit and healthy local logs, with a 30-second grace and exact-process checks. A sole verified same-user client can qualify even when manually launched; multiple clients block selection. Separate default-off Windows force-close options and bounded Scarlet-owned startup recovery remain opt-in.
+- Published for preview testing, not as stable 0.6.1. The final Windows runs recorded 2,020 passes with six filesystem exclusions; Linux recorded 2,025 passes with one Windows-only exclusion. Optional force-close paths and Linux desktop/audio acceptance still require live checks.
+
+## 0.6.0 — published stable, October 18, 2026
+
+- Consolidate maintainer-branch work through the earlier A13 builds: background moderation summaries from saved local history, durable Discord audit delivery, shared API-read pacing, clearer instance-close outcomes, authority/privacy checks and safer saving/export/restore.
+- Carry forward the A13 verified-client launch/restart protections and checksum-pinned source-build tooling. These cumulative fixes were not all newly introduced by the stable version designation.
+- Ship one Windows/Linux desktop JAR, its matching frozen source ZIP and checksums. Runtime Java 11 or newer is required; Java 21 is recommended and not bundled.
+- The release recorded 1,416 passing tests in both the source and packaged runs, with six filesystem-capability exclusions. Stable designation does not resolve the known issues or replace outstanding supervised platform/live-service checks; consult the published release notes for that version's limitations.
+
+## Historical development entries (wording preserved; links repaired)
+
+## 0.6.1-a9 (unpublished pre-release candidate)
+
+This candidate consolidates the 0.6.1 alpha and local test-build work. See
+[0.6.1-a9 release notes](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a9) for current behavior and test limits.
+Historical T entries below remain a record of intermediate behavior, not the final policy.
+
+- Add console import progress and completion reporting; update optional avatar-provider support.
+- Join the newest eligible active group instance at startup, support age-gated join links, and keep optional avatar/profile work off the live roster path. Add toggleable small Discord join/leave thumbnails.
+- Restore Staff Mode watched-avatar/vote-to-kick eligibility without requiring a configured group; improve speech fallback, advisories and first-run prompts.
+- Add a persistent Windows rendering-compatibility setting.
+- Improve client tracking, shutdown diagnostics and bounded retries. Closed/empty exit now relies on a matching closure audit plus healthy local logs rather than API occupancy. A sole verified manually launched client is eligible when the exit toggle is enabled; multiple clients block it.
+- Add opt-in bounded startup recovery, explicit repeated-connection-failure detection and separate Windows force-close opt-ins for startup and closed/empty exit. Normal close and exact-process safety checks remain first.
+- Correct current shutdown documentation and synchronize runtime, build and launcher versions to lowercase `0.6.1-a9`. Add regression coverage for earlier alpha upgrades, numeric alpha ordering, stable-release precedence and Windows build acceptance. Do not change the published update feed or announcement.
+- Make the Linux rendering-metadata regression account for Java's own font-cache initialization before taking its unchanged-data baseline; retain the complete settings/credentials filesystem comparison.
+
+## 0.6.1-T10 (local test build)
+
+- Startup recovery also detects three live, separately spaced region-connection failures in the Disconnecting state, each paired with VRChat's explicit network-region game-flow reset. Ordinary log activity no longer hides this specific failed-startup loop. Requires three cycles within two minutes, at least 20 seconds apart, with the latest within 45 seconds. Historical catch-up, duplicated entries and unrelated errors do not count.
+- Keep the existing recovery opt-in, at least three minutes per startup, a ten-minute watch per attempt and at most two replacements. Require a new current-launch log, expected account authentication, healthy caught-up tracking and fresh loop evidence at close dispatch. Connection success clears failure evidence; world joins, account/context changes or a changed tracked log session prevent recovery.
+- Reuse the existing exact Scarlet-owned process, normal-close-first transport, separately enabled Windows force fallback, verified exit before replacement, active-target authorization and fresh secure join lookup. No blanket process killing or adoption of manually launched clients for startup recovery. Closed/empty-instance shutdown is unchanged.
+
+## 0.6.1-T9 (local test build)
+
+- The existing closed/empty-instance exit toggle now permits shutdown of the only verified running VRChat client, including a manually launched client or one whose Scarlet launch ownership was not established. The setting remains off by default; its saved key is unchanged. Startup recovery still requires Scarlet launch ownership and cannot use this shutdown-only receipt.
+- Retain the matching current-session closure audit, healthy caught-up live logs, known self with no other players, full 30-second grace, same Windows/Linux user, exact process identity and fresh single-client rechecks at dispatch. Multiple clients, inaccessible identity or ambiguous inventory prevent shutdown. No instance API occupancy request is restored.
+- Multiple running clients produce a rate-limited warning in the configured ops-alert channel when the monitored instance is closed and locally empty. No action button can bypass this ambiguity. Notifications contain no join links or player identities.
+- Windows shutdown inventory reads the full executable-name inventory but requests detailed identity only for VRChat candidates, avoiding unrelated process churn. Normal close remains first; forced termination still requires the separate existing opt-in and its bounded fresh checks.
+
+## 0.6.1-T8 (local test build)
+
+- Automatic VRChat client shutdown now uses Scarlet's healthy, caught-up output-log roster instead of making a fresh instance API request. Stale server player counts, missing instance responses and occupancy retry backoff no longer delay this shutdown path. This deliberately removes independent server occupancy confirmation; it is not a claim that local logs are infallible.
+- Keep the matching group-instance close audit, current log session, verified Scarlet-owned client, sole-self roster, full 30-second healthy grace, final tracking/identity checks and bounded normal-close retries. An empty but still-open instance is not enough. Closure audit delivery can still be delayed.
+- The separate opt-in Windows force-close fallback also uses fresh local tracking checks rather than the instance API, after at least 15 seconds for normal exit. Player arrivals, changed sessions, unhealthy logs or uncertain process identity still veto it. Old server-count override actions are inactive in this shutdown mode.
+- Startup target authorization and idle server-instance closing retain their existing API checks. No publishing or live game/process actions during verification.
+
+## 0.6.1-T7 (local test build)
+
+- Add opt-in "VRChat Client: Recover stalled auto-launch". Watch only verified Scarlet-owned automatic launches, wait at least three minutes after each launch and two minutes without new log lines, and allow at most two replacement launches. Stop watching on any new world-join entry, a changed account/context, or a ten-minute observation limit per attempt. Ordinary later freezes/disconnects are not recovery triggers.
+- Require a functioning, caught-up log reader (or a recently successful empty-directory scan); unreadable logs and parser failures are not evidence of a frozen client. Revalidate quiet-log evidence immediately before normal close. Never launch a second client while the original remains running.
+- Reuse exact managed process ownership and verified quiet shutdown before replacement. Recheck the active target and obtain fresh secure join information after shutdown. Changed ownership, uncertain close or launch, settings/account changes and exhausted retries stop recovery. Explicit Windows close rejections permit only the separately enabled, guarded force fallback. All work runs on the existing serialized background launch worker.
+- Add two separate, default-off Windows force-close opt-ins: stalled startup recovery, and closed/empty-instance shutdown. Allow 15 seconds for normal shutdown first. Forced termination uses an OS handle pinned to the verified Scarlet-owned process, never a name-based blanket kill; identity, settings and applicable startup/closed-empty evidence are checked again. Closed-empty fallback obtains a new server response and requires the same uninterrupted roster/session/grace observation; operator occupancy overrides cannot authorize force-close. One force opportunity only, with no replay after an uncertain result. Force-close may lose unsaved client state.
+- Keep T6 server occupancy, log-health and process-ownership requirements. No publication or live game actions during verification.
+
+## 0.6.1-T6 (local test build)
+
+- Distinguish native close stages: window enumeration, no visible window, multiple visible windows, changed window/process identity, final safety veto, Windows access denial, rejected close message, and uncertain dispatch. Final guard diagnostics identify mode, group, session, operator permission, stale server proof or log-health failures. Recheck server-proof age after slow native process checks. Failed Windows posts include a numeric error only.
+- Permit at most two additional automatic attempts after explicitly classified, definitely-unsent transient window/guard failures. Each retry starts a fresh full 30-second healthy grace period and requires a new server response and all process/session/roster checks. Audit replays and roster changes do not refill the retry budget. Sent, rejected, unknown or identity-changing outcomes remain terminal; no force-close fallback exists.
+- Operator confirmations remain one-shot and never turn an occupancy override into an unattended retry. Preserve the existing server occupancy and log-health acceptance rules, permissions, API backoff and launch ownership checks.
+
+## 0.6.1-T5 (local test build)
+
+- Move potentially slow native process verification before bounded log catch-up and outside the roster lock. Reject session changes across that work; retain fresh health, full grace, final process identity and server proof requirements.
+- Use a bounded, primary-account, no-cache instance read for client-exit proof, without the legacy world-instance fallback. Add rate-limited numeric count and cache-source diagnostics; existing logs cannot establish the cause of VRChat's inconsistent count.
+- After at least five minutes of locally observed sole-self occupancy, report a fresh occupancy-only server disagreement to the configured operations channel. Reports expire after ten minutes and are bounded to one per ten minutes for the same observation. Any intervening player/session change invalidates the control.
+- Add a separate `vrchat-client-exit-override` Other permission (owner/admin by default; explicitly grant to trusted staff). Two-step, actor-bound confirmation expires after sixty seconds. It may bypass only a fresh API occupancy disagreement to request normal exit of the same Scarlet-owned VRChat client. Closed-instance proof, healthy sole-self roster, full grace, operating mode and final ownership checks remain mandatory; no force-kill or instance mutation is performed. Results go to operations logging.
+
+## 0.6.1-T4 (local test build)
+
+- After a fresh server rejection involving only occupancy, retry after 15 seconds and then 30 seconds, before returning to 60-second intervals. Missing, invalid, stale or failed responses retain a 60-second backoff and consume the faster retry allowance for that session. Audit replays do not refill it; existing API-wide rate limiting remains in place.
+- Allow a recently healthy log reader up to 1.5 seconds to complete an append, with the same two-second freshness limit and fresh health checks. Timestamp healthy loop completion after filesystem target discovery instead of before it. Add fixed, rate-limited tracking failure reasons to distinguish unfinished reads, stale heartbeats and invalidated sessions.
+- Preserve the complete 30-second grace period, exact session/process ownership, server closure and sole-self checks, final revalidation and graceful-only exit. Genuine tracking failures still reset the countdown. Live-device timing needs retesting; no report or publication was requested.
+
+## 0.6.1-T3 (local test build)
+
+- Added exact, rate-limited automatic-exit server rejection diagnostics for response availability, ID/world/instance matching, closure timestamp and individual occupancy fields. Multiple failing fields are reported without exposing account IDs, instance links or raw response bodies.
+- Kept the server acceptance predicate, process/session checks, log health, 30-second grace, 60-second server retry backoff and graceful-only exit behavior unchanged. Diagnostics do not make additional API requests or authorize a close.
+
+## 0.6.1-T2 (local test build)
+
+- Before automatic client-exit checks, allow a recently healthy log reader up to 500 ms to finish an ordinary append instead of immediately resetting the 30-second countdown. Waiting happens outside the roster lock; fresh health, exact session/process ownership, roster, closure and server checks remain required. Stale, failed or incomplete tracking still blocks exit and resets the grace period.
+- Suppress group-audit permission, missing-group and Discord moderation opt-in startup prompts in Staff Mode. Group-bot permission checks remain enabled, and Staff Mode does not consume the Discord opt-in preference.
+
+## 0.6.1-T1 (local test build)
+
+- Added privacy-safe, rate-limited automatic VRChat exit diagnostics without changing the ownership, current-session, closed/empty, grace-period or graceful-exit safeguards.
+- Bounded speech synthesis waits and pending work, handled failed/null/cancelled voices with distinct bounded fallback attempts, and saved fallback selections only after successful synthesis. A still-busy native provider is not given more queued requests; restart Scarlet if the provider remains stuck.
+- Separated watched-avatar matching from optional avatar-detail hydration. Refreshed present-player advisories after catch-up/provider changes without replaying historical speech, and stopped rejoin checks from trusting an avatar retained from an earlier visit.
+- Preserved avatar-provider selections independently of consent, warned on empty selections, and corrected the consent setting documentation. Existing consent, Advisory/TTS switches, silent flags, departed-player guards and Staff Mode group isolation remain enforced.
+- Recognized uppercase T builds as previews, ordered them numerically after the prior A builds and before stable 0.6.1. No update feed or announcement was changed.
+
+## 0.5.0 (prepared locally; not yet published)
+
+See [0.5.0 release notes](https://github.com/hatson321/Scarlet/blob/0355d732200204485efe979ee36ae8245456b247/RELEASE_NOTES_0.5.0.md) for the cumulative desktop maintenance changes and remaining limitations. The build, runtime fallback, local update metadata, and launcher version marker now agree on `0.5.0`; historical release entries below keep their original numbers.
+
+### Fixed
+
+- Restored the configured-template autofill link on the moderation Report button alongside the copy-and-paste report and simple notes/tags link. Both template outputs now share the same content and footer setting, and an empty template falls back to the event details. Oversized reports and URLs are preserved in private text attachments. Removed the obsolete warning about filling the audit actor's requester ID, which the current form URL does not do. Help Desk sign-in, evidence requirements, and manual submission still apply.
+
+### Removed
+
+- Completely removed the Android/mobile companion feature from active Scarlet and future build/distribution paths. This includes the companion application, desktop mobile-delivery subsystem, phone pairing and device state, direct-LAN listener, FCM/OAuth delivery, mobile settings/UI/status hooks, Android/mobile packaging, and the previously removed maintainer-operated relay implementations. Historical release/acquisition artifacts and quarantined relay evidence remain inert and must not be distributed as future builds.
+
+> Mobile and Android entries under older release headings below are retained as historical records of what those releases contained; they do not describe the active product.
+
 ## 0.4.20
 
 Adds **VRChat trust ranks** to the player list with Nuisance/Visitor advisories and callouts, makes the **follow-into-new-instance** feature react in about a third of the time, and reworks the **advisory colors** so they read cleanly on a dark theme and over a Discord screenshare.
@@ -17,7 +146,7 @@ Adds **VRChat trust ranks** to the player list with Nuisance/Visitor advisories 
 - **Report button now gives a copy-paste report, not just a sign-in link.** VRChat moved general reporting in-app and restricted the Help Desk form to appeals and evidence-backed reports (and it requires signing in), so the old pre-filled Help Desk links mostly hit a login wall or get auto-closed. The `vrchat-report` button now outputs a **plain-text, copy-paste report block** (target, actor, reason, internal tags, group/audit IDs) for a signed-in moderator to paste straight into VRChat's in-app report. The Help Desk link is kept but labelled for its now-narrow use (appeals / evidence). No automated/bot-account reporting — a human still files it.
 - **Report a user's profile picture / user icon to VRChat.** Moderation embeds now carry pre-filled VRChat T&S report links for a user's **profile picture** and **user icon** — the two account-level content types that had a report-URL builder but were never surfaced anywhere. (Sticker, emoji, print and prop reports were already offered on their in-instance spawn embeds.) As with everything else, Scarlet only assembles the pre-filled report; a human files it with VRChat.
 - **Bundled alert SFX set.** The `BL_SFX_*` sound effects are rendered to WAV and bundled in the build so they play on every audio route — local player, Java Sound, and the Discord-voice output — with no MP3 decoder dependency. SIREN_CHIRP drives the nuisance alarm today; the rest are ready to wire to their events.
-- **First-launch "vibe-coded" disclosure.** On first run, Scarlet shows a one-time notice that this fork is maintained by **KozyBlake** and developed largely with AI assistance, with **Continue** or **Close Scarlet** — so anyone who'd rather not run an AI-assisted project can bow out up front. Shown once (persisted as `vibecoded_notice_acknowledged`); headless/scheduled runs log the notice once and continue instead of blocking on a dialog. A matching note sits at the top of the README. (KozyBlake maintains and is accountable for the project; the AI is a tool, not the maintainer.)
+- **Maintainer and release-process disclosure.** scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested. The notice is shown once; headless or scheduled runs log it once and continue without blocking on a dialog.
 
 ### Changed
 
@@ -44,7 +173,7 @@ Adds **VRChat trust ranks** to the player list with Nuisance/Visitor advisories 
 - **Bans no longer show up as standalone kicks.** When you ban a user who's in an instance, VRChat auto-issues an instance-kick alongside the ban; Scarlet bundles that kick under the ban instead of logging it separately. A long-standing inverted date comparison (going back to the legacy builds) made the “most recent prior action” resolve to a user's *oldest* action, so for anyone with any moderation history the co-occurring ban was missed and its auto-kick was posted as a normal kick. Fixed the comparison; the same field also drove the embed's “Most recent” line, which was showing the oldest action rather than the newest.
 - **Headless: the multiple-data-folder prompt can no longer hang a service.** When Scarlet finds more than one data folder and there's no interactive console, it no longer opens a blocking read on stdin — it logs the folders and deterministically loads the first, so a headless bot never stalls at startup.
 - **A down or gated avatar-search provider no longer floods the console.** A provider that fails — DNS-dead, HTTP 403/404, timed out, or connection refused — now logs **one** warning when it first goes down and **one** when Scarlet gives up on it, then stays quiet; the stack traces for these expected network failures are dropped from WARN/DEBUG (TRACE only). Every failure now backs off, and the backoff **escalates** with each repeat (up to ~2h), so a permanently-down provider is retried a couple of times an hour at most instead of on every single search, and it auto-recovers (with a one-line note) the moment it responds again. This now also covers HTTP **4xx/5xx** responses, which previously slipped past the backoff and retried every search — e.g. a provider that starts returning **403** (as avtrDB's search did, before it was removed) used to dump a stack trace on every single lookup.
-- **ARM/glibc Discord voice (DAVE): groundwork + two protocol-version bugs.** On ARM/Termux, Discord voice can join/leave-thrash when the native DAVE library falls back to the JNA path. Two `(short) transitionId` casts that should have used the negotiated MLS protocol version were corrected, and the DAVE handshake path (`DAudioDaveSession`) now logs each epoch/transition step so a real ARM voice session can pinpoint where the handshake fails. ARM natives stay under `-android.jar`, out of the main desktop jar, by design. (Groundwork — the underlying glibc-aarch64 fallback still needs a test log from an affected user to close out.)
+- **ARM/glibc Discord voice (DAVE): groundwork + two protocol-version bugs.** On ARM/Termux, Discord voice can join/leave-thrash when the native DAVE library falls back to the JNA path. Two `(short) transitionId` casts that should have used the negotiated MLS protocol version were corrected, and the DAVE handshake path (`DAudioDaveSession`) now logs each epoch/transition step so a real ARM voice session can pinpoint where the handshake fails. This entry originally referred to a separate Android artifact; that artifact has since been removed and is no longer distributed or supported. (Groundwork — the underlying glibc-aarch64 fallback still needs a test log from an affected user to close out.)
 
 ### Removed
 
@@ -84,7 +213,7 @@ The largest maintenance release in a while: keeps Scarlet working against VRChat
 - **Smaller:** avatar-search author provider (stray literal, URL-encoding, malformed-row skipping); `volatile` User-Agent statics; iOS-vs-PC avatar-rating copy-paste; tag-rename autocomplete refresh; report-tag separators; GitHub release parsing; `:`-less location parsing; UTF-8 JSON read; an option helper honoring `required`.
 - **Linux TTS:** dropped the unreliable **Mimic** and **Festival** engines — Festival was registering an error message as ~22 bogus "voices", and Mimic (a Mimic-3 binary) failed on the Mimic-1 flags Scarlet sends; both only ever fell back to a working voice anyway. The Linux voice list is now Flite / Pico / eSpeak(-NG) only, and each Flite-family engine is probed at startup so a broken binary never offers a voice that can't speak.
 
-- **ARM/glibc Discord voice (DAVE) groundwork.** On a glibc arm64 box (e.g. a Raspberry Pi running the desktop jar) there is no native `libdave-jvm`, so voice falls back to the JNA `DAudioDaveSession` path — which currently mis-handshakes and makes the bot thrash (join/leave) in voice. That fallback (only ever active on such platforms) is now heavily logged at each DAVE handshake step, with the MLS-init failure surfaced at error level, so the next ARM voice attempt pinpoints where E2EE dies. Also fixed the two casts the author had flagged `// smells sus` (a transition id was being passed where a protocol version is expected on the failure-recovery paths). Termux/Android arm64 users should keep using **`-android.jar`**, which bundles the proper `native/android/arm64-v8a/libdave-jvm.so`.
+- **ARM/glibc Discord voice (DAVE) groundwork.** On a glibc arm64 box (e.g. a Raspberry Pi running the desktop jar) there is no native `libdave-jvm`, so voice falls back to the JNA `DAudioDaveSession` path — which currently mis-handshakes and makes the bot thrash (join/leave) in voice. That fallback (only ever active on such platforms) is now heavily logged at each DAVE handshake step, with the MLS-init failure surfaced at error level, so the next ARM voice attempt pinpoints where E2EE dies. Also fixed the two casts the author had flagged `// smells sus` (a transition id was being passed where a protocol version is expected on the failure-recovery paths). This historical entry previously directed Termux/Android users to a separate build; that build has since been removed and is no longer distributed or supported.
 
 ### Notes
 
@@ -331,7 +460,7 @@ Highlights:
 - Mixed-character username TTS now uses a short alert phrase and best-effort readable pronunciation instead of announcing script names such as Cyrillic or Greek for each character.
 - Mixed-character username normalization now favors Latin lookalike output when a display name is mostly readable as an English-style name, while still preserving full non-Latin names instead of forcing them through the lookalike path.
 - The main desktop shade excludes Android and Termux DAVE native payloads; the Android classifier build still includes them automatically during normal Maven packaging.
-- Bumped Scarlet release / version metadata to `0.4.17-b2` and pointed update / download release checks at the KozyBlake fork.
+- Bumped Scarlet release / version metadata to `0.4.17-b2` and pointed update / download release checks at the then-current maintained fork.
 
 ### Fixed
 
@@ -345,20 +474,20 @@ Highlights:
 
 ## 0.4.17-b1_hotfix
 
-Hotfix update for the first KozyBlake fork release.
+Hotfix update for the first Linux-compatible fork release.
 
 Credit to ChanAurora for reporting both the help-desk report issue with custom-font usernames and the stale Scarlet version shown in generated reports.
 
 Hotfix highlights:
 
 - **Readable help-desk reports for stylized usernames.** Report URLs now use a normalized ASCII subject while preserving the exact VRChat display name in the report description so staff can identify the reported user.
-- **Correct report versioning.** Report footers, Discord embed footers, UI labels, startup output, and packaged JAR metadata now report `KozyBlake/Scarlet 0.4.17-b1_hotfix`.
+- **Correct report versioning.** Report footers, Discord embed footers, UI labels, startup output, and packaged JAR metadata now report the fork-specific `0.4.17-b1_hotfix` identity.
 - **Fork update metadata.** `meta.json` now advertises `0.4.17-b1_hotfix` for both release and build update checks.
 - **Lower-bandwidth update checks.** Scarlet reuses the same `meta.json` fetch for update and announcement checks and asks GitHub for `304 Not Modified` when nothing changed.
 - **Security hardening for announcements.** Announcement link buttons are restricted to normal web links so `file://` paths and custom app protocols cannot be broadcast as clickable actions.
 - **Security hardening for VRChat launch links.** Windows client launch now uses argument-list process creation and URL-encodes the VRChat location, preventing crafted locations from injecting extra launch arguments.
 - **Announcement metadata guard.** GitHub now raises an immediate warning issue if `meta.json` announcement metadata is pushed by a GitHub actor outside the trusted announcer allowlist.
-- **Fork branding polish.** Remaining plain `Scarlet` version labels, startup text, and log prefixes now use `KozyBlake/Scarlet` where user-facing fork identity matters.
+- **Fork branding polish.** Remaining plain `Scarlet` version labels, startup text, and log prefixes were updated to the then-current fork identity where user-facing ownership mattered.
 
 Original 0.4.17-b1 highlights still included:
 
@@ -402,16 +531,16 @@ Original 0.4.17-b1 highlights still included:
 
 #### Misc
 
-- Startup data-folder warning explaining that the `KozyBlake/Scarlet` data folder is separate, the legacy folder is left in place, and switching back to the original repo may require setup again.
+- Startup data-folder warning explaining that the fork-specific data folder is separate, the legacy folder is left in place, and switching back to the original repo may require setup again.
 - Hidden `popup-test` CLI dispatcher for dry-run popup testing without performing the confirmed action.
 
 ### Changed
 
-- Bumped Scarlet release / version metadata to `0.4.17-b1_hotfix` and pointed update / download release checks at the KozyBlake fork.
+- Bumped Scarlet release / version metadata to `0.4.17-b1_hotfix` and pointed update / download release checks at the then-current maintained fork.
 - Periodic update poll runs **hourly** instead of every 3 hours.
 - Update prompt rewording: "Hey, your release is *X*, there is a new release of *Y*. Open the download page?" (in both the auto-prompt and the new manual dialog).
-- Default Scarlet data directories and user-agent branding moved from the legacy upstream owner name to `KozyBlake`, with a one-time opt-in prompt before copying data from the old default folder.
-- Log categories and direct console log prefixes rebranded to `KozyBlake/Scarlet`.
+- Default Scarlet data directories and user-agent branding moved from the legacy upstream owner name to the then-current fork identity, with a one-time opt-in prompt before copying data from the old default folder.
+- Log categories and direct console log prefixes were rebranded to the then-current fork identity.
 
 ### Fixed
 
@@ -421,7 +550,7 @@ Original 0.4.17-b1 highlights still included:
 - The custom-font username fix covers Latin-Extended stroke/bar glyphs like the `༒808 ȼɍᵾsȺđɇɍ༒` case (`tf_subject=808+crUsAder`), fullwidth and mathematical styled Latin, combining marks, CJK, Cyrillic, Greek, Hebrew, Arabic, Devanagari, and decorative Unicode flair.
 - Version reporting now reads the packaged implementation version at runtime instead of relying on a compile-time-inlined constant, preventing report footers from showing an older build after partial recompiles.
 - All primary packaged JAR variants now receive manifest implementation metadata so report/version text can resolve the correct build from the artifact itself.
-- Report footer branding now uses `KozyBlake/Scarlet` instead of plain `Scarlet`.
+- Report footer branding now uses the maintained fork identity instead of plain `Scarlet`.
 - Background update / announcement polling now uses HTTP validators (`ETag` / `Last-Modified`), a short in-memory cache, and a shared 5-minute metadata cache key so unchanged `meta.json` checks do not repeatedly download the full file or get pinned to a stale GitHub CDN object for too long.
 - Announcement checks now run every 10 minutes instead of hourly, while normal update checks remain hourly.
 - Announcement link buttons now only open `http://` and `https://` URLs; local files and app/protocol links are ignored defensively.
