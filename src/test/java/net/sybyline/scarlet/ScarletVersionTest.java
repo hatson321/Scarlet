@@ -42,12 +42,24 @@ class ScarletVersionTest
         assertEquals(buildVersion(), Scarlet.VERSION);
     }
 
-    @Test void localUpdateAndLauncherMetadataMatchBuildVersion() throws Exception
+    @Test void launcherMatchesBuildAndPublishedFeedDoesNotAdvertiseALocalPreview() throws Exception
     {
         String version = buildVersion();
         JsonObject metadata = JsonParser.parseString(read("meta.json")).getAsJsonObject();
-        assertEquals(version, metadata.get("latest_release").getAsString());
-        assertEquals(version, metadata.get("latest_build").getAsString());
+        String release = metadata.get("latest_release").getAsString();
+        String publishedBuild = metadata.get("latest_build").getAsString();
+        assertTrue(MiscUtils.isValidVersion(release));
+        assertTrue(MiscUtils.isValidVersion(publishedBuild));
+        assertFalse(MiscUtils.isPreviewVersion(release));
+        assertTrue(MiscUtils.compareScarletVersion(publishedBuild, release) >= 0);
+        if (MiscUtils.isPreviewVersion(version))
+            assertTrue(MiscUtils.compareScarletVersion(version, publishedBuild) >= 0,
+                "Local previews may be newer than the published update feed");
+        else
+        {
+            assertEquals(version, release);
+            assertEquals(version, publishedBuild);
+        }
         assertEquals(version, read("scarlet.version").trim());
     }
 
@@ -83,7 +95,13 @@ class ScarletVersionTest
         assertFalse(MiscUtils.isPreviewVersion("0.6.0"));
         assertTrue(MiscUtils.compareScarletVersion("0.6.0", "0.5.0-a13") > 0);
         assertTrue(MiscUtils.compareScarletVersion("0.5.0-a13", "0.6.0") < 0);
-        assertEquals("0.6.0", Scarlet.VERSION);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a1"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a1"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a1", "0.6.0") > 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a2"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a2"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a2", "0.6.1-a1") > 0);
+        assertEquals("0.6.1-a2", Scarlet.VERSION);
     }
 
     @Test void iterationNumbersOrderNumericallyAcrossDigitBoundaries()
@@ -125,7 +143,7 @@ class ScarletVersionTest
             }
     }
 
-    @Test void releaseAnnouncementMatchesTheBuildAndReplacesTheObsoleteNotice() throws Exception
+    @Test void releaseAnnouncementMatchesThePublishedReleaseAndReplacesTheObsoleteNotice() throws Exception
     {
         ScarletMeta metadata = Scarlet.GSON_PRETTY.fromJson(read("meta.json"), ScarletMeta.class);
         ScarletAnnouncement announcement = metadata.announcement;
@@ -136,7 +154,7 @@ class ScarletVersionTest
         // The feed also supports non-release advisories; do not force those to name a version.
         if (announcement.id.startsWith("release-"))
         {
-            String version = buildVersion();
+            String version = metadata.latest_release;
             assertTrue(announcement.id.startsWith("release-" + version + "-"));
             assertTrue(announcement.title.startsWith("Scarlet " + version + " "));
             assertTrue(announcement.message.startsWith("Scarlet " + version + " "));

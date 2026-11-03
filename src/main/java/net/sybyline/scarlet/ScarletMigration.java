@@ -143,6 +143,45 @@ public final class ScarletMigration
         boolean progress(String phase, String detail, int filesDone, int totalFiles, long bytesDone, long totalBytes);
     }
 
+    /** Observes import work without cancelling it. Negative counters mean no measured total. */
+    public interface ImportProgress
+    {
+        void update(String phase, long completed, long total);
+    }
+
+    /** Output failure must never interrupt a commit, rollback, or cleanup. */
+    static ImportProgress safeImportProgress(ImportProgress progress)
+    {
+        return new ImportProgress()
+        {
+            private boolean unavailable;
+            @Override public void update(String phase, long completed, long total)
+            {
+                if (progress == null || this.unavailable) return;
+                try { progress.update(phase, completed, total); }
+                catch (RuntimeException failure)
+                {
+                    this.unavailable = true;
+                    LOG.warn("Import progress output is unavailable; import safety checks continue.");
+                }
+            }
+        };
+    }
+
+    private static Progress importExportProgress(ImportProgress progress, String prefix)
+    {
+        return (phase, detail, filesDone, totalFiles, bytesDone, totalBytes) ->
+        {
+            // Never forward archive names, credential material, or export cancellation.
+            if (totalBytes > 0)
+                progress.update(prefix + ": " + phase + " (bytes)", bytesDone, totalBytes);
+            else if (totalFiles > 0)
+                progress.update(prefix + ": " + phase + " (files)", filesDone, totalFiles);
+            else progress.update(prefix + ": " + phase, -1, -1);
+            return true;
+        };
+    }
+
     /** Mutable per-export progress accounting shared down the zip recursion. */
     static final class ProgressState
     {
@@ -639,15 +678,22 @@ public final class ScarletMigration
 
     public static ImportResult importBundle(File in, ImportOptions options, char[] pin) throws IOException
     {
+        return importBundle(in, options, pin, null);
+    }
+
+    public static ImportResult importBundle(File in, ImportOptions options, char[] pin, ImportProgress observer) throws IOException
+    {
+        ImportProgress progress = safeImportProgress(observer);
+        progress.update("Acquiring exclusive import access", -1, -1);
         try (net.sybyline.scarlet.util.ProcLock.Lease ignored = net.sybyline.scarlet.util.ProcLock.acquireDataDirectory(Scarlet.dir);
              net.sybyline.scarlet.util.ProcLock.Lease preferences = net.sybyline.scarlet.util.ProcLock.acquirePreferences(
                  net.sybyline.scarlet.util.ProcLock.preferencesLockDirectory(), false))
         {
-            return importBundleOffline(in, options, pin);
+            return importBundleOffline(in, options, pin, progress);
         }
     }
 
-    private static ImportResult importBundleOffline(File in, ImportOptions options, char[] pin) throws IOException
+    private static ImportResult importBundleOffline(File in, ImportOptions options, char[] pin, ImportProgress progress) throws IOException
     {
         ImportOptions importOptions = options == null ? ImportOptions.all() : options;
         if (!importOptions.importDataFiles && !importOptions.importCredentials)
@@ -657,12 +703,16 @@ public final class ScarletMigration
 
         // A PIN-protected bundle is decrypted (and authenticated) to a temp file first, so a
         // wrong PIN or tampered bundle fails before we create a backup or touch local data.
-        try (PreparedBundle prepared = prepareBundle(in, pin, null))
+        progress.update("Checking bundle and authenticating encryption if present", -1, -1);
+        try (PreparedBundle prepared = prepareBundle(in, pin, importExportProgress(progress, "Preparing import bundle")))
         {
-            File backup = createPreImportBackup();
+            progress.update("Creating pre-import safety backup", -1, -1);
+            File backup = createPreImportBackup(progress);
+            progress.update("Safety backup complete; import is still in progress", -1, -1);
             try
             {
-                String summary = importBundleContents(prepared.file, importOptions);
+                String summary = importBundleContents(prepared.file, importOptions, progress);
+                progress.update("Finishing import and releasing resources", -1, -1);
                 return new ImportResult(summary, backup);
             }
             catch (IOException ex)
@@ -868,7 +918,7 @@ public final class ScarletMigration
         });
     }
 
-    private static String importBundleContents(File in, ImportOptions options) throws IOException
+    private static String importBundleContents(File in, ImportOptions options, ImportProgress progress) throws IOException
     {
         File dataDir = Scarlet.dir;
         if (dataDir == null)
@@ -885,7 +935,7 @@ public final class ScarletMigration
             {
                 replaceScarletPreferences(xml);
             }
-        });
+        }, progress);
     }
 
     /** A seam for hermetic failure tests; production uses only Scarlet's Preferences subtree. */
@@ -898,10 +948,23 @@ public final class ScarletMigration
     static String importBundleContents(File in, ImportOptions options, File dataDir,
                                       PreferenceTransaction preferences) throws IOException
     {
+        return importBundleContents(in, options, dataDir, preferences, null);
+    }
+
+    static String importBundleContents(File in, ImportOptions options, File dataDir,
+                                      PreferenceTransaction preferences, ImportProgress observer) throws IOException
+    {
+        ImportProgress progress = safeImportProgress(observer);
+        progress.update("Validating and staging archive entries", -1, -1);
         if (in == null || !in.isFile()) throw new FileNotFoundException("Bundle not found: " + in);
         // ZipInputStream alone accepts archives with a missing/truncated central directory.
+        final int archiveEntries;
         try (java.util.zip.ZipFile archive = new java.util.zip.ZipFile(in))
-        { if (archive.size() == 0 || archive.size() > MAX_ENTRIES) throw new IOException("Invalid bundle entry count"); }
+        {
+            archiveEntries = archive.size();
+            if (archiveEntries == 0 || archiveEntries > MAX_ENTRIES) throw new IOException("Invalid bundle entry count");
+        }
+        progress.update("Validating and staging archive entries", 0, archiveEntries);
         File root = dataDir.getCanonicalFile();
         Files.createDirectories(root.toPath());
         ScarletPrivateFiles.Workspace privateWorkspace = ScarletPrivateFiles.workspace(".scarlet-import-");
@@ -951,8 +1014,10 @@ public final class ScarletMigration
                         copyCapped(zip, OutputStream.nullOutputStream(), MAX_ENTRY_BYTES, total, MAX_TOTAL_BYTES);
                     }
                     zip.closeEntry(); // Checks ZIP CRC before any live mutation.
+                    progress.update("Validating and staging archive entries", count, archiveEntries);
                 }
             }
+            progress.update("Preparing selected configuration", -1, -1);
             if (options.importCredentials && (incomingPrefs == null || !staged.containsKey(GLOBAL_PREFS_KEY)
                     || Files.size(staged.get(GLOBAL_PREFS_KEY)) == 0))
                 throw new IOException("Credential imports require validated preferences.xml and nonempty data/global-prefs.key");
@@ -996,6 +1061,7 @@ public final class ScarletMigration
                 ScarletPrivateFiles.protect(config);
             }
             // Capture every replacement before applying the first file.
+            progress.update("Preparing rollback state (files)", 0, staged.size());
             for (String relative : staged.keySet())
             {
                 Path destination = checkedDestination(root, relative);
@@ -1012,23 +1078,28 @@ public final class ScarletMigration
                     if (!sameBytes(original, destination)) throw new IOException("Failed to verify staged original data");
                 }
                 originals.put(relative, original);
+                progress.update("Preparing rollback state (files)", originals.size(), staged.size());
             }
             if (options.importCredentials)
             {
+                progress.update("Saving current credentials for rollback", -1, -1);
                 originalPrefs = preferences.backup();
                 byte[] recoveryPrefs = originalPrefs;
                 FileBackups.writeBytes(workspace.resolve("original-preferences.xml").toFile(), 0, output -> output.write(recoveryPrefs));
                 ScarletPrivateFiles.protect(workspace.resolve("original-preferences.xml"));
             }
+            progress.update("Applying and verifying imported files", 0, staged.size());
             for (Map.Entry<String, Path> replacement : staged.entrySet())
             {
                 Path destination = checkedDestination(root, replacement.getKey());
                 applied.add(replacement.getKey());
                 publishPrivateReplacement(replacement.getValue(), destination);
                 if (!sameBytes(replacement.getValue(), destination)) throw new IOException("Imported file failed read-back verification");
+                progress.update("Applying and verifying imported files", applied.size(), staged.size());
             }
             if (options.importCredentials)
             {
+                progress.update("Applying credentials", -1, -1);
                 prefsAttempted = true;
                 preferences.replace(incomingPrefs);
             }
@@ -1038,6 +1109,8 @@ public final class ScarletMigration
         catch (Exception failure)
         {
             IOException result = new IOException("Import failed; restoring the original configuration", failure);
+            progress.update("Import failed; restoring original files", 0, applied.size());
+            int restored = 0;
             java.util.Collections.reverse(applied);
             for (String relative : applied)
             {
@@ -1050,20 +1123,27 @@ public final class ScarletMigration
                         publishPrivateReplacement(original, destination);
                         if (!sameBytes(original, destination)) throw new IOException("Restored file failed verification");
                     }
+                    progress.update("Import failed; restoring original files", ++restored, applied.size());
                 }
                 catch (Exception rollback) { result.addSuppressed(rollback); preserveRecovery = true; }
             }
             if (prefsAttempted)
             {
+                progress.update("Restoring original credentials", -1, -1);
                 try { preferences.replace(originalPrefs); }
                 catch (Exception rollback) { result.addSuppressed(rollback); preserveRecovery = true; }
             }
             if (preserveRecovery)
+            {
+                progress.update("Rollback incomplete; recovery files retained", -1, -1);
                 throw new IOException("Import failed and rollback could not complete. Recovery files retained at " + workspace, result);
+            }
+            progress.update("Rollback complete; import failed", -1, -1);
             throw result;
         }
         finally
         {
+            progress.update(preserveRecovery ? "Keeping recovery files for manual repair" : "Cleaning temporary import files", -1, -1);
             if (preserveRecovery) privateWorkspace.retain();
             try { privateWorkspace.close(); }
             catch (IOException cleanup) { LOG.warn("Could not remove private temporary import staging files", cleanup); }
@@ -1243,11 +1323,12 @@ public final class ScarletMigration
         return summary.toString();
     }
 
-    private static File createPreImportBackup() throws IOException
+    private static File createPreImportBackup(ImportProgress progress) throws IOException
     {
         File backup = nextPreImportBackupFile();
         // Import already owns both exclusive leases. Never enter the public export wrapper here.
-        String summary = createPreImportBackup(Scarlet.dir, backup, ScarletMigration::snapshotPreferences);
+        String summary = exportBundleAtomic(backup, null, importExportProgress(progress, "Creating safety backup"),
+            Scarlet.dir, ScarletMigration::snapshotPreferences, true, true).summary;
         pruneOldBackups(backup.getParentFile());
         LOG.info("Created pre-import migration backup at {} ({})", backup, summary);
         return backup;
@@ -1618,7 +1699,8 @@ public final class ScarletMigration
             try (OutputStream os = new BufferedOutputStream(new FileOutputStream(outPlain)))
             {
                 byte[] buffer = new byte[8192];
-                long done = 0L;
+                // The total is the entire bundle, including the header already read above.
+                long done = magic.length + 1L + salt.length + iv.length;
                 int n;
                 while ((n = is.read(buffer)) > 0)
                 {

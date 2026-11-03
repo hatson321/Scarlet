@@ -61,7 +61,7 @@ public interface AvatarSearch
         // provider again. Deliberately NOT used for author lookup / "search by picture", which were
         // rebuilt without it (see AUTHOR_LOOKUP_URL_ROOTS and BY_IMAGE_URL_ROOTS).
         URL_ROOT_AVTRDB = "https://api.avtrdb.com/v2/avatar/search/vrcx",
-        URL_ROOT_NEKOSUNEVR = AvatarSearch_VRCDS.SEARCH_ROOT+"/vrcx_search",
+        URL_ROOT_NEKOSUNEVR = AvatarSearch_NSVR.API_ROOT_SEARCH+"/vrcx_search",
         URL_ROOT_VRCDB = "https://vrcx.vrcdb.com/avatars/Avatar/VRCX",
         URL_ROOT_WORLDBALANCER = "https://avatarwbvrcxsearch.worldbalancer.com/vrcx_search",
         URL_ROOT_PAW = "https://paw-api.amelia.fun/vrcx_search",
