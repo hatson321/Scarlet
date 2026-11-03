@@ -15,18 +15,17 @@ A self-hosted VRChat group management and moderation-log utility with Discord in
 
 ## Which version should I use?
 
-Release status checked **November 1, 2026**:
+Release status checked **November 3, 2026**:
 
 | Version | Status | Where to get it |
 | --- | --- | --- |
-| **0.6.0** | Published stable release | [Stable release and downloads](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0) |
-| **0.6.1-a11** | Published preview / prerelease | [Preview release and downloads](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11) |
-| **0.6.1** | Unpublished stable candidate under review | Not a public stable update |
-| **0.6.1-a12** | Local release preparation | Not the current public preview download |
+| **0.6.1** | Latest stable release | [Stable release and downloads](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1) |
+| **0.6.0** | Previous stable release | [Previous stable downloads](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0) |
+| **0.6.1-a11** | Earlier preview / prerelease | [Earlier preview downloads](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11) |
 
-The feature details and command reference below describe the **published 0.6.1-a11 preview**, unless stated otherwise. Do not assume that every preview change is in 0.6.0. Consult the notes attached to your exact release; a local build or unpublished draft is not evidence of publication.
+The feature details and command reference below describe the **0.6.1 series**, including features introduced in the a11 preview and carried into 0.6.1 stable. Do not assume that these changes are in 0.6.0. The early stable release corrects the maintainer status and requested credit references; it does not resolve every known issue. Consult the [0.6.1 release notes](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1) for limitations and test coverage.
 
-**Need matching source?** The repository's `main` application source is based on the published **0.6.0 stable release**, with refreshed documentation and the approved Help → Credits cleanup. It is not the a11 preview source, and these overlays mean GitHub's **Code → Download ZIP** is not byte-for-byte identical to the original release archive. For exact release-source reproduction, download the `scarlet-<version>-source.zip` attached to your release. The a11 feature reference below does not add those features to stable `main`.
+**Need matching source?** The repository's `main` application source is based on **0.6.0**, with refreshed documentation and the approved Help → Credits cleanup. It is not the 0.6.1 stable or a11 preview source, and these overlays mean GitHub's **Code → Download ZIP** is not byte-for-byte identical to the original release archive. For exact release-source reproduction, download the `scarlet-<version>-source.zip` attached to your release. Publishing 0.6.1 does not change the runtime source on `main`.
 
 ## What Scarlet does
 
@@ -37,11 +36,13 @@ The feature details and command reference below describe the **published 0.6.1-a
 - Saves local moderation history, settings, watched lists, and migration bundles. Independent backups are still important.
 - Runs from the same release JAR on Windows and Linux. VRChat-log features need access to the local client's output logs; Linux/Proton/Wine compatibility depends on the installation and feature.
 
-### Preview additions and limitations
+### Features carried into 0.6.1 and limitations
 
 **Avatar-provider cache (a11).** With provider permission granted, successful public avatar metadata is reused for up to 24 hours and empty results for five minutes, including across restarts. The bounded cache stores metadata, not downloaded avatar images. Use **Avatar search providers → Manage → Clear saved avatar results** when needed. Cache use does not bypass provider consent or make private, ambiguous, or unindexed avatars resolvable.
 
 **Vote-to-kick context (a11).** Discord vote-to-kick alerts can include the target's small profile thumbnail, short bio, pronouns, and status when available. Cached context can accompany the initial alert; missing optional details may be filled in afterward. The base alert does not depend on successful profile enrichment. This is an observed vote-to-kick initiation, not proof that a kick completed or that the target did anything wrong.
+
+Windows and Linux testers have reported successful vote-to-kick context delivery. **Known limitation:** the status field can incorrectly show Offline; do not rely on it to determine presence. Removing that field is planned for a later build and is not part of 0.6.1.
 
 **Saved-history summaries.** `moderation-summary` and its scheduled counterpart scan Scarlet's saved structured audit records for the current group in a background worker. They exclude confidential, redacted, and training records; unreadable records produce a partial-result notice. Missing or never-collected history cannot be counted. The separate `actor-moderation-summary` and `outstanding-moderation` commands still query VRChat.
 
@@ -66,10 +67,10 @@ The feature details and command reference below describe the **published 0.6.1-a
 3. From a terminal in that folder, launch the selected version:
 
 ```sh
-java -jar scarlet-0.6.0.jar
+java -jar scarlet-0.6.1.jar
 ```
 
-For the public preview, use its actual filename instead:
+For the earlier a11 preview, use its actual filename instead:
 
 ```sh
 java -jar scarlet-0.6.1-a11.jar
@@ -86,13 +87,13 @@ Use **Data Folder** in Scarlet, or the `explore` CLI command, to open the active
 To select a separate data directory, set the `SCARLET_HOME` environment variable or pass the **case-sensitive JVM property before `-jar`**:
 
 ```sh
-java -DSCARLET_HOME="/path/to/scarlet-data" -jar scarlet-0.6.1-a11.jar
+java -DSCARLET_HOME="/path/to/scarlet-data" -jar scarlet-0.6.1.jar
 ```
 
 Windows example:
 
 ```text
-java "-DSCARLET_HOME=C:\Scarlet-Data" -jar scarlet-0.6.1-a11.jar
+java "-DSCARLET_HOME=C:\Scarlet-Data" -jar scarlet-0.6.1.jar
 ```
 
 Before upgrading, keep an independent backup and close the old Scarlet process. Do not run two versions against the same data folder. Renaming a JAR does not create a clean profile, and an upgrade does not intentionally reset all existing settings. Older builds may not compare newer version suffixes correctly; use the verified release download manually if needed.
@@ -302,8 +303,8 @@ Exports require a new destination outside the data folder and a PIN. The verifie
 Example offline entry points, preserving the same data location:
 
 ```text
-java "-DSCARLET_HOME=C:\Scarlet-Data" -jar scarlet-0.6.1-a11.jar --restore
-java "-DSCARLET_HOME=C:\Scarlet-Data" -jar scarlet-0.6.1-a11.jar --export
+java "-DSCARLET_HOME=C:\Scarlet-Data" -jar scarlet-0.6.1.jar --restore
+java "-DSCARLET_HOME=C:\Scarlet-Data" -jar scarlet-0.6.1.jar --export
 ```
 
 The console `--import-bundle "<bundle.zip>"` workflow also exists. Its `--data-only` choice excludes incoming credential stores; it is not a substitute for reviewing the import's destination and options. Private plaintext staging requires enforceable filesystem permissions and can refuse an unsuitable filesystem.
