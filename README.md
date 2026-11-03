@@ -6,12 +6,6 @@ A self-hostable VRChat Group management utility with Discord integration.
 
 > scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested.
 
-### Project history and acknowledgments
-
-The original fork's attribution is preserved below as historical context. Current maintenance is described above.
-
-> **About this fork.** Scarlet (this fork) is maintained by **KozyBlake** and developed largely with AI assistance — a "vibe-coded" project. Features and fixes come from KozyBlake and community ideas, implemented and reasoned through with an AI pair, then reviewed and built by KozyBlake. On first launch Scarlet shows this notice and lets you close it if running AI-assisted software isn't for you. (KozyBlake maintains and is accountable for the project; the AI is a tool, not the maintainer.)
-
 - [Maintained repository](https://github.com/Hatson321/Scarlet)
 - [Changelog](CHANGELOG.md)
 - [0.6.0 release notes](RELEASE_NOTES_0.6.0.md) — prepared locally; publication is a separate step.
@@ -842,11 +836,7 @@ usable; it is not an automatic fallback for TTS. Ordinary mutable distributions
 keep their existing native package-manager selection, and Windows keeps SAPI.
 Restart Scarlet after installing extra engines if their voices do not yet appear.
 
-An installation video for the earlier desktop workflow is available below. Verify its steps against the current written instructions:
-
-Thanks to [@KozyBlake](https://github.com/KozyBlake) for making this video tutorial:
-
-[![installation-tutorial-video](https://img.youtube.com/vi/JMJgMSThBac/0.jpg)](https://www.youtube.com/watch?v=JMJgMSThBac)
+> **Installation tutorial:** The previous tutorial is private and outdated. A new tutorial is needed; please use the written instructions below in the meantime.
 
 ---
 

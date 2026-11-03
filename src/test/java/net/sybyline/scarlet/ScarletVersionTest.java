@@ -128,7 +128,15 @@ class ScarletVersionTest
         assertTrue(MiscUtils.compareScarletVersion("0.6.1-a11", "0.6.1-a10") > 0);
         assertTrue(MiscUtils.compareScarletVersion("0.6.1-a10", "0.6.1-a11") < 0);
         assertTrue(MiscUtils.compareScarletVersion("0.6.1-a11", "0.6.1") < 0);
-        assertEquals("0.6.1-a11", Scarlet.VERSION);
+        assertTrue(MiscUtils.isValidVersion("0.6.1-a12"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.1-a12"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a12", "0.6.1-a11") > 0);
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a11", "0.6.1-a12") < 0);
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1-a12", "0.6.1") < 0);
+        assertTrue(MiscUtils.isValidVersion("0.6.1"));
+        assertFalse(MiscUtils.isPreviewVersion("0.6.1"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.1", "0.6.1-a12") > 0);
+        assertEquals("0.6.1", Scarlet.VERSION);
     }
 
     @Test void publicAlphaCandidateOrdersAfterDeliveredAlphasAndBeforeStable() throws Exception
