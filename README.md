@@ -9,7 +9,7 @@
 
 A self-hosted VRChat group management and moderation-log utility with Discord integration, a desktop player list, watched-entity advisories, and text-to-speech.
 
-> scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested.
+> Scarlet is actively maintained by **Hatson321**. AI may assist with API updates and implementation; changes are reviewed by Hatson321 and the Scarlet administration team, tested before release, and documented in a detailed release update.
 
 [Downloads](https://github.com/Hatson321/Scarlet/releases) · [Discord community][discord-invite] · [VRChat Group](https://vrchat.com/home/group/grp_f12667c7-df5f-454f-9a34-5ed8c33112a1) · [FAQ](FAQ.md) · [Settings](SETTINGS.md) · [Changelog](CHANGELOG.md) · [Security and network behavior](SECURITY.md) · [Building from source](BUILDING.md)
 
@@ -78,7 +78,7 @@ java -jar scarlet-0.6.1-a11.jar
 
 A portable Java installation also works: invoke that installation's `bin/java` or `bin/java.exe` directly. If you just installed Java, reopen the terminal and check `java -version`; an existing terminal or Windows file association may still select a different runtime.
 
-> **Installation tutorial:** The previous tutorial is private and outdated. A new tutorial is needed; use these written instructions in the meantime.
+> **Installation tutorial:** The previous video tutorial is private and outdated. A replacement video is needed; please use the written instructions below in the meantime.
 
 ### Data location and upgrades
 
