@@ -464,6 +464,100 @@ class ScarletVRChatLogTrackingTest
         }
     }
 
+    @Test void emptyManualStartupLogIsHealthyForAlertsButCannotAuthorizeExit() throws Exception
+    {
+        try (Fixture fixture = new Fixture("output_log_2026-11-04_12-00-00.txt"))
+        {
+            fixture.logs.alive = true;
+            ScarletTailerHealth health = new ScarletTailerHealth();
+            long started = fixture.tail.startupFileTime.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+            ScarletTailerHealth.Clients clients = new ScarletTailerHealth.Clients(
+                java.util.Map.of("synthetic-client", java.time.Instant.ofEpochMilli(started)));
+            for (int minute = 0; minute < 15; minute++)
+            {
+                fixture.logs.now += TimeUnit.MINUTES.toNanos(1);
+                fixture.tail.on_loop();
+                assertEquals(ScarletTailerHealth.Change.NONE, health.observe(fixture.logs.now, clients, fixture.logs.tailerHealth()));
+                assertNull(health.reason());
+                assertEquals(0L, fixture.logs.lastEntryMillis());
+                assertFalse(fixture.logs.clientExitTrackingHealthy());
+            }
+            fixture.accept(false, "[Behaviour] User Authenticated: " + AUTH);
+            fixture.tail.on_loop();
+            assertTrue(fixture.logs.clientExitTrackingHealthy());
+            assertEquals(ScarletTailerHealth.Change.NONE, health.observe(fixture.logs.now, clients, fixture.logs.tailerHealth()));
+        }
+    }
+
+    @Test void unreadPreambleCannotRefreshWatchdogHeartbeat() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.logs.alive = true;
+            Files.writeString(fixture.file.toPath(), PREFIX + "old preamble\n");
+            fixture.tail.on_loop();
+            assertEquals(0L, fixture.logs.tailerHealth().completedLoopNanos);
+            fixture.tail.on_line(true, PREFIX + "old preamble");
+            fixture.tail.on_loop();
+            assertEquals(0L, fixture.logs.tailerHealth().completedLoopNanos);
+        }
+    }
+
+    @Test void partialAppendCannotFabricateNewHealthyLoopForAlerts() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            long completed = fixture.logs.tailerHealth().completedLoopNanos;
+            fixture.logs.now += TimeUnit.SECONDS.toNanos(1);
+            fixture.tail.on_line(false, PREFIX + "partial event");
+            fixture.tail.on_loop();
+            assertEquals(completed, fixture.logs.tailerHealth().completedLoopNanos);
+            assertFalse(fixture.logs.clientExitTrackingHealthy());
+            fixture.tail.on_eof(); fixture.tail.on_loop();
+            assertTrue(fixture.logs.tailerHealth().completedLoopNanos > completed);
+        }
+    }
+
+    @Test void parserFailureCannotBeRecoveredByAnUnrelatedEntry() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            fixture.failListener = true;
+            fixture.accept(false, "[Behaviour] User Authenticated: " + AUTH);
+            fixture.accept(false, "unrelated diagnostic"); fixture.tail.on_loop();
+            assertNotNull(fixture.logs.tailerHealth().failure);
+            assertFalse(fixture.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void stoppedThreadAndMissingFileAreUnhealthyEvenWithRecentLoop() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            fixture.logs.alive = false;
+            assertEquals("tracking-thread-unavailable", fixture.logs.tailerHealth().failure);
+            fixture.logs.alive = true;
+            Files.delete(fixture.file.toPath());
+            assertEquals("tracking-file-unavailable", fixture.logs.tailerHealth().failure);
+        }
+    }
+
+    @Test void targetDiscoveryFailureCannotAdvanceWatchdogHeartbeat() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            long completed = fixture.logs.tailerHealth().completedLoopNanos;
+            fixture.logs.now += TimeUnit.SECONDS.toNanos(11);
+            fixture.logs.onLocate = () -> { throw new IllegalStateException("synthetic scan failure"); };
+            assertThrows(IllegalStateException.class, fixture.tail::on_loop);
+            assertEquals(completed, fixture.logs.tailerHealth().completedLoopNanos);
+        }
+    }
+
     @Test void healthyQuietTailUsesLoopHeartbeatRatherThanEntryTime() throws Exception
     {
         try (Fixture fixture = new Fixture())
@@ -646,5 +740,68 @@ class ScarletVRChatLogTrackingTest
             fixture.tail.on_loop();
             assertFalse(fixture.logs.clientExitTrackingHealthy());
         }
+    }
+
+    @Test void invalidTimestampIsSkippedWithoutReplayingEarlierEntries() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            for (String timestamp : List.of("2026.99.12 12:00:00", "2026.02.30 12:00:00", "2026.10.12 25:00:00"))
+                assertDoesNotThrow(() -> fixture.tail.on_line(false, timestamp + " Debug      -  invalid record"));
+            fixture.accept(false, "[Behaviour] User Authenticated: " + AUTH);
+            fixture.tail.on_loop();
+            assertEquals(2, fixture.authentication.size());
+            assertTrue(fixture.tail.isRunning());
+            assertFalse(fixture.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void oversizedContinuationIsDiscardedAndCannotHealHealth() throws Exception
+    {
+        try (Fixture fixture = new Fixture())
+        {
+            fixture.healthy();
+            fixture.tail.on_line(false, PREFIX + "[Behaviour] User Authenticated: " + AUTH);
+            for (int n = 0; n < 1500; n++) fixture.tail.on_line(false, "x".repeat(2048));
+            fixture.tail.on_eof();
+            assertEquals(1, fixture.authentication.size(), "Never dispatch a truncated record");
+            assertTrue(fixture.tail.buffer.isEmpty());
+            fixture.accept(false, "[Behaviour] User Authenticated: " + AUTH);
+            assertEquals(2, fixture.authentication.size());
+            assertFalse(fixture.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void parserFailuresNeverLogRawRecordOrExceptionMessage() throws Exception
+    {
+        String canary = "synthetic-private-join-canary";
+        java.io.ByteArrayOutputStream captured = new java.io.ByteArrayOutputStream();
+        java.io.PrintStream previous = System.err;
+        net.sybyline.scarlet.log.ScarletLogger.setConsoleOnly(true);
+        try (java.io.PrintStream output = new java.io.PrintStream(captured, true, StandardCharsets.UTF_8))
+        {
+            System.setErr(output);
+            ScarletVRChatLogs.Listener listener = (ScarletVRChatLogs.Listener) Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{ScarletVRChatLogs.Listener.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("log_userAuthenticated")) throw new IllegalArgumentException(canary);
+                    return null;
+                });
+            try (ScarletVRChatLogs logs = new ScarletVRChatLogs(listener))
+            {
+                ScarletVRChatLogs.VRChatLogTail tail = logs.new VRChatLogTail(temporary.resolve("synthetic-not-opened").toFile());
+                tail.on_line(false, PREFIX + "[Behaviour] User Authenticated: " + canary + " (" + USER + ")");
+                tail.on_eof();
+                assertFalse(tail.trackingValid);
+            }
+        }
+        finally
+        {
+            System.setErr(previous);
+            net.sybyline.scarlet.log.ScarletLogger.setConsoleOnly(Boolean.getBoolean("scarlet.offline"));
+        }
+        String diagnostic = captured.toString(StandardCharsets.UTF_8);
+        assertTrue(diagnostic.contains("Log record handler failed"));
+        assertFalse(diagnostic.contains(canary));
     }
 }

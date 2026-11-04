@@ -8,8 +8,6 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Queue;
 
@@ -358,7 +356,7 @@ class ScarletVRChatApi122CompatibilityTest
 
         Fixture(Path cacheDir) throws Exception
         {
-            this.cacheDir = cacheDir;
+            this.cacheDir = cacheDir.resolve("usr");
             Configuration.getDefaultApiClient();
             previousGson = JSON.getGson();
             OkHttpClient http = new OkHttpClient.Builder()
@@ -382,13 +380,7 @@ class ScarletVRChatApi122CompatibilityTest
             vrc = ScarletDiscordSafetyTest.inert(ScarletVRChat.class);
             ScarletDiscordSafetyTest.put(vrc, "client", client);
             ScarletDiscordSafetyTest.put(vrc, "scarlet", scarlet);
-            @SuppressWarnings("unchecked")
-            ScarletJsonCache<User> cache = ScarletDiscordSafetyTest.inert(ScarletJsonCache.class);
-            ScarletDiscordSafetyTest.put(cache, "kind", "usr");
-            ScarletDiscordSafetyTest.put(cache, "type", TypeToken.get(User.class));
-            ScarletDiscordSafetyTest.put(cache, "dir", cacheDir.toFile());
-            ScarletDiscordSafetyTest.put(cache, "entries", new HashMap<>());
-            ScarletDiscordSafetyTest.put(cache, "known404s", new HashSet<>());
+            ScarletJsonCache<User> cache = new ScarletJsonCache<>(cacheDir.toFile(), "usr", TypeToken.get(User.class));
             ScarletDiscordSafetyTest.put(vrc, "cachedUsers", cache);
         }
 

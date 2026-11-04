@@ -200,7 +200,7 @@ public class Scarlet implements Closeable
             if (implementationVersion != null && !implementationVersion.trim().isEmpty())
                 return implementationVersion.trim();
         }
-        return "0.6.1";
+        return "0.6.2-a1";
     }
 
     public static void main(String[] args) throws Exception
@@ -1420,7 +1420,7 @@ public class Scarlet implements Closeable
     });
     final ScarletSettings.FileValued<String> verifiedRoleSf = this.settings.new FileValuedStringPattern("verified_role_snowflake", I18n.tr("setting.verified_role_snowflake"), "1234567890", "\\d{1,20}", true);
     final ScarletSettings.FileValued<String> membersRoleSf = this.settings.new FileValuedStringPattern("members_role_snowflake", I18n.tr("setting.members_role_snowflake"), "1234567890", "\\d{1,20}", true);
-    final ScarletSettings.FileValued<String> notVerifiedLinkMessage = this.settings.new FileValuedStringPattern("link_vrchat_manual_verify_message", I18n.tr("setting.link_vrchat_manual_verify_message"), "Please open a ticket so an Orchard administrator can verify you manually.", null, true);
+    final ScarletSettings.FileValued<String> notVerifiedLinkMessage = this.settings.new FileValuedStringPattern("link_vrchat_manual_verify_message", I18n.tr("setting.link_vrchat_manual_verify_message"), "Please open a ticket so an administrator can verify you manually.", null, true);
     final ScarletSettings.FileValued<String> autoInviteGroupId = this.settings.new FileValuedStringPattern("auto_invite_group_id", I18n.tr("setting.auto_invite_group_id"), DEFAULT_AUTO_INVITE_GROUP_ID, VrcIds.P_ID_GROUP, true);
     final ScarletSettings.FileValued<EnforcementAgeState> enforceInstances18plus = this.settings.new FileValuedEnum<>("enforce_instances_18_plus", I18n.tr("setting.enforce_instances_18_plus"), EnforcementAgeState.DISABLED);
     final ScarletSettings.FileValued<EnforcementListState> enforceInstancesWorlds = this.settings.new FileValuedEnum<>("enforce_instances_worlds", I18n.tr("setting.enforce_instances_worlds"), EnforcementListState.DISABLED);
@@ -1959,7 +1959,6 @@ public class Scarlet implements Closeable
         // Health watchdog: converts Scarlet's silent failure modes (dead log tailer,
         // expired VRChat session) into visible, recoverable ones. Runs off the worker
         // pool; each tick is cheap and failures in the watchdog itself are swallowed.
-        this.healthWatchdogStartedMillis = System.currentTimeMillis();
         this.exec.scheduleWithFixedDelay(this::healthWatchdogTick, 90L, 60L, TimeUnit.SECONDS);
         // Lift expired timed group bans (see processTimedBans). Cheap and failure-tolerant.
         this.exec.scheduleWithFixedDelay(this::processTimedBans, 60L, 60L, TimeUnit.SECONDS);
@@ -2866,13 +2865,10 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
     // session expiring both just make moderation quietly stop. The watchdog makes
     // them loud (popup + ops channel) and, for the session, self-healing.
 
-    long healthWatchdogStartedMillis = 0L;
+    private final ScarletTailerHealth tailerHealth = new ScarletTailerHealth();
     private int healthTickCounter = 0;
-    private boolean tailerStallAlerted = false,
-                    sessionLostAlerted = false;
+    private boolean sessionLostAlerted = false;
     private long lastSessionRecoveryAttemptMillis = 0L;
-    /** How long the VRChat log may be silent (while VRChat runs) before alerting. */
-    static final long TAILER_STALL_MILLIS = 5L * 60_000L;
     /** Minimum spacing between unattended re-login attempts. */
     static final long SESSION_RECOVERY_RETRY_MILLIS = 10L * 60_000L;
 
@@ -2899,42 +2895,29 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
 
     private void checkTailerHealth()
     {
-        if (ScarletUI.findVRChatPids().isEmpty())
+        ScarletTailerHealth.Clients clients = ScarletTailerHealth.captureClients(ScarletUI.findVRChatPids());
+        ScarletTailerHealth.Change change = this.tailerHealth.observe(System.nanoTime(), clients, this.logs.tailerHealth());
+        if (change == ScarletTailerHealth.Change.STALLED)
         {
-            // VRChat not running: a quiet log is expected; clear any stall latch so the
-            // next session starts fresh.
-            this.tailerStallAlerted = false;
-            return;
+            long minutes = this.tailerHealth.unhealthyMinutes();
+            LOG.warn("VRChat log reader health unconfirmed for {} minutes ({})", minutes, this.tailerHealth.reason());
+            this.splash.queueFeedbackPopup(null, 10_000L,
+                I18n.tr("health.tailerStalled"), I18n.tr("health.tailerStalledDetail", minutes),
+                java.awt.Color.ORANGE, java.awt.Color.ORANGE);
+            this.discord.emitOpsAlert("VRChat log reader needs attention",
+                "Scarlet has been unable to confirm a healthy log reader for the current VRChat session for " + minutes
+                + " minutes. Instance monitoring may be unavailable. Check Scarlet's log for the tracking diagnostic."
+                + " A quiet but healthy log does not trigger this alert.", 0xE74C3C);
         }
-        long lastEntry = this.logs.lastEntryMillis(),
-             reference = lastEntry > 0L ? lastEntry : this.healthWatchdogStartedMillis,
-             quietMillis = System.currentTimeMillis() - reference;
-        if (quietMillis > TAILER_STALL_MILLIS)
+        else if (change == ScarletTailerHealth.Change.RECOVERED)
         {
-            if (!this.tailerStallAlerted)
-            {
-                this.tailerStallAlerted = true;
-                long quietMinutes = quietMillis / 60_000L;
-                LOG.warn("VRChat is running but no log lines have been seen for {} minutes - the log tailer may be stalled", quietMinutes);
-                this.splash.queueFeedbackPopup(null, 10_000L,
-                    I18n.tr("health.tailerStalled"),
-                    I18n.tr("health.tailerStalledDetail", quietMinutes),
-                    java.awt.Color.ORANGE, java.awt.Color.ORANGE);
-                this.discord.emitOpsAlert("VRChat log tailer stalled",
-                    "VRChat is running, but Scarlet has not seen a log line in " + quietMinutes
-                    + " minutes. Instance monitoring (joins/leaves, watched groups, TTS) may be down."
-                    + " Restarting Scarlet usually recovers this.", 0xE74C3C);
-            }
-        }
-        else if (this.tailerStallAlerted && lastEntry > 0L)
-        {
-            this.tailerStallAlerted = false;
-            LOG.info("VRChat log lines are flowing again");
+            LOG.info("VRChat log reader health confirmed across successive checks");
             this.splash.queueFeedbackPopup(null, 6_000L,
                 I18n.tr("health.tailerRecovered"), null,
                 java.awt.Color.GREEN, java.awt.Color.GREEN);
             this.discord.emitOpsAlert("VRChat log tailer recovered",
-                "Log lines are flowing again; instance monitoring has resumed.", 0x2ECC71);
+                "The current log reader has completed healthy processing loops across successive checks."
+                + " This confirms reader health, not delivery of a particular event.", 0x2ECC71);
         }
     }
 

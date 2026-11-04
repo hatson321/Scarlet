@@ -56,6 +56,9 @@ class ScarletStartupFollowIntegrationTest
         ScarletSettings settings = inert(ScarletSettings.class);
         put(settings, "fileValuedSettings", new HashMap<>());
         ScarletSettings.FileValuedBoolean toggle = settings.new FileValuedBoolean("synthetic_follow", "Synthetic", false);
+        ScarletSettings.FileValuedBoolean training = settings.new FileValuedBoolean("synthetic_training", "Synthetic", false);
+        put(training, "cached", false);
+        put(scarlet, "trainingMode", training);
         put(toggle, "cached", false);
         put(discord, "vrchatClient_launchOnInstanceCreate", toggle);
         discord.maybeJoinActiveInstanceOnStartup();
@@ -64,6 +67,33 @@ class ScarletStartupFollowIntegrationTest
         put(toggle, "cached", true);
         discord.maybeJoinActiveInstanceOnStartup();
         assertNull(field(discord, "clientLaunchWorker"), "Enabling later must not replay a startup join");
+    }
+
+    @Test void trainingAtStartupCannotCreateWorkerOrTouchClient() throws Exception
+    {
+        ScarletDiscordJDA discord = inert(ScarletDiscordJDA.class);
+        Scarlet scarlet = inert(Scarlet.class);
+        ScarletVRChat vrc = inert(ScarletVRChat.class);
+        vrc.groupId = GROUP;
+        vrc.currentUserId = "usr_11111111-1111-1111-1111-111111111111";
+        put(scarlet, "vrc", vrc);
+        put(scarlet, "running", true);
+        put(discord, "scarlet", scarlet);
+        put(discord, "startupDeferredFollow", new ScarletDeferredInstanceFollow());
+        ScarletSettings settings = inert(ScarletSettings.class);
+        put(settings, "fileValuedSettings", new HashMap<>());
+        ScarletSettings.FileValuedBoolean follow = settings.new FileValuedBoolean("synthetic_follow", "Synthetic", true);
+        ScarletSettings.FileValuedBoolean training = settings.new FileValuedBoolean("synthetic_training", "Synthetic", true);
+        put(follow, "cached", true);
+        put(training, "cached", true);
+        put(scarlet, "trainingMode", training);
+        put(discord, "vrchatClient_launchOnInstanceCreate", follow);
+        discord.maybeJoinActiveInstanceOnStartup();
+        assertFalse(discord.isStartupInstanceJoinPending());
+        assertNull(field(discord, "clientLaunchWorker"));
+        put(training, "cached", false);
+        discord.maybeJoinActiveInstanceOnStartup();
+        assertNull(field(discord, "clientLaunchWorker"), "Leaving training must not replay the cancelled startup join");
     }
 
     @Test void actualSubmissionRunsInBackgroundAndDoesNotQueueDuplicateStartupWork() throws Exception

@@ -42,7 +42,7 @@ class ScarletVersionTest
         assertEquals(buildVersion(), Scarlet.VERSION);
     }
 
-    @Test void launcherMatchesBuildAndPublishedFeedDoesNotAdvertiseALocalPreview() throws Exception
+    @Test void launcherMatchesBuildAndPublishedFeedIsConsistent() throws Exception
     {
         String version = buildVersion();
         JsonObject metadata = JsonParser.parseString(read("meta.json")).getAsJsonObject();
@@ -52,14 +52,7 @@ class ScarletVersionTest
         assertTrue(MiscUtils.isValidVersion(publishedBuild));
         assertFalse(MiscUtils.isPreviewVersion(release));
         assertTrue(MiscUtils.compareScarletVersion(publishedBuild, release) >= 0);
-        if (MiscUtils.isPreviewVersion(version))
-            assertTrue(MiscUtils.compareScarletVersion(version, publishedBuild) >= 0,
-                "Local previews may be newer than the published update feed");
-        else
-        {
-            assertEquals(version, release);
-            assertEquals(version, publishedBuild);
-        }
+        // A shared update feed may advertise a release newer or older than this checkout.
         assertEquals(version, read("scarlet.version").trim());
     }
 
@@ -136,7 +129,11 @@ class ScarletVersionTest
         assertTrue(MiscUtils.isValidVersion("0.6.1"));
         assertFalse(MiscUtils.isPreviewVersion("0.6.1"));
         assertTrue(MiscUtils.compareScarletVersion("0.6.1", "0.6.1-a12") > 0);
-        assertEquals("0.6.1", Scarlet.VERSION);
+        assertTrue(MiscUtils.isValidVersion("0.6.2-a1"));
+        assertTrue(MiscUtils.isPreviewVersion("0.6.2-a1"));
+        assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", "0.6.1") > 0);
+        assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", "0.6.2") < 0);
+        assertEquals("0.6.2-a1", Scarlet.VERSION);
     }
 
     @Test void publicAlphaCandidateOrdersAfterDeliveredAlphasAndBeforeStable() throws Exception
@@ -215,7 +212,7 @@ class ScarletVersionTest
             }
     }
 
-    @Test void releaseAnnouncementMatchesThePublishedReleaseAndReplacesTheObsoleteNotice() throws Exception
+    @Test void releaseAnnouncementIsConsistentAndDoesNotExceedPublishedRelease() throws Exception
     {
         ScarletMeta metadata = Scarlet.GSON_PRETTY.fromJson(read("meta.json"), ScarletMeta.class);
         ScarletAnnouncement announcement = metadata.announcement;
@@ -226,8 +223,12 @@ class ScarletVersionTest
         // The feed also supports non-release advisories; do not force those to name a version.
         if (announcement.id.startsWith("release-"))
         {
-            String version = metadata.latest_release;
-            assertTrue(announcement.id.startsWith("release-" + version + "-"));
+            Matcher releaseId = Pattern.compile("release-(.+)-[0-9]{8}").matcher(announcement.id);
+            assertTrue(releaseId.matches());
+            String version = releaseId.group(1).replaceFirst("-stable$", "");
+            assertTrue(MiscUtils.isValidVersion(version));
+            assertTrue(MiscUtils.compareScarletVersion(version, metadata.latest_release) <= 0,
+                "An existing release notice can remain in place when the update feed advances");
             assertTrue(announcement.title.startsWith("Scarlet " + version + " "));
             assertTrue(announcement.message.startsWith("Scarlet " + version + " "));
             assertEquals("info", announcement.severity);

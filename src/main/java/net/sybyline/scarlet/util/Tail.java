@@ -32,6 +32,10 @@ public class Tail implements Runnable
     protected final boolean reOpen;
     protected final byte[] inbuf;
     protected volatile boolean run;
+    static final int MAX_LINE_BYTES = 256 * 1024;
+    private final ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream(64);
+    private long lineStart = -1, scannedPosition = -1;
+    private boolean seenCR, overlongLine;
 
     protected void on_init() {}
     protected void on_fnf(FileNotFoundException fnfex) {}
@@ -40,6 +44,7 @@ public class Tail implements Runnable
     protected void on_exception(Exception ex) {}
     protected void on_eof() {}
     protected void on_loop() {}
+    protected void on_overlong_line() {}
 
     protected boolean isRunning()
     {
@@ -105,6 +110,7 @@ public class Tail implements Runnable
                         }
                         position = 0;
                         fileInitialLength = 0;
+                        this.resetLineState(0);
                     }
                     catch (FileNotFoundException e)
                     {
@@ -183,49 +189,77 @@ public class Tail implements Runnable
      */
     protected long readLines(long fileInitialLength, RandomAccessFile reader) throws IOException
     {
-        try (ByteArrayOutputStream lineBuf = new ByteArrayOutputStream(64))
+        long requestedPosition = reader.getFilePointer();
+        long length = reader.length();
+        if (length < this.scannedPosition)
         {
-            long pos = reader.getFilePointer();
-            long rePos = pos;
-            int num;
-            boolean seenCR = false;
-            while (this.isRunning() && ((num = reader.read(this.inbuf)) != -1)) // eof
-            {
-                for (int i = 0; i < num; i++)
-                {
-                    byte ch = this.inbuf[i];
-                    switch (ch)
-                    {
-                    case 0x0a: // LF
-                        seenCR = false;
-                        this.on_line(rePos < fileInitialLength, new String(lineBuf.toByteArray(), this.charset));
-                        lineBuf.reset();
-                        rePos = pos + i + 1;
-                        break;
-                    case 0x0d: // CR
-                        if (seenCR)
-                        {
-                            lineBuf.write(0x0d);
-                        }
-                        seenCR = true;
-                        break;
-                    default:
-                        if (seenCR)
-                        {
-                            seenCR = false;
-                            this.on_line(rePos < fileInitialLength, new String(lineBuf.toByteArray(), this.charset));
-                            lineBuf.reset();
-                            rePos = pos + i + 1;
-                        }
-                        lineBuf.write(ch);
-                    }
-                }
-                pos = reader.getFilePointer();
-            }
-            reader.seek(rePos);
-            this.on_eof();
-            return rePos;
+            this.on_rotated();
+            requestedPosition = 0;
+            this.resetLineState(0);
         }
+        else if (requestedPosition != this.lineStart)
+            this.resetLineState(requestedPosition);
+        reader.seek(this.scannedPosition);
+        int num;
+        while (this.isRunning() && ((num = reader.read(this.inbuf)) != -1))
+        {
+            long start = this.scannedPosition;
+            for (int i = 0; i < num; i++)
+            {
+                byte ch = this.inbuf[i];
+                switch (ch)
+                {
+                case 0x0a: // LF, including CRLF split between reads
+                    this.finishLine(fileInitialLength, start + i + 1);
+                    break;
+                case 0x0d: // CR
+                    if (this.seenCR) this.appendLineByte(0x0d);
+                    this.seenCR = true;
+                    break;
+                default:
+                    if (this.seenCR)
+                    {
+                        // This byte belongs to the next line, not the CR-terminated one.
+                        this.finishLine(fileInitialLength, start + i);
+                    }
+                    this.appendLineByte(ch);
+                }
+            }
+            this.scannedPosition = reader.getFilePointer();
+        }
+        // Keep the incomplete-line position visible to health checks, but retain the
+        // bounded pending bytes so the next poll reads only the newly appended suffix.
+        reader.seek(this.lineStart);
+        this.on_eof();
+        return this.lineStart;
+    }
+
+    private void resetLineState(long position)
+    {
+        this.lineBuffer.reset();
+        this.lineStart = this.scannedPosition = position;
+        this.seenCR = this.overlongLine = false;
+    }
+
+    private void appendLineByte(int value)
+    {
+        if (this.overlongLine) return;
+        if (this.lineBuffer.size() >= MAX_LINE_BYTES)
+        {
+            this.overlongLine = true;
+            this.lineBuffer.reset();
+            this.on_overlong_line();
+        }
+        else this.lineBuffer.write(value);
+    }
+
+    private void finishLine(long fileInitialLength, long nextStart)
+    {
+        if (!this.overlongLine)
+            this.on_line(this.lineStart < fileInitialLength, new String(this.lineBuffer.toByteArray(), this.charset));
+        this.lineBuffer.reset();
+        this.lineStart = nextStart;
+        this.seenCR = this.overlongLine = false;
     }
 
 }

@@ -5,8 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Arrays;
-import java.util.EnumMap;
-import java.util.Map;
+import java.util.List;
 
 import org.junit.jupiter.api.Test;
 
@@ -73,22 +72,22 @@ class ScarletVoteKickProfileTest
         MessageEmbed original = base();
         PublicProfile profile = new PublicProfile().id(TARGET).bio("Synthetic public biography")
             .pronouns("they/them").status(UserStatus.JOIN_ME).statusDescription("Open to conversation")
-            .currentAvatarImageUrl(IMAGE);
+            .trustTags(List.of("system_trust_veteran")).currentAvatarImageUrl(IMAGE);
         MessageEmbed result = ScarletVoteKickProfile.enrich(original, TARGET, null, profile);
 
         assertNotSame(original, result);
         assertBasePreserved(original, result);
         assertEquals("Synthetic public biography", value(result, "Bio (excerpt)"));
         assertEquals("they/them", value(result, "Pronouns"));
-        assertEquals("Join Me", value(result, "Status (profile snapshot)"));
-        assertEquals("Open to conversation", value(result, "Status message"));
+        assertEquals("Trusted", value(result, "Trust rank"));
+        assertNull(field(result, "Status (profile snapshot)"));
+        assertNull(field(result, "Status message"));
         assertFalse(field(result, "Bio (excerpt)").isInline());
         assertTrue(field(result, "Pronouns").isInline());
-        assertTrue(field(result, "Status (profile snapshot)").isInline());
-        assertFalse(field(result, "Status message").isInline());
+        assertTrue(field(result, "Trust rank").isInline());
         assertEquals(IMAGE, result.getThumbnail().getUrl());
         assertNull(result.getImage(), "Profile pictures must not create a large embed image");
-        assertEquals(5, result.getFields().size());
+        assertEquals(4, result.getFields().size());
     }
 
     @Test void enrichingDoesNotMutateTheSourceEmbedOrExistingFields()
@@ -107,23 +106,45 @@ class ScarletVoteKickProfileTest
         assertEquals("Original event metadata", original.getFooter().getText());
     }
 
-    @Test void everySdkStatusHasAnExplicitHumanReadableProfileSnapshotLabel()
+    @Test void allStatusValuesAreOmittedAndDoNotChangeTrustRank()
     {
-        Map<UserStatus, String> expected = new EnumMap<>(UserStatus.class);
-        expected.put(UserStatus.ACTIVE, "Online");
-        expected.put(UserStatus.JOIN_ME, "Join Me");
-        expected.put(UserStatus.ASK_ME, "Ask Me");
-        expected.put(UserStatus.BUSY, "Do Not Disturb");
-        expected.put(UserStatus.OFFLINE, "Offline");
-        assertEquals(UserStatus.values().length, expected.size(), "Review labels if the SDK adds a status");
         for (UserStatus status : UserStatus.values())
         {
-            MessageEmbed result = render(null, new PublicProfile().id(TARGET).status(status));
-            assertEquals(expected.get(status), value(result, "Status (profile snapshot)"), status.name());
+            MessageEmbed result = render(null, new PublicProfile().id(TARGET).status(status)
+                .statusDescription("Not displayed").trustTags(List.of("system_trust_veteran")));
+            assertEquals("Trusted", value(result, "Trust rank"));
+            assertNull(field(result, "Status (profile snapshot)"));
+            assertNull(field(result, "Status message"));
         }
     }
 
-    @Test void publicProfileOverridesCachedUserPronounsAndStatus()
+    @Test void publicAndCachedTrustTagsUseTheExistingRankMapping()
+    {
+        String[][] ranks = {{"system_troll", "Nuisance"}, {"", "Visitor"},
+            {"system_trust_basic", "New User"}, {"system_trust_known", "User"},
+            {"system_trust_trusted", "Known"}, {"system_trust_veteran", "Trusted"}};
+        for (String[] rank : ranks)
+        {
+            List<String> tags = rank[0].isEmpty() ? List.of() : List.of(rank[0]);
+            assertEquals(rank[1], value(render(null, new PublicProfile().id(TARGET).trustTags(tags)), "Trust rank"));
+            assertEquals(rank[1], value(render(new User().id(TARGET).tags(tags), null), "Trust rank"));
+        }
+        assertEquals("Unknown", value(render(null, new PublicProfile().id(TARGET).trustTags(null)), "Trust rank"));
+        assertEquals("Unknown", value(render(new User().id(TARGET).tags(null), null), "Trust rank"));
+    }
+
+    @Test void publicRankWinsButMissingTagsCanUseTheCachedUser()
+    {
+        User user = new User().id(TARGET).tags(List.of("system_trust_veteran"));
+        assertEquals("Known", value(render(user, new PublicProfile().id(TARGET)
+            .trustTags(List.of("system_trust_trusted"))), "Trust rank"));
+        assertEquals("Visitor", value(render(user, new PublicProfile().id(TARGET).trustTags(List.of())), "Trust rank"));
+        assertEquals("Trusted", value(render(user, new PublicProfile().id(TARGET).trustTags(null)), "Trust rank"));
+        assertEquals("Unknown", value(render(new User().id(OTHER).tags(List.of("system_trust_veteran")),
+            new PublicProfile().id(TARGET).trustTags(null)), "Trust rank"));
+    }
+
+    @Test void publicProfileOverridesCachedUserPronouns()
     {
         User stale = new User().id(TARGET).pronouns("old pronouns").status(UserStatus.OFFLINE)
             .statusDescription("old status message");
@@ -131,8 +152,8 @@ class ScarletVoteKickProfileTest
             .status(UserStatus.ACTIVE).statusDescription("new status message");
         MessageEmbed result = render(stale, current);
         assertEquals("new pronouns", value(result, "Pronouns"));
-        assertEquals("Online", value(result, "Status (profile snapshot)"));
-        assertEquals("new status message", value(result, "Status message"));
+        assertNull(field(result, "Status (profile snapshot)"));
+        assertNull(field(result, "Status message"));
     }
 
     @Test void clearedPublicFieldsNeverResurrectCachedUserValues()
@@ -148,7 +169,7 @@ class ScarletVoteKickProfileTest
             assertNull(field(result, "Pronouns"));
             assertNull(field(result, "Status (profile snapshot)"));
             assertNull(field(result, "Status message"));
-            assertEquals(1, result.getFields().size());
+            assertEquals(2, result.getFields().size());
         }
     }
 
@@ -157,8 +178,8 @@ class ScarletVoteKickProfileTest
         MessageEmbed result = render(new User().id(TARGET).pronouns("he/him").status(UserStatus.ASK_ME)
             .statusDescription("Ask before joining"), null);
         assertEquals("he/him", value(result, "Pronouns"));
-        assertEquals("Ask Me", value(result, "Status (profile snapshot)"));
-        assertEquals("Ask before joining", value(result, "Status message"));
+        assertNull(field(result, "Status (profile snapshot)"));
+        assertNull(field(result, "Status message"));
         assertNull(field(result, "Bio (excerpt)"));
         assertNull(result.getThumbnail());
         assertNull(result.getImage());
@@ -282,7 +303,7 @@ class ScarletVoteKickProfileTest
             .pronouns("p".repeat(100)).statusDescription("s".repeat(200)));
         assertEquals("b".repeat(240) + "\u2026", value(result, "Bio (excerpt)"));
         assertEquals("p".repeat(80) + "\u2026", value(result, "Pronouns"));
-        assertEquals("s".repeat(160) + "\u2026", value(result, "Status message"));
+        assertNull(field(result, "Status message"));
     }
 
     @Test void astralUnicodeIsCountedAsCodePointsAndNeverSplit()
@@ -373,7 +394,7 @@ class ScarletVoteKickProfileTest
         };
         MessageEmbed original = base();
         User brokenUser = new User() {
-            @Override public UserStatus getStatus() { throw privateFailure; }
+            @Override public List<String> getTags() { throw privateFailure; }
         };
         PublicProfile brokenProfile = new PublicProfile() {
             @Override public String getBio() { throw privateFailure; }

@@ -51,7 +51,7 @@ class ScarletVoteKickProfileIntegrationTest
     static PublicProfile profile()
     {
         return new PublicProfile().id(TARGET).bio("Synthetic biography").pronouns("they/them")
-            .status(UserStatus.ACTIVE).statusDescription("Synthetic status").currentAvatarImageUrl(IMAGE);
+            .status(UserStatus.ACTIVE).statusDescription("Synthetic status").trustTags(List.of("system_trust_veteran")).currentAvatarImageUrl(IMAGE);
     }
 
     static void await(CountDownLatch latch)
@@ -282,8 +282,9 @@ class ScarletVoteKickProfileIntegrationTest
             assertEquals(IMAGE, initial.getThumbnail().getUrl()); assertNull(initial.getImage());
             assertEquals("Synthetic biography", field(initial, "Bio (excerpt)"));
             assertEquals("they/them", field(initial, "Pronouns"));
-            assertEquals("Online", field(initial, "Status (profile snapshot)"));
-            assertEquals("Synthetic status", field(initial, "Status message"));
+            assertEquals("Trusted", field(initial, "Trust rank"));
+            assertNull(field(initial, "Status (profile snapshot)"));
+            assertNull(field(initial, "Status message"));
             assertEquals("`" + TARGET + "`", field(initial, "Target User ID"));
             assertEquals("`" + ACTOR + "`", field(initial, "Initiating User ID"));
             assertEquals("Synthetic Initiator", initial.getAuthor().getName());

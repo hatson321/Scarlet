@@ -406,6 +406,36 @@ public class ScarletUI implements IScarletUI
         this.updateStatusBar();
     }
 
+    synchronized void clearDepartedPlayers()
+    {
+        this.connectedPlayers.values().removeIf(player ->
+        {
+            if (player.left == null)
+                return false;
+            this.pendingUpdates.remove(player.id);
+            this.propstable.removeEntrySilently(player);
+            return true;
+        });
+        this.fireSort();
+    }
+
+    void applyClearInstanceChoice(int choice)
+    {
+        if (choice == 0)
+            this.clearDepartedPlayers();
+        else if (choice == 1)
+            this.clearInstanceManual();
+    }
+
+    private void uiClearInstance()
+    {
+        Object[] options = { I18n.tr("ui.clearDepartedUsers"), I18n.tr("ui.clearFullList"), I18n.tr("common.cancel") };
+        int choice = JOptionPane.showOptionDialog(this.jframe,
+            Swing.dialogMessage(I18n.tr("ui.clearInstanceChoiceMsg")), I18n.tr("ui.confirmClearTitle"),
+            JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+        this.applyClearInstanceChoice(choice);
+    }
+
     public synchronized void fireSort()
     {
         this.propstable.sortEntries(COMPARE);
@@ -1075,9 +1105,7 @@ public class ScarletUI implements IScarletUI
 
             JButton btn_clear = mkBtn.apply(I18n.tr("ui.btnClearInstance"));
             btn_clear.setToolTipText(I18n.tr("ui.clearTheCurrentInstancePlayerList"));
-            btn_clear.addActionListener($ ->
-                this.scarlet.settings.requireConfirmYesNoAsync(
-                    I18n.tr("ui.confirmClearMsg"), I18n.tr("ui.confirmClearTitle"), this::clearInstanceManual, null));
+            btn_clear.addActionListener($ -> this.uiClearInstance());
             actions.add(btn_clear);
 
             // TTS pause/resume toggle — state is reflected in label and colour

@@ -9,15 +9,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -102,6 +98,31 @@ public class ScarletVRChatLogs implements Closeable
     public long lastEntryMillis()
     {
         return this.lastEntryMillis;
+    }
+
+    /** A completed-loop observation for alerts, independent of the stricter exit predicate. */
+    ScarletTailerHealth.Reader tailerHealth()
+    {
+        VRChatLogTail tail = this.currentTail;
+        String failure = null;
+        if (!this.running) failure = "tracking-owner-stopped";
+        else if (!this.trackingThreadAlive()) failure = "tracking-thread-unavailable";
+        else if (tail == null || this.currentTarget == null) failure = "tracking-log-unavailable";
+        else if (!tail.isRunning()) failure = "tracking-reader-stopped";
+        else if (!tail.trackingValid) failure = "tracking-session-invalidated";
+        else try
+        {
+            if (!tail.healthFileAvailable()) failure = "tracking-file-unavailable";
+        }
+        catch (SecurityException unavailable) { failure = "tracking-file-unavailable"; }
+        Long fileStart = tail == null || tail.startupFileTime == null ? null
+            : tail.startupFileTime.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+        long completed = tail == null ? 0L : tail.watchdogLoopNanos;
+        // Ordinary appends may be in progress at sampling time. Only a completed healthy
+        // loop can refresh this timestamp; a failed parser invalidates the whole session.
+        if (tail != this.currentTail || (tail != null && !tail.trackingValid))
+            failure = "tracking-session-changed-or-invalidated";
+        return new ScarletTailerHealth.Reader(tail, fileStart, completed, failure);
     }
 
     /**
@@ -393,43 +414,45 @@ public class ScarletVRChatLogs implements Closeable
         this.currentTail = null;
         try
         {
-            if (!VrcAppData.DIR.isDirectory())
-            {
-                this.catchUp(null);
-                LOG.warn("The VRChat Client does not seem to be installed on this machine, disabling log tailer-parser!");
-                return;
-            }
-            while (!this.pollTarget())
-            {
-                this.catchUp(null);
-                if (!MiscUtils.sleep(10_000L))
-                    return;
-                if (!this.running)
-                    return;
-                LOG.info("Waiting for log file to appear...");
-            }
+            File finishedTarget = null;
+            boolean notifiedWaiting = false;
             while (this.running && !this.tailThread.isInterrupted())
             {
+                // A failed reader must not replay the same session from byte zero.
+                while (this.running && (this.currentTarget == null || Objects.equals(this.currentTarget, finishedTarget)))
+                {
+                    try { this.pollTarget(); }
+                    catch (Exception ex)
+                    {
+                        this.invalidateClientExitTracking();
+                        LOG.warn("Log discovery unavailable ({}); retrying", ex.getClass().getSimpleName());
+                    }
+                    if (this.currentTarget != null && !Objects.equals(this.currentTarget, finishedTarget)) break;
+                    if (!notifiedWaiting) { this.catchUp(null); notifiedWaiting = true; }
+                    if (!this.discoveryPause()) return;
+                }
+                if (!this.running || this.tailThread.isInterrupted()) return;
                 this.invalidateClientExitTracking();
                 this.currentTargetIndex++;
                 LOG.info("Tailing " + this.currentTarget.getName());
-                this.listener.log_init(this.currentTarget);
-                this.currentTail = new VRChatLogTail(this.currentTarget);
+                finishedTarget = this.currentTarget;
                 try
                 {
+                    this.listener.log_init(this.currentTarget);
+                    this.currentTail = new VRChatLogTail(this.currentTarget);
                     this.currentTail.run();
                 }
                 catch (Exception ex)
                 {
                     this.invalidateClientExitTracking();
-                    LOG.error("Exception whilst tailing " + this.currentTarget.getName(), ex);
+                    LOG.error("Log reader stopped ({}); waiting for a new session", ex.getClass().getSimpleName());
                 }
             }
         }
         catch (Exception ex)
         {
             this.invalidateClientExitTracking();
-            LOG.error("Exception in tailer thread", ex);
+            LOG.error("Log reader stopped ({})", ex.getClass().getSimpleName());
         }
         finally
         {
@@ -439,6 +462,8 @@ public class ScarletVRChatLogs implements Closeable
             this.currentTail = null;
         }
     }
+
+    boolean discoveryPause() { return MiscUtils.sleep(10_000L); }
 
     private void catchUp(File file)
     {
@@ -458,22 +483,31 @@ public class ScarletVRChatLogs implements Closeable
         return true;
     }
 
-    private static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
+    private static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("uuuu-MM-dd_HH-mm-ss")
+        .withResolverStyle(java.time.format.ResolverStyle.STRICT);
+    File logDirectory() { return VrcAppData.DIR; }
     File locateTarget()
     {
-        File[] files = VrcAppData.DIR.listFiles();
+        File[] files = this.logDirectory().listFiles();
         if (files == null) throw new IllegalStateException("VRChat log directory cannot be enumerated");
-        return Optional
-            .ofNullable(files)
-            .map(Arrays::stream)
-            .orElseGet(Stream::empty)
-            .filter(file -> file.isFile() && file.getName().startsWith("output_log_") && file.getName().endsWith(".txt"))
-            .max(Comparator.comparing($ -> LocalDateTime.parse($.getName().substring(11, 30), dtf)))
-            .orElse(null);
+        File newest = null;
+        LocalDateTime latest = null;
+        for (File file : files)
+        {
+            if (!file.isFile()) continue;
+            LocalDateTime timestamp = startupFileTime(file);
+            if (timestamp != null && (latest == null || timestamp.isAfter(latest)))
+            {
+                newest = file;
+                latest = timestamp;
+            }
+        }
+        return newest;
     }
 
     static final Pattern entry = Pattern.compile("\\A(?<ldt>\\d{4}\\.\\d{2}\\.\\d{2}\\s\\d{2}:\\d{2}:\\d{2})\\s(?<lvl>\\w+)\\s+-\\s\\s(?<txt>.+)\\z");
-    static final DateTimeFormatter entry_dtf = DateTimeFormatter.ofPattern("yyyy'.'MM'.'dd HH':'mm':'ss");
+    static final DateTimeFormatter entry_dtf = DateTimeFormatter.ofPattern("uuuu'.'MM'.'dd HH':'mm':'ss")
+        .withResolverStyle(java.time.format.ResolverStyle.STRICT);
     static LocalDateTime startupFileTime(File file)
     {
         String name = file.getName();
@@ -483,6 +517,7 @@ public class ScarletVRChatLogs implements Closeable
     }
     class VRChatLogTail extends Tail
     {
+        static final int MAX_ENTRY_CHARS = 1024 * 1024, MAX_ENTRY_LINES = 1024;
         VRChatLogTail(File target)
         {
             super(target, StandardCharsets.UTF_8, 150L, false, false, 8192);
@@ -494,11 +529,14 @@ public class ScarletVRChatLogs implements Closeable
         final LocalDateTime startupFileTime;
         final ScarletStartupFailureLoop startupFailures = new ScarletStartupFailureLoop();
         final List<String> buffer;
+        int bufferedChars;
+        boolean discardEntry;
         long lastPolled;
         volatile boolean isInPreamble;
         volatile boolean trackingValid = true;
         volatile long completedLoopNanos;
         volatile long lastHealthyLoopNanos;
+        volatile long watchdogLoopNanos;
         volatile long completedReadPosition;
         volatile boolean completeRead = true;
         volatile boolean readInProgress;
@@ -513,11 +551,26 @@ public class ScarletVRChatLogs implements Closeable
             if (matcher.find())
             {
                 this.handleCurrentEntry();
-                this.entryLdt = LocalDateTime.parse(matcher.group("ldt"), entry_dtf);
+                this.discardEntry = false;
+                try { this.entryLdt = LocalDateTime.parse(matcher.group("ldt"), entry_dtf); }
+                catch (java.time.DateTimeException invalid)
+                {
+                    this.rejectEntry("invalid-timestamp");
+                    return;
+                }
                 this.entryLvl = matcher.group("lvl");
                 this.entryTxt = matcher.group("txt");
             }
-            this.buffer.add(line);
+            if (!this.discardEntry)
+            {
+                if (line.length() > MAX_ENTRY_CHARS - this.bufferedChars || this.buffer.size() >= MAX_ENTRY_LINES)
+                    this.rejectEntry("record-too-large");
+                else
+                {
+                    this.buffer.add(line);
+                    this.bufferedChars += line.length();
+                }
+            }
             if (this.isInPreamble && !inPreamble)
                 ScarletVRChatLogs.this.catchUp(this.file);
             this.isInPreamble &= inPreamble;
@@ -545,15 +598,21 @@ public class ScarletVRChatLogs implements Closeable
                     return;
                 }
             }
-            if (this.trackingValid && !this.isInPreamble && this.buffer.isEmpty() && this.isRunning() && this.trackingCaughtUp())
+            if (this.trackingValid && this.buffer.isEmpty() && this.isRunning() && this.trackingCaughtUp())
             {
                 // Target discovery can involve slow filesystem enumeration. Stamp the
                 // completed healthy loop, not the time before that work started.
                 long completed = ScarletVRChatLogs.this.trackingNowNanos();
-                this.completedLoopNanos = completed;
-                this.lastHealthyLoopNanos = completed;
+                this.watchdogLoopNanos = completed;
+                if (!this.isInPreamble)
+                {
+                    this.completedLoopNanos = completed;
+                    this.lastHealthyLoopNanos = completed;
+                }
             }
         }
+
+        boolean healthFileAvailable() { return this.file.isFile(); }
 
         boolean trackingCaughtUp()
         {
@@ -597,7 +656,26 @@ public class ScarletVRChatLogs implements Closeable
 
         @Override protected void on_fnf(FileNotFoundException ex) { this.invalidateTracking(); }
         @Override protected void on_rotated() { this.invalidateTracking(); }
-        @Override protected void on_exception(Exception ex) { this.invalidateTracking(); }
+        @Override protected void on_exception(Exception ex)
+        {
+            this.invalidateTracking();
+            if (!(ex instanceof InterruptedException))
+                LOG.warn("Log reader failed ({}); automatic actions remain blocked", ex.getClass().getSimpleName());
+        }
+        @Override protected void on_overlong_line() { this.rejectEntry("line-too-large"); }
+
+        private void rejectEntry(String reason)
+        {
+            boolean firstFailure = this.trackingValid;
+            this.invalidateTracking();
+            this.buffer.clear();
+            this.bufferedChars = 0;
+            this.entryLdt = null;
+            this.entryLvl = null;
+            this.entryTxt = null;
+            this.discardEntry = true;
+            if (firstFailure) LOG.warn("Log record rejected ({}); automatic actions remain blocked", reason);
+        }
 
         @Override public void stop()
         {
@@ -626,11 +704,12 @@ public class ScarletVRChatLogs implements Closeable
             catch (Exception ex)
             {
                 this.invalidateTracking();
-                LOG.error("Error handling log line: " + this.entryTxt, ex);
+                LOG.error("Log record handler failed ({}); automatic actions remain blocked", ex.getClass().getSimpleName());
             }
             finally
             {
                 this.buffer.clear();
+                this.bufferedChars = 0;
                 this.entryLdt = null;
                 this.entryLvl = null;
                 this.entryTxt = null;

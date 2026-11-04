@@ -61,6 +61,7 @@ class ScarletPlayerListUiTest
         final Map<String, ScarletUI.ConnectedPlayer> rows = new HashMap<>();
         final Map<String, ScarletUI.ConnectedPlayer> parked = new HashMap<>();
         final JLabel status = new JLabel();
+        final PropsTable<ScarletUI.ConnectedPlayer> table = new PropsTable<>();
         Fixture() throws Exception
         {
             Scarlet scarlet = inert(Scarlet.class);
@@ -72,7 +73,7 @@ class ScarletPlayerListUiTest
             put(ui, "connectedPlayers", rows);
             put(ui, "parkedPlayers", parked);
             put(ui, "pendingUpdates", new HashMap<>());
-            put(ui, "propstable", new PropsTable<ScarletUI.ConnectedPlayer>());
+            put(ui, "propstable", table);
             put(ui, "jlabel_status", status);
         }
         void join(boolean preamble)
@@ -205,5 +206,115 @@ class ScarletPlayerListUiTest
         assertEquals("Pending real avatar", f.parked.get(lateReal).avatarName);
         assertNull(f.rows.get(TRAINING_USER).avatarName);
         assertTrue(f.ui.hasActivePlayers());
+    }
+
+    @Test void departedChoiceKeepsCurrentRowsDetailsAndRejoinedPlayers() throws Exception
+    {
+        Fixture f = new Fixture();
+        f.join(false);
+        f.ui.playerEnrich(USER, new User().pronouns("they/them"), "Keep advisory", Color.GREEN, 2, () -> true);
+        f.ui.playerUpdate(false, USER, p -> p.avatarName = "Keep avatar");
+        ScarletUI.ConnectedPlayer present = f.rows.get(USER);
+        String departed = USER + "-departed", rejoined = USER + "-rejoined";
+        f.ui.playerJoin(false, departed, "Departed", JOINED, null, null, 0, false);
+        f.ui.playerLeave(false, departed, "Departed", JOINED.plusMinutes(1));
+        f.ui.playerLeave(false, USER + "-leave-only", "Leave only", JOINED.plusMinutes(1));
+        f.ui.playerJoin(false, rejoined, "Rejoined", JOINED, null, null, 0, false);
+        f.ui.playerLeave(false, rejoined, "Rejoined", JOINED.plusMinutes(1));
+        f.ui.playerJoin(false, rejoined, "Rejoined", JOINED.plusMinutes(2), null, null, 0, false);
+        f.ui.playerUpdate(false, USER + "-pending", p -> p.avatarName = "Pending detail");
+
+        f.ui.applyClearInstanceChoice(0);
+
+        assertEquals(2, f.rows.size());
+        assertEquals(2, f.table.getRowCount());
+        assertSame(present, f.rows.get(USER));
+        assertEquals("they/them", present.pronouns);
+        assertEquals("Keep advisory", present.baseAdvisory);
+        assertEquals("Keep avatar", present.avatarName);
+        assertEquals(JOINED, present.joined);
+        assertNull(f.rows.get(rejoined).left);
+        assertTrue(f.ui.hasActivePlayers());
+        assertEquals(I18n.tr("ui.statusBar", 2, 0, 2).trim(), f.status());
+        f.ui.playerJoin(false, USER + "-pending", "Pending", JOINED, null, null, 0, false);
+        assertEquals("Pending detail", f.rows.get(USER + "-pending").avatarName);
+    }
+
+    @Test void clearingAllDepartedRowsRefreshesAnEmptyTable() throws Exception
+    {
+        Fixture f = new Fixture();
+        f.ui.instanceLocation("synthetic-instance");
+        f.join(false);
+        f.ui.playerLeave(false, USER, "Synthetic Player", JOINED.plusMinutes(1));
+        f.ui.applyClearInstanceChoice(0);
+        assertTrue(f.rows.isEmpty());
+        assertEquals(0, f.table.getRowCount());
+        assertFalse(f.ui.hasActivePlayers());
+        assertEquals(I18n.tr("ui.statusWaitingForPlayers"), f.status());
+        assertDoesNotThrow(() -> f.ui.applyClearInstanceChoice(0));
+    }
+
+    @Test void clearedDepartedPlayerCanRejoinWithoutDuplicateOrStaleDetails() throws Exception
+    {
+        Fixture f = new Fixture();
+        f.join(false);
+        f.ui.playerUpdate(false, USER, p -> p.avatarName = "Previous avatar");
+        ScarletUI.ConnectedPlayer departed = f.rows.get(USER);
+        f.ui.playerLeave(false, USER, "Synthetic Player", JOINED.plusMinutes(1));
+        f.ui.applyClearInstanceChoice(0);
+        f.ui.playerEnrich(USER, null, "Late advisory", Color.RED, 4, () -> true);
+        assertTrue(f.rows.isEmpty());
+        f.ui.playerJoin(false, USER, "Synthetic Player", JOINED.plusMinutes(2), null, null, 0, false);
+        assertEquals(1, f.rows.size());
+        assertEquals(1, f.table.getRowCount());
+        assertNotSame(departed, f.rows.get(USER));
+        assertNull(f.rows.get(USER).left);
+        assertNull(f.rows.get(USER).avatarName);
+        assertNull(f.rows.get(USER).baseAdvisory);
+        assertEquals(JOINED.plusMinutes(2), f.rows.get(USER).joined);
+    }
+
+    @Test void departedTrainingClearPreservesParkedRealInstance() throws Exception
+    {
+        Fixture f = new Fixture();
+        f.join(false);
+        f.ui.playerLeave(false, USER + "-departed", "Real departed", JOINED.plusMinutes(1));
+        f.ui.enterTrainingView();
+        f.ui.playerJoin(false, TRAINING_USER, "Training present", JOINED, null, null, 0, false);
+        f.ui.playerLeave(false, TRAINING_USER + "-departed", "Training departed", JOINED.plusMinutes(1));
+        f.ui.applyClearInstanceChoice(0);
+        assertEquals(1, f.rows.size());
+        assertTrue(f.rows.containsKey(TRAINING_USER));
+        assertEquals(1, f.table.getRowCount());
+        assertEquals(2, f.parked.size());
+        assertTrue(f.ui.hasActivePlayers());
+        f.ui.exitTrainingView();
+        assertEquals(2, f.rows.size());
+        assertEquals(2, f.table.getRowCount());
+        assertNotNull(f.rows.get(USER + "-departed").left);
+    }
+
+    @Test void fullListChoiceClearsBothPresentAndDepartedRows() throws Exception
+    {
+        Fixture f = new Fixture();
+        f.join(false);
+        f.ui.playerLeave(false, USER + "-departed", "Departed", JOINED.plusMinutes(1));
+        f.ui.applyClearInstanceChoice(1);
+        assertTrue(f.rows.isEmpty());
+        assertEquals(0, f.table.getRowCount());
+    }
+
+    @Test void cancellingOrDismissingTheChoiceLeavesTheListIntact() throws Exception
+    {
+        Fixture f = new Fixture();
+        f.join(false);
+        f.ui.playerLeave(false, USER + "-departed", "Departed", JOINED.plusMinutes(1));
+        for (int choice : new int[] { 2, -1 })
+        {
+            f.ui.applyClearInstanceChoice(choice);
+            assertEquals(2, f.rows.size());
+            assertEquals(2, f.table.getRowCount());
+            assertTrue(f.ui.hasActivePlayers());
+        }
     }
 }

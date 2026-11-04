@@ -2,7 +2,7 @@ package net.sybyline.scarlet;
 
 import io.github.vrchatapi.model.PublicProfile;
 import io.github.vrchatapi.model.User;
-import io.github.vrchatapi.model.UserStatus;
+import net.sybyline.scarlet.util.TrustRank;
 import net.dv8tion.jda.api.EmbedBuilder;
 import net.dv8tion.jda.api.entities.MessageEmbed;
 import net.dv8tion.jda.api.utils.MarkdownSanitizer;
@@ -12,7 +12,6 @@ final class ScarletVoteKickProfile
 {
     static final int BIO_LIMIT = 240;
     static final int PRONOUN_LIMIT = 80;
-    static final int STATUS_MESSAGE_LIMIT = 160;
 
     private ScarletVoteKickProfile() { }
 
@@ -34,12 +33,11 @@ final class ScarletVoteKickProfile
                 addText(builder, "Bio (excerpt)", profile.getBio(), BIO_LIMIT, false);
             }
             // A returned public profile is authoritative even when a field was cleared.
-            // Do not resurrect old cached pronouns/status text after the user removes them.
+            // Do not resurrect old cached pronouns after the user removes them.
             addText(builder, "Pronouns", profile != null ? profile.getPronouns() : user.getPronouns(), PRONOUN_LIMIT, true);
-            UserStatus status = profile != null ? profile.getStatus() : user.getStatus();
-            if (status != null) builder.addField("Status (profile snapshot)", statusLabel(status), true);
-            addText(builder, "Status message", profile != null ? profile.getStatusDescription() : user.getStatusDescription(),
-                STATUS_MESSAGE_LIMIT, false);
+            java.util.List<String> tags = profile != null ? profile.getTrustTags() : null;
+            if (tags == null && user != null) tags = user.getTags();
+            builder.addField("Trust rank", TrustRank.of(tags).toString(), true);
             return builder.build();
         }
         catch (RuntimeException ex)
@@ -93,16 +91,4 @@ final class ScarletVoteKickProfile
         return AuditEmbedBuilder.clip(escaped, Math.min(1024, maximum * 2 + 16));
     }
 
-    private static String statusLabel(UserStatus status)
-    {
-        switch (status)
-        {
-        case ACTIVE: return "Online";
-        case JOIN_ME: return "Join Me";
-        case ASK_ME: return "Ask Me";
-        case BUSY: return "Do Not Disturb";
-        case OFFLINE: return "Offline";
-        default: return "Unavailable";
-        }
-    }
 }

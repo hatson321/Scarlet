@@ -1,5 +1,17 @@
 # Building Scarlet from source
 
+## Choose the matching source
+
+Use the `scarlet-<version>-source.zip` and `SHA256SUMS.txt` attached to the
+[release you want to build](https://github.com/Hatson321/Scarlet/releases).
+Verify the archive checksum before extracting it. For development, use the
+selected Git branch; it may differ from a published release.
+
+Run the commands below from the extracted source directory containing `pom.xml`,
+`scripts/` and `libdave-maven/`. If you only want to run Scarlet, download the
+standard release JAR instead; Java is not bundled. Use Java 11 or newer, preferably
+Java 21. Building the application and its tests requires JDK 21.
+
 ## Supported maintainer toolchain
 
 | Component | Supported requirement |
@@ -56,7 +68,8 @@ system loader to satisfy a version error; use a compatible supported distributio
 
 > **PowerPC status:** the PowerPC edition remains experimental and is not part
 > of the supported Linux verification gate. Do not treat a successful x86-64
-> or AArch64 package check as PowerPC runtime validation.
+> or AArch64 package check as PowerPC runtime validation. No PowerPC JAR is attached
+> to the published 0.6.0 or 0.6.1-a11 release; it is an experimental source-build output.
 
 ## Install the prerequisites on Linux
 
@@ -135,7 +148,7 @@ JDK 21; it does not raise the application's Java 11 runtime requirement.
 ## Pinned VRChat SDK source dependency
 
 The SDK version remains **1.23.0**. Its previously declared JitPack download
-was unavailable during the A12 review. Both build entrypoints now fetch the
+was unavailable when the source-build bootstrap was introduced. Both build entrypoints now fetch the
 upstream source archive, verify its SHA-256, and build its unmodified POM using
 the upstream coordinates `io.github.vrchatapi:vrchatapi:1.23.0` locally. They do
 not extract classes from an older Scarlet JAR or need a private Maven cache.
@@ -179,11 +192,13 @@ Skip that step and the build fails like this:
           (https://jitpack.io): status code: 401, reason phrase: Unauthorized (401)
 ```
 
-**JitPack is not the problem here.** It is simply the last repository in the
-resolution order, and it answers `401 Unauthorized` — rather than `404` — for
-any artifact it does not host. So it takes the blame for an artifact that was
-never meant to come from the network at all. No JitPack account or token is
-required to build Scarlet.
+For this observed missing vendored artifact, Maven reported a JitPack `401`
+after local resolution failed. Install the three vendored modules into the same
+Maven repository used by the root build. That observation does not mean every
+JitPack `401` has this cause: inspect the failing artifact and repository first.
+The supported build uses the pinned SDK bootstrap above and does not require a
+JitPack account or token; unrelated network or authentication failures need their
+own diagnosis.
 
 ## Build outputs
 
@@ -192,10 +207,15 @@ All in `target/`:
 | Artifact | Purpose |
 |---|---|
 | `scarlet-<version>.jar` | **the one you want** — shaded, desktop natives only |
-| `scarlet-<version>-debug.jar` | same, with debug logging enabled |
+| `scarlet-<version>-debug.jar` | diagnostic build with the in-app Debug menu enabled; not the normal release download |
 | `scarlet-<version>-ppc.jar` | experimental PowerPC edition; not in the supported Linux gate |
 | `original-scarlet-<version>.jar` | pre-shade jar; not runnable on its own |
 | `SHA256SUMS-linux.txt` | SHA-256 checksums written by the Linux package verifier |
+| `SHA256SUMS-packages.txt` | SHA-256 checksums written by the Windows package verifier |
+
+The current source build produces no Android application or mobile companion.
+The published desktop assets are the standard Windows/Linux JAR, matching source
+ZIP and checksum file; building debug or PowerPC outputs does not publish them.
 
 Run with:
 
@@ -205,8 +225,11 @@ java -jar target/scarlet-<version>.jar
 
 ## Troubleshooting
 
-**`401 Unauthorized` from jitpack.io** — you skipped the `libdave-maven`
-install. See above.
+**`401 Unauthorized` from jitpack.io** — identify the failing artifact first.
+For a missing `moe.kyokobot.libdave` module at `1.0.0`, verify the local vendored
+install and shared Maven repository path. For the VRChat SDK, use the pinned
+bootstrap rather than assuming the libdave step fixes it. Other network or
+authentication failures are not explained solely by the HTTP status code.
 
 **Still failing after installing libdave** — Maven caches resolution failures
 and will not retry until they expire. Clear them:

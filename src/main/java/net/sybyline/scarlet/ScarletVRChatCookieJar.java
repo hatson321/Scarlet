@@ -181,34 +181,41 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         {
             try (BufferedReader in = new BufferedReader(MiscUtils.reader(this.cookieFile)))
             {
-                in.lines()
-                    .map(String::trim)
-                    .filter($ -> !$.isEmpty())
-                    .sequential()
-                    .forEachOrdered(this::add);
+                List<Cookie> imported = new ArrayList<>();
+                String line;
+                while ((line = in.readLine()) != null)
+                {
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    Cookie cookie = Cookie.parse(this.url, line);
+                    if (cookie == null) throw new IOException("Invalid legacy cookie entry");
+                    imported.add(cookie);
+                }
+                imported.forEach(cookie -> this.addTo(this.list, cookie));
                 save = true;
             }
             catch (IOException ioex)
             {
                 ScarletVRChat.LOG.error("Exception loading cookies", ioex);
             }
-            if (save)
-            {
-                this.cookieFile.delete();
-            }
         }
         {
             String store = this.stores.primary();
             if (store != null) try (BufferedReader in = new BufferedReader(new StringReader(store)))
             {
-                in.lines()
-                    .map(String::trim)
-                    .filter($ -> !$.isEmpty())
-                    .sequential()
-                    .forEachOrdered(this::add);
+                String line;
+                while ((line = in.readLine()) != null)
+                {
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    Cookie cookie = Cookie.parse(this.url, line);
+                    if (cookie == null) throw new IOException("Invalid stored cookie entry");
+                    this.addTo(this.list, cookie);
+                }
             }
             catch (IOException ioex)
             {
+                save = false;
                 ScarletVRChat.LOG.error("Exception loading cookies from store", ioex);
             }
         }
@@ -219,16 +226,29 @@ public class ScarletVRChatCookieJar implements CookieJar, Closeable
         }
         if (save)
         {
+            String expected = this.primaryCookieText();
             this.save();
+            if (!expected.equals(this.stores.primary()))
+                throw new IllegalStateException("Migrated cookie store verification failed; legacy file retained");
+            try { java.nio.file.Files.delete(this.cookieFile.toPath()); }
+            catch (IOException failure)
+            {
+                ScarletVRChat.LOG.warn("Encrypted cookies saved, but the legacy cookie file could not be removed", failure);
+            }
         }
     }
 
-    synchronized void save()
+    private String primaryCookieText()
     {
         StringBuilder sb = new StringBuilder();
         for (Cookie cookie : removeStale(this.list))
             sb.append(cookie.toString()).append('\n');
-        this.stores.primary(sb.toString());
+        return sb.toString();
+    }
+
+    synchronized void save()
+    {
+        this.stores.primary(this.primaryCookieText());
         this.saveAlternates();
     }
 

@@ -2,6 +2,8 @@ package net.sybyline.scarlet.util;
 
 import java.awt.GraphicsEnvironment;
 import java.util.List;
+import java.util.function.BooleanSupplier;
+import net.sybyline.scarlet.util.tts.LinuxCommandTtsProvider;
 
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
@@ -55,17 +57,7 @@ public class XdgOpenInstallDialogs
      */
     public static boolean isXdgOpenInstalled()
     {
-        try
-        {
-            Process proc = new ProcessBuilder("which", "xdg-open")
-                .redirectErrorStream(true)
-                .start();
-            return proc.waitFor() == 0;
-        }
-        catch (Exception ex)
-        {
-            return false;
-        }
+        return LinuxCommandTtsProvider.isCommandAvailable("xdg-open");
     }
 
     /**
@@ -120,25 +112,43 @@ public class XdgOpenInstallDialogs
             return false;
         }
 
-        String cmd = pm.getFullInstallCommand().replace("{pkg}", PACKAGE_NAME);
-        LOG.info("Installing xdg-utils via: {}", cmd);
+        return performInstallation(pm, new Installer()
+        {
+            public int run(boolean privileged, String command)
+            {
+                return privileged ? PkexecInstaller.run(null, "Installing xdg-utils", command)
+                    : PkexecInstaller.runUserCommand(null, "Installing xdg-utils", command);
+            }
+            public int terminal(String command)
+            {
+                return PkexecInstaller.runTerminalCommand(null, "Installing xdg-utils", command);
+            }
+        }, XdgOpenInstallDialogs::isXdgOpenInstalled);
+    }
 
+    interface Installer
+    {
+        int run(boolean privileged, String command);
+        int terminal(String command);
+    }
+
+    static boolean performInstallation(LinuxPackageManagerDetector.PackageManager pm,
+                                       Installer installer, BooleanSupplier available)
+    {
+        if (pm == null) return false;
+        String command = pm.getFullInstallCommand().replace("{pkg}", PACKAGE_NAME);
         try
         {
-            ProcessBuilder pb = new ProcessBuilder("sh", "-c", cmd);
-            pb.inheritIO();
-            Process proc = pb.start();
-            int exit = proc.waitFor();
-            boolean ok = exit == 0;
-            if (ok)
-                LOG.info("xdg-utils installed successfully");
-            else
-                LOG.error("xdg-utils installation exited with code {}", exit);
-            return ok;
+            int exit = installer.run(pm.requiresSudo, command);
+            if (exit == PkexecInstaller.NOT_STARTED || (pm.requiresSudo && exit == 127))
+                exit = installer.terminal(command);
+            boolean installed = exit == 0 && available.getAsBoolean();
+            if (!installed) LOG.warn("xdg-utils installation did not make xdg-open available (exit {})", exit);
+            return installed;
         }
-        catch (Exception ex)
+        catch (RuntimeException failure)
         {
-            LOG.error("Exception during xdg-utils installation", ex);
+            LOG.error("Exception during xdg-utils installation", failure);
             return false;
         }
     }

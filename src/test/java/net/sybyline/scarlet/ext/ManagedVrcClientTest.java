@@ -460,6 +460,19 @@ class ManagedVrcClientTest
         assertTrue(this.tracker.hasClientsOrPending());
     }
 
+    @Test void truncatedOrUnrecognizedWineNamesCannotAuthorizeAnotherLaunch()
+    {
+        for (String name : List.of("wine", "wine64", "wine-preloader", "wine64-preloader", "wine64-preloade", "wine-unknown"))
+        {
+            this.processes.entries.clear();
+            this.processes.entries.add(new ProcessInfo(77, START.minusSeconds(1), "test-user", "/synthetic/" + name, List.of()));
+            assertEquals(0, this.tracker.beginLaunch(LOCATION), name);
+            assertTrue(this.tracker.hasClientsOrPending(), name);
+            assertNull(this.tracker.current());
+            assertEquals(0, this.processes.signals);
+        }
+    }
+
     @Test void protectedNonClientNameDoesNotPretendToProveOwnership()
     {
         this.processes.entries.add(new ProcessInfo(0, null, null, "[synthetic system process]", List.of()));

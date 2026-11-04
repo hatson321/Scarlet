@@ -3916,6 +3916,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             this.startupInstanceJoin = new ScarletStartupInstanceJoin(group == null ? "" : group, OffsetDateTime.now(ZoneOffset.UTC));
             java.util.function.BooleanSupplier allowed = () -> !this.clientLaunchClosed && this.scarlet.running
                 && !this.scarlet.staffMode && this.vrchatClient_launchOnInstanceCreate.get()
+                && !this.scarlet.trainingMode.get()
                 && group != null && !group.isEmpty() && user != null && Objects.equals(user, this.scarlet.vrc.currentUserId)
                 && Objects.equals(group, this.scarlet.vrc.groupId)
                 && net.sybyline.scarlet.ext.ExtendedUserAgent.isPrimaryAuthenticationStable(generation)
@@ -4034,38 +4035,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
         if (!allowed.getAsBoolean()) return;
         try
         {
-            // Resolve the instance's short/secure name so non-public (group,
-            // friends, private) instances deep-link correctly \u2014 without it
-            // VRChat opens to the error world instead of the new instance.
-            String shortName = null;
-            try
-            {
-                Location locModel = Location.of(location);
-                if (locModel != null && locModel.world != null && locModel.instance != null)
-                {
-                    // The dedicated /shortName endpoint generates the secure join token the
-                    // client uses on a manual join; restricted (group+/age-gated) instances
-                    // are rejected into the error world with only the plain shortName.
-                    shortName = this.scarlet.vrc.getInstanceSecureName(locModel.world, locModel.instance);
-                    if (shortName == null)
-                    {
-                        io.github.vrchatapi.model.Instance inst = this.scarlet.vrc.getInstance(locModel.world, locModel.instance);
-                        if (inst != null)
-                        {
-                            if (inst.getSecureName() != null && !inst.getSecureName().trim().isEmpty())
-                                shortName = inst.getSecureName();
-                            else if (inst.getShortName() != null && !inst.getShortName().trim().isEmpty())
-                                shortName = inst.getShortName();
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LOG.warn("Could not resolve secure join information for VRChat auto-launch: {}", ScarletStartupFailure.describe(ex));
-            }
-            if (this.clientLaunchClosed || Thread.currentThread().isInterrupted() || !this.vrchatClient_launchOnInstanceCreate.get())
-                return;
+            // Resolve and validate the destination before any existing client can be closed.
+            String shortName = this.scarlet.vrc.getStartupInstanceSecureName(this.scarlet.vrc.groupId, location, allowed);
+            if (shortName == null || shortName.trim().isEmpty())
+                throw new ScarletStartupFailure(ScarletStartupFailure.Kind.SECURE_NAME_MISSING);
+            if (!allowed.getAsBoolean()) return;
             ScarletStartupRecovery.LogState before = this.scarlet.logs.startupLogState();
             VrcLaunch.launchAutomatic(this.scarlet.vrc.currentUserId, location, shortName, allowed);
             this.watchAutomaticStartup(location, before, allowed);
@@ -5053,6 +5027,24 @@ public class ScarletDiscordJDA implements ScarletDiscord
             || !Objects.equals(group, this.scarlet.vrc.groupId) || !Objects.equals(guild, this.guildSf))
             throw new IllegalStateException("Local summary cancelled or its group/server context changed");
     }
+
+    private Runnable summaryPublicationGuard(String group, String guild)
+    {
+        return this.summaryPublicationGuard(group, guild,
+            new HashSet<>(Arrays.asList(this.scarlet.secretStaffList.getSecretStaffIds())));
+    }
+
+    private Runnable summaryPublicationGuard(String group, String guild, Set<String> secretIds)
+    {
+        this.requireSummaryContext(group, guild);
+        final long revision = this.currentSummaryPrivacyRevision();
+        return () -> {
+            this.requireSummaryContext(group, guild);
+            if (revision != this.currentSummaryPrivacyRevision()
+                || !secretIds.equals(new HashSet<>(Arrays.asList(this.scarlet.secretStaffList.getSecretStaffIds()))))
+                throw new IllegalStateException("Summary privacy settings changed; request a fresh summary");
+        };
+    }
     <MCR extends MessageCreateRequest<MCR> & FluentRestAction<Message, MCR>> Message emitModSummary(Scarlet scarlet, OffsetDateTime endOfDay, long hoursBack, Function<MessageEmbed, MCR> mca)
     {
         return this.emitModSummary(scarlet, endOfDay, hoursBack, mca, scarlet.vrc.groupId, this.guildSf);
@@ -5064,15 +5056,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
     {
         if (hoursBack <= 0L) throw new IllegalArgumentException("hours-back must be greater than zero");
         OffsetDateTime startOfDay = endOfDay.minusHours(hoursBack);
-        this.requireSummaryContext(summaryGroup, summaryGuild);
-        final long privacyRevision = this.currentSummaryPrivacyRevision();
         final Set<String> secretIds = new HashSet<>(Arrays.asList(scarlet.secretStaffList.getSecretStaffIds()));
-        Runnable checkPublication = () -> {
-            this.requireSummaryContext(summaryGroup, summaryGuild);
-            if (privacyRevision != this.currentSummaryPrivacyRevision()
-                || !secretIds.equals(new HashSet<>(Arrays.asList(scarlet.secretStaffList.getSecretStaffIds()))))
-                throw new IllegalStateException("Summary privacy settings changed; request a fresh summary");
-        };
+        Runnable checkPublication = this.summaryPublicationGuard(summaryGroup, summaryGuild, secretIds);
         Function<MessageEmbed, MCR> checkedSend = embed -> {
             checkPublication.run();
             return mca.apply(embed).setCheck(() -> {
@@ -5257,6 +5242,10 @@ public class ScarletDiscordJDA implements ScarletDiscord
     }
     <MCR extends MessageCreateRequest<MCR> & FluentRestAction<Message, MCR>> Message emitOutstandingMod(Scarlet scarlet, OffsetDateTime endOfDay, long hoursBack, Function<MessageEmbed, MCR> mca)
     {
+        if (hoursBack <= 0L) throw new IllegalArgumentException("hours-back must be greater than zero");
+        final String group = scarlet.vrc.groupId;
+        Runnable checkPublication = this.summaryPublicationGuard(group, this.guildSf);
+        java.util.function.BooleanSupplier publicationAllowed = () -> { checkPublication.run(); return true; };
         List<String> list = new ArrayList<>();
         if (this.pingOnOutstandingModeration_instanceWarn.get()) list.add("group.instance.warn");
         if (this.pingOnOutstandingModeration_instanceKick.get()) list.add("group.instance.kick");
@@ -5281,18 +5270,20 @@ public class ScarletDiscordJDA implements ScarletDiscord
             .setColor(GroupAuditTypeEx.OUTSTANDING_MODERATION.color)
             .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
             .setTimestamp(endOfDay)
-            .build()).complete();
+            .build()).setCheck(publicationAllowed).complete();
         
         this.scarlet.exec.submit(() ->
         {
+            try
+            {
+            checkPublication.run();
             Map<String, List<ScarletData.AuditEntryMetadata>> map = new HashMap<>();
             Map<String, String> displayNames = new HashMap<>();
             for (GroupAuditLogEntryUnknown entry : entries)
             {
-                if (this.scarlet.secretStaffList.isSecretStaffId(entry.getActorId()))
-                    continue;
+                if (entry == null || !Objects.equals(group, entry.getGroupId())) continue;
                 ScarletData.AuditEntryMetadata entryMeta = this.scarlet.data.auditEntryMetadata(entry.getId());
-                if (entryMeta.hasAuxActor() && this.scarlet.secretStaffList.isSecretStaffId(entryMeta.auxActorId))
+                if (!ScarletAuditPrivacy.historyVisible(entry, entryMeta, this.scarlet.secretStaffList::isSecretStaffId, false))
                     continue;
                 String actorId = entryMeta != null && entryMeta.hasAuxActor() ? entryMeta.auxActorId : entry.getActorId();
                 String displayName = entryMeta != null && entryMeta.hasAuxActor() ? entryMeta.auxActorDisplayName : entry.getActorDisplayName();
@@ -5310,7 +5301,8 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 ? message.getChannel().asThreadChannel()
                 : message.isEphemeral()
                     ? message.getChannel()
-                    : message.createThreadChannel("Outstanding Moderation as of "+endOfDay).completeAfter(1000L, TimeUnit.MILLISECONDS);
+                    : message.createThreadChannel("Outstanding Moderation as of "+endOfDay)
+                        .setCheck(publicationAllowed).completeAfter(1000L, TimeUnit.MILLISECONDS);
             
             map.forEach((actorId, metas) ->
             {
@@ -5337,9 +5329,15 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 List<String> pages = MiscUtils.paginateOnLines(sb, 2000);
                 for (String page : pages)
                 {
-                    messageChannel.sendMessage(page).completeAfter(1500L, TimeUnit.MILLISECONDS);
+                    checkPublication.run();
+                    messageChannel.sendMessage(page).setCheck(publicationAllowed).completeAfter(1500L, TimeUnit.MILLISECONDS);
                 }
             });
+            }
+            catch (RuntimeException ex)
+            {
+                LOG.warn("Outstanding moderation summary stopped ({}); no further pages will be sent", ex.getClass().getSimpleName());
+            }
         });
         
         return message;
