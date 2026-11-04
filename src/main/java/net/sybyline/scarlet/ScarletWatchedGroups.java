@@ -38,11 +38,13 @@ public class ScarletWatchedGroups
     {
         this.watchedGroupsFile = watchedGroupsFile;
         this.watchedGroups = new ConcurrentHashMap<>();
-        this.load();
+        if (!this.load())
+            throw new IllegalStateException("Watched groups could not be loaded. Original data was preserved; restore or repair the file before restarting.");
     }
 
     final File watchedGroupsFile;
     Map<String, WatchedGroup> watchedGroups;
+    private boolean loadFailed;
 
     public static class WatchedGroup implements Comparable<WatchedGroup>
     {
@@ -247,17 +249,25 @@ public class ScarletWatchedGroups
         return true;
     }
 
-    public boolean load()
+    public synchronized boolean load()
     {
-        if (!this.watchedGroupsFile.isFile())
+        boolean failedBefore = this.loadFailed;
+        this.loadFailed = true;
+        try
         {
-            this.save();
-            return true;
+            if (!ScarletData.existingRecord(this.watchedGroupsFile))
+            {
+                if (failedBefore) throw new java.io.IOException("Previously unreadable watched groups must be restored or repaired before reload");
+                this.loadFailed = false;
+                return this.save();
+            }
         }
+        catch (Exception ex) { LOG.error("Could not inspect watched groups storage", ex); return false; }
         WatchedGroup[] watchedGroupsArray;
-        try (FileReader fr = new FileReader(this.watchedGroupsFile))
+        try (FileReader fr = new FileReader(this.watchedGroupsFile, java.nio.charset.StandardCharsets.UTF_8))
         {
             watchedGroupsArray = Scarlet.GSON_PRETTY.fromJson(fr, WatchedGroup[].class);
+            if (watchedGroupsArray == null) throw new java.io.IOException("Existing watched groups must contain a JSON array");
         }
         catch (Exception ex)
         {
@@ -270,15 +280,22 @@ public class ScarletWatchedGroups
             if (watchedGroup != null && watchedGroup.id != null && watchedGroup.id.startsWith("grp_"))
                 watchedGroups.put(watchedGroup.id, watchedGroup);
         this.watchedGroups = watchedGroups;
+        this.loadFailed = false;
         return true;
     }
 
-    public boolean save()
+    public synchronized boolean save()
     {
+        if (this.loadFailed)
+        {
+            LOG.error("Watched groups storage was not loaded; refusing to overwrite the original data");
+            return false;
+        }
         WatchedGroup[] watchedGroupsArray = this.watchedGroups.values().toArray(new WatchedGroup[0]);
-        try (java.io.Writer fw = FileBackups.writer(this.watchedGroupsFile))
+        try (FileBackups.AtomicWriter fw = FileBackups.writer(this.watchedGroupsFile))
         {
             Scarlet.GSON_PRETTY.toJson(watchedGroupsArray, WatchedGroup[].class, fw);
+            fw.commit();
         }
         catch (Exception ex)
         {

@@ -27,21 +27,11 @@ public enum Platform
     // =======================================================================
 
     public static final Platform CURRENT;
-    public static final boolean IS_ANDROID;
-    public static final boolean IS_TERMUX;
     public static final boolean FORCE_HEADLESS_UI;
 
     static
     {
         String s = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        String runtimeName = System.getProperty("java.runtime.name", "").toLowerCase(Locale.ROOT);
-        String vmVendor = System.getProperty("java.vm.vendor", "").toLowerCase(Locale.ROOT);
-        String vmName = System.getProperty("java.vm.name", "").toLowerCase(Locale.ROOT);
-        String javaVendor = System.getProperty("java.vendor", "").toLowerCase(Locale.ROOT);
-        String androidRoot = System.getenv("ANDROID_ROOT");
-        String androidData = System.getenv("ANDROID_DATA");
-        String termuxVersion = System.getenv("TERMUX_VERSION");
-        String prefix = System.getenv("PREFIX");
         if (s.contains("win"))
             CURRENT = NT;
         else if (s.contains("linux") || s.contains("unix"))
@@ -53,23 +43,7 @@ public enum Platform
         else
             CURRENT = OTHER;
 
-        IS_ANDROID =
-               s.contains("android")
-            || runtimeName.contains("android")
-            || vmVendor.contains("android")
-            || vmName.contains("dalvik")
-            || javaVendor.contains("android")
-            || androidRoot != null
-            || androidData != null;
-
-        IS_TERMUX =
-               termuxVersion != null
-            || (prefix != null && prefix.replace('\\', '/').contains("/com.termux/"));
-
-        FORCE_HEADLESS_UI =
-               IS_ANDROID
-            || IS_TERMUX
-            || Boolean.getBoolean("scarlet.forceHeadlessUi");
+        FORCE_HEADLESS_UI = Boolean.getBoolean("scarlet.forceHeadlessUi");
     }
 
     public boolean isNT()    { return this == NT; }
@@ -77,14 +51,6 @@ public enum Platform
     public boolean isXNU()   { return this == XNU; }
     public boolean isSun()   { return this == SUN; }
     public boolean isOther() { return this == OTHER; }
-    public static boolean isAndroid()
-    {
-        return IS_ANDROID;
-    }
-    public static boolean isTermux()
-    {
-        return IS_TERMUX;
-    }
     /**
      * @return {@code true} when the JVM reports a PowerPC CPU (32- or 64-bit,
      * either endianness), e.g. a Wii running Wii-Linux or an old PowerPC Mac.
@@ -227,10 +193,6 @@ public enum Platform
             case SUN:   os = "Solaris";  break;
             default:    os = "Unknown";  break;
         }
-        if (IS_TERMUX)
-            os += " (Termux)";
-        else if (IS_ANDROID)
-            os += " (Android)";
         return os + " / " + ARCH.canonicalName;
     }
 }

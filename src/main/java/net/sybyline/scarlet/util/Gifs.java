@@ -21,6 +21,7 @@ public interface Gifs
     static final int MAX_GIF_FRAMES = 256;
     static final int MAX_GIF_DIMENSION = 2048;
     static final long MAX_GIF_PIXELS = 2_048L * 2_048L;
+    static final long MAX_GIF_DECODED_BYTES = 128L * 1024L * 1024L;
 
     static String resolveTenorGifUrl(String url) throws IOException
     {
@@ -42,7 +43,7 @@ public interface Gifs
             if (bytes.length > MAX_GIF_BYTES)
                 throw new IOException("GIF exceeds maximum allowed size");
         }
-        GifDecoder decoder = new GifDecoder();
+        GifDecoder decoder = new GifDecoder(MAX_GIF_DIMENSION, MAX_GIF_FRAMES, MAX_GIF_DECODED_BYTES);
         int status = decoder.read(new ByteArrayInputStream(bytes));
         if (status != GifDecoder.STATUS_OK)
             throw new IOException("GIF decode failed with status " + status);

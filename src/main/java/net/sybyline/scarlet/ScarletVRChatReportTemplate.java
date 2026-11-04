@@ -84,9 +84,10 @@ public class ScarletVRChatReportTemplate
             return false;
         this.contents = contents;
         this.templateFile.getParentFile().mkdirs();
-        try (BufferedWriter out = new BufferedWriter(net.sybyline.scarlet.util.FileBackups.writer(this.templateFile)))
+        try (net.sybyline.scarlet.util.FileBackups.AtomicWriter out = net.sybyline.scarlet.util.FileBackups.writer(this.templateFile))
         {
             out.append(contents);
+            out.commit();
         }
         this.lastModified = this.templateFile.lastModified();
         return true;

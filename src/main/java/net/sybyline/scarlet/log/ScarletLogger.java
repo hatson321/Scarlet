@@ -25,16 +25,27 @@ import net.sybyline.scarlet.util.MavenDepsLoader;
 public class ScarletLogger extends LegacyAbstractLogger
 {
 
+    // Offline migration must not create or append files inside the snapshot it owns.
+    private static volatile boolean consoleOnly = Boolean.getBoolean("scarlet.offline");
+    private static final java.util.concurrent.atomic.AtomicLong errors = new java.util.concurrent.atomic.AtomicLong();
+
+    public static long errorCount() { return errors.get(); }
+
+    public static void setConsoleOnly(boolean value)
+    {
+        consoleOnly = value;
+    }
+
     private static final long serialVersionUID = -875763706664943747L;
 
     public static final String linesep = String.format("%n");
     public static final Pattern lfpattern = Pattern.compile("\\Ascarlet_log_\\d\\d\\d\\d-\\d\\d-\\d\\d_\\d\\d-\\d\\d-\\d\\d\\.txt\\z"),
-                                errpkg = Pattern.compile("^(?<ws>\\s*at\\s+)(?<pkg>net\\.sybyline\\.scarlet(\\.[\\w$]+)*)\\.(?<cls>[\\w$]+)\\.(?<mth>[\\w$<>]+)\\((?<file>[\\w$]+\\.java)\\:(?<line>\\d+)\\)$");
+                                errpkg = Pattern.compile("^(?<ws>\\s*at\\s+)(?<pkg>net\\.(?:sybyline|hatson321)\\.scarlet(\\.[\\w$]+)*)\\.(?<cls>[\\w$]+)\\.(?<mth>[\\w$<>]+)\\((?<file>[\\w$]+\\.java)\\:(?<line>\\d+)\\)$");
 
-    /** Returns the log file this session is currently writing to. Never null. */
+    /** Returns the active file, or null while offline/startup logging is console-only. */
     public static File getActiveLogFile()
     {
-        return ThreadLogEntry.logFile;
+        return consoleOnly ? null : ThreadLogEntry.logFile;
     }
     public static final Level level = level0();
     private static final boolean is_error = level.compareTo(Level.ERROR) >= 0,
@@ -46,7 +57,10 @@ public class ScarletLogger extends LegacyAbstractLogger
     {
         try
         {
-            return Level.valueOf(System.getProperty("net.sybyline.scarlet.log.level", "DEBUG"));
+            String configured = System.getProperty("net.sybyline.scarlet.log.level");
+            if (configured == null)
+                configured = System.getProperty("net.hatson321.scarlet.log.level", "DEBUG");
+            return Level.valueOf(configured);
         }
         catch (Exception ex)
         {
@@ -103,6 +117,7 @@ public class ScarletLogger extends LegacyAbstractLogger
     @Override
     protected void handleNormalizedLoggingCall(Level level, Marker marker, String messagePattern, Object[] arguments, Throwable throwable)
     {
+        if (level == Level.ERROR) errors.incrementAndGet();
         LocalDateTime now = LocalDateTime.now();
         FormattingTuple result = MessageFormatter.arrayFormat(messagePattern, arguments);
         PrintStream stream = level == Level.ERROR ? System.err : System.out;
@@ -136,7 +151,12 @@ public class ScarletLogger extends LegacyAbstractLogger
                 .collect(Collectors.joining(linesep, logMessage, linesep));
             throwable = null;
         }
-        ThreadLogEntry.logEntry(stream, logMessage, throwable);
+        if (consoleOnly)
+        {
+            stream.print(logMessage);
+            if (throwable != null) throwable.printStackTrace(stream);
+        }
+        else ThreadLogEntry.logEntry(stream, logMessage, throwable);
     }
 
     static class ThreadLogEntry
@@ -166,11 +186,11 @@ public class ScarletLogger extends LegacyAbstractLogger
         static
         {
             printer_thread.setDaemon(true);
-            printer_thread.setName("KozyBlake/Scarlet Logging Thread");
+            printer_thread.setName("Hatson321/Scarlet Logger Logging Thread");
             printer_thread.start();
             
             shutdown_thread.setDaemon(true);
-            shutdown_thread.setName("KozyBlake/Scarlet Logging Shutdown Hook");
+            shutdown_thread.setName("Hatson321/Scarlet Logger Logging Shutdown Hook");
             Runtime.getRuntime().addShutdownHook(shutdown_thread);
             
             File logDir = logFile.getParentFile();

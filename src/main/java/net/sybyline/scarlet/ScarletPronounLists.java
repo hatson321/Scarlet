@@ -187,7 +187,7 @@ public class ScarletPronounLists
             target.addAll(Arrays.asList(defaults));
             return;
         }
-        try (FileReader fr = new FileReader(file))
+        try (FileReader fr = new FileReader(file, java.nio.charset.StandardCharsets.UTF_8))
         {
             String[] arr = Scarlet.GSON_PRETTY.fromJson(fr, String[].class);
             if (arr != null)
@@ -204,9 +204,10 @@ public class ScarletPronounLists
 
     private void saveFile(File file, String[] values, String label)
     {
-        try (java.io.Writer fw = FileBackups.writer(file))
+        try (FileBackups.AtomicWriter fw = FileBackups.writer(file))
         {
             Scarlet.GSON_PRETTY.toJson(values, String[].class, fw);
+            fw.commit();
         }
         catch (Exception ex)
         {

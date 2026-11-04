@@ -4,6 +4,7 @@ import java.awt.GraphicsEnvironment;
 import net.sybyline.scarlet.util.FileBackups;
 import java.awt.Rectangle;
 import java.io.Console;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.Reader;
 import java.io.Writer;
@@ -30,6 +31,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.Base64;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -66,6 +68,7 @@ public class ScarletSettings
 
     static final Logger LOG = LoggerFactory.getLogger("Scarlet/Settings");
     private static final String BACKUP_WARNING_ACK_FILENAME = "backup-warning-ack-v1.flag";
+    static final String INTERIM_NAMESPACE_RECONCILED_KEY = "__scarlet_interim_namespace_reconciled_v1";
     private static final String globalPW = Optional.ofNullable(System.getenv("SCARLET_GLOBAL_PW")).orElseGet(() -> System.getProperty("scarlet.global.pw", fallbackGlobalPw()));
 
     private static String fallbackGlobalPw()
@@ -126,11 +129,17 @@ public class ScarletSettings
 
     public ScarletSettings(Scarlet scarlet, File settingsFile)
     {
+        this(scarlet, settingsFile, true);
+    }
+
+    /** JSON-only construction for hermetic validation tests; never opens Preferences. */
+    ScarletSettings(Scarlet scarlet, File settingsFile, boolean initializePreferences)
+    {
         this.scarlet = scarlet;
         this.settingsFile = settingsFile;
         this.settingsFileLastModified = settingsFile.lastModified();
         this.hasVersionChangedSinceLastRun = null;
-        this.warnBackupBeforeSecureStoreChanges();
+        if (initializePreferences) this.warnBackupBeforeSecureStoreChanges();
         // Preferences.userNodeForPackage() touches the Windows Registry, and
         // EncryptedPrefs runs PBKDF2 with 100k iterations — both are slow on
         // Windows. We kick them off immediately on a background thread so they
@@ -143,6 +152,7 @@ public class ScarletSettings
             {
                 ScarletSettings.this.prefsInitStage = "opening Preferences user node";
                 Preferences prefs = Preferences.userNodeForPackage(Scarlet.class);
+                migrateInterimPreferencesIfSafe(prefs);
                 ScarletSettings.this.globalPreferences = prefs;
                 ScarletSettings.this.preferences = prefs;
                 ScarletSettings.this.prefsInitStage = "opening encrypted preference wrapper";
@@ -192,7 +202,8 @@ public class ScarletSettings
         prefsInitThread.setDaemon(true);
         this.prefsInitThread = prefsInitThread;
         LOG.info("Initializing secure preference store in background");
-        prefsInitThread.start();
+        if (initializePreferences) prefsInitThread.start();
+        else this.prefsReady.countDown();
         this.json = null;
         this.lastRunVersion = new RegistryString("lastRunVersion");
         this.lastRunTime = new RegistryOffsetDateTime("lastRunTime");
@@ -228,24 +239,20 @@ public class ScarletSettings
         File watchedAvatarsFile = dataDir != null ? new File(dataDir, "watched_avatars.json") : null;
         File goodPronounsFile = dataDir != null ? new File(dataDir, "good_pronoun.json") : null;
         File badPronounsFile = dataDir != null ? new File(dataDir, "bad_pronoun.json") : null;
-        String legacyPrefsNode = "/net/sybyline/scarlet",
-               legacyPrefsStore = isWindows()
-                   ? "Windows Java Preferences registry node HKEY_CURRENT_USER\\Software\\JavaSoft\\Prefs\\net\\sybyline\\scarlet"
-                   : "Java Preferences node " + legacyPrefsNode;
+        String legacyPrefsStore = "Earlier Scarlet Java Preferences node (retained unchanged)";
         String dataDirText = dataDir != null ? dataDir.getAbsolutePath() : "(unavailable)",
                settingsDirText = settingsParent != null ? settingsParent.getAbsolutePath() : dataDirText;
         String message =
-            "Back up your KozyBlake/Scarlet data before startup continues.\n\n" +
-            "KozyBlake/Scarlet may reinitialize or lose access to previously stored secure settings and credentials during initialization.\n" +
+            "Back up your Hatson321/Scarlet Logger data before startup continues.\n\n" +
+            "Scarlet Logger may reinitialize or lose access to previously stored secure settings and credentials during initialization.\n" +
             "If something goes wrong, a backup is the safest way to recover.\n\n" +
-            "Any previously stored secure credentials from older installs will not carry over automatically.\n" +
-            "You will need to enter your secure values again after this update.\n" +
-            "Older secure credential wrappers are not auto-migrated anymore.\n\n" +
+            "Previously stored secure credentials are copied only when Scarlet can verify their encryption seed safely.\n" +
+            "If that verification cannot be completed, the earlier store is left unchanged and you may need to enter secure values again.\n\n" +
             "Data that could be reset, reverted, or need recovery includes:\n" +
             " - Discord bot token\n" +
             " - VRChat usernames, passwords, TOTP secrets, and cookie/session data\n" +
             " - Other secure values stored in the Java Preferences credential store\n\n" +
-            "The early secure-store initialization path does not rewrite KozyBlake/Scarlet's JSON data files.\n" +
+            "The early secure-store initialization path does not rewrite Scarlet Logger's JSON data files.\n" +
             "That means files like watched groups, pronoun lists, watched avatars, and most other JSON-backed data should remain in place during this step.\n" +
             "You should still back them up first as a fail-safe.\n\n" +
             "Recommended current files/folders to copy now:\n" +
@@ -262,19 +269,18 @@ public class ScarletSettings
             " - " + legacyPrefsStore + "\n" +
             " - Legacy plain-text settings keys may also exist in " + pathOrUnavailable(settingsFile) + " as vrc_username / vrc_password / vrc_secret\n\n" +
             "Startup will continue after this reminder is acknowledged.";
-        LOG.warn("Back up KozyBlake/Scarlet data before initialization continues. Most non-JSON secure settings will need to be re-entered, and older secure wrappers are no longer auto-migrated. JSON-backed files are not expected to be rewritten during the early secure-store initialization path. Recommended backup path(s): {}, {}. Legacy credential storage: {}",
+        LOG.warn("Back up Hatson321/Scarlet Logger data before initialization continues. Secure settings are migrated only when the existing encryption seed can be verified; otherwise they may need to be re-entered. JSON-backed files are not expected to be rewritten during early secure-store initialization. Recommended backup path(s): {}, {}. Earlier credential storage: {}",
             dataDirText,
             settingsDirText,
             legacyPrefsStore);
         System.err.println();
         System.err.println("===========================================");
-        System.err.println("  BACK UP YOUR KOZYBLAKE/SCARLET DATA BEFORE CONTINUING");
-        System.err.println("  Previously stored secure credentials will not carry over.");
-        System.err.println("  You will need to enter secure values again.");
-        System.err.println("  Older secure credential wrappers are not auto-migrated.");
+        System.err.println("  BACK UP YOUR HATSON321/SCARLET LOGGER DATA BEFORE CONTINUING");
+        System.err.println("  Secure credentials migrate only when their encryption seed can be verified.");
+        System.err.println("  If verification fails, you may need to enter secure values again.");
         System.err.println("  This can affect Discord bot token and VRChat credentials/cookies.");
         System.err.println("  The early secure-store initialization path is not expected");
-        System.err.println("  to rewrite KozyBlake/Scarlet's JSON data files, but back them up anyway.");
+        System.err.println("  to rewrite Scarlet Logger's JSON data files, but back them up anyway.");
         System.err.println("  Recommended current backup path(s):");
         System.err.println("   - " + dataDirText);
         System.err.println("   - " + settingsDirText);
@@ -292,14 +298,14 @@ public class ScarletSettings
         System.err.println();
         if (this.scarlet != null && this.scarlet.splash != null)
         {
-            this.scarlet.splash.splashSubtext("Back up KozyBlake/Scarlet data before continuing");
+            this.scarlet.splash.splashSubtext("Back up Hatson321/Scarlet Logger data before continuing");
         }
         if (!GraphicsEnvironment.isHeadless())
         {
             JOptionPane.showMessageDialog(
                 null,
                 net.sybyline.scarlet.ui.Swing.dialogMessage(message),
-                "Back Up KozyBlake/Scarlet Data",
+                "Back Up Hatson321/Scarlet Logger Data",
                 JOptionPane.WARNING_MESSAGE);
         }
         acknowledgeBackupWarning(dataDir);
@@ -404,6 +410,239 @@ public class ScarletSettings
     }
 
     /**
+     * Reconciles Java Preferences written by the short-lived interim package namespace back into
+     * the restored Sybyline namespace. The interim encryption seed must verify. Before any write,
+     * the source and any populated destination are exported to owner-only backup files. If both
+     * nodes contain data, the interim state is selected only when it has a demonstrably newer
+     * last-run timestamp. A durable marker makes a completed reconciliation idempotent. The
+     * interim source node is never changed or removed.
+     */
+    static void migrateInterimPreferencesIfSafe(Preferences current)
+    {
+        if (current == null)
+            return;
+        try
+        {
+            Preferences root = Preferences.userRoot();
+            String interimPath = interimPreferencesNodePath();
+            if (current.absolutePath().equals(interimPath))
+                return;
+            if (current.getBoolean(INTERIM_NAMESPACE_RECONCILED_KEY, false))
+            {
+                if (EncryptedPrefs.tryReadLocalPassword(current, Scarlet.dir, globalPW) == null
+                    && !ensureImportedInterimSeedIsRewrapped(current, globalPW))
+                    LOG.error("Restored Scarlet Preferences are marked as namespace-reconciled, but their encryption seed could not be verified or re-wrapped; the retained interim node will not overwrite them");
+                return;
+            }
+            boolean interimNodeExists = root.nodeExists(interimPath);
+            Preferences interim = interimNodeExists ? root.node(interimPath) : null;
+            boolean interimHasPreferenceData = interim != null && preferenceNodeHasData(interim);
+            // A completed secure-store cutover intentionally leaves the Preferences node empty and
+            // keeps the only seed copy in secure-prefs.dat. Use the current node merely as a record
+            // reader in that case; the helper still derives and looks up the interim-path seed.
+            Preferences seedRecords = interim != null ? interim : current;
+            String localPassword = EncryptedPrefs.tryReadLocalPasswordForPath(
+                seedRecords,
+                Scarlet.dir,
+                interimPath,
+                globalPW);
+            if (localPassword == null)
+            {
+                if (interimNodeExists)
+                    LOG.warn("Interim Scarlet secure preferences were detected, but their encryption seed could not be verified; no preference data was copied");
+                return;
+            }
+            boolean currentHasData = preferenceNodeHasData(current);
+            if (currentHasData)
+            {
+                String interimLastRun = interimHasPreferenceData ? interim.get("lastRunTime", null) : null;
+                if (!shouldPreferInterimState(current.get("lastRunTime", null), interimLastRun))
+                {
+                    LOG.warn("Both restored and interim Scarlet Preferences contain data, but the interim state was not demonstrably newer; both nodes were left untouched");
+                    return;
+                }
+            }
+
+            if (interimHasPreferenceData && !backupPreferenceNode(interim, "interim-hatson321"))
+            {
+                LOG.warn("Interim Scarlet Preferences could not be backed up; namespace reconciliation was cancelled");
+                return;
+            }
+            if (currentHasData && !backupPreferenceNode(current, "restored-sybyline"))
+            {
+                LOG.warn("Restored Scarlet Preferences could not be backed up; namespace reconciliation was cancelled");
+                return;
+            }
+
+            clearPreferenceTree(current);
+            if (interimHasPreferenceData)
+                copyPreferenceTree(interim, current);
+            EncryptedPrefs.installLocalPassword(current, globalPW, localPassword);
+            current.putBoolean(INTERIM_NAMESPACE_RECONCILED_KEY, true);
+            current.flush();
+            LOG.info("Safely reconciled interim Scarlet Preferences into the restored namespace; owner-only backups were written where applicable and the interim node was retained unchanged");
+        }
+        catch (Exception ex)
+        {
+            LOG.warn("Could not safely copy interim Scarlet Preferences; the interim node was retained unchanged", ex);
+        }
+    }
+
+    static String interimPreferencesNodePath()
+    {
+        return new String(new char[] {
+            '/', 'n', 'e', 't', '/', 'h', 'a', 't', 's', 'o', 'n', '3', '2', '1', '/',
+            's', 'c', 'a', 'r', 'l', 'e', 't'
+        });
+    }
+
+    static boolean shouldPreferInterimState(String currentLastRun, String interimLastRun)
+    {
+        OffsetDateTime current = parsePreferenceTimestamp(currentLastRun);
+        OffsetDateTime interim = parsePreferenceTimestamp(interimLastRun);
+        // A shared seed proves only that both stores are decryptable; it says nothing about which
+        // state is newer. Requiring two valid timestamps and a strict ordering prevents the retained
+        // interim node from rolling the restored node back on every subsequent startup.
+        return current != null && interim != null && interim.isAfter(current);
+    }
+
+    /**
+     * Ensures that Preferences normalized from the interim package namespace have a local-password
+     * record wrapped for the restored namespace. The imported XML and file mirror retain the
+     * interim-path record, so it can be verified and re-wrapped without modifying that record.
+     */
+    static boolean ensureImportedInterimSeedIsRewrapped(Preferences current, String activeGlobalPassword)
+    {
+        if (current == null || activeGlobalPassword == null)
+            return false;
+        if (EncryptedPrefs.tryReadLocalPassword(current, Scarlet.dir, activeGlobalPassword) != null)
+            return true;
+        String localPassword = EncryptedPrefs.tryReadLocalPasswordForPath(
+            current,
+            Scarlet.dir,
+            interimPreferencesNodePath(),
+            activeGlobalPassword);
+        if (localPassword == null)
+            return false;
+        try
+        {
+            if (preferenceNodeHasData(current) && !backupPreferenceNode(current, "imported-interim-before-seed-rewrap"))
+                return false;
+            EncryptedPrefs.installLocalPassword(current, activeGlobalPassword, localPassword);
+            current.putBoolean(INTERIM_NAMESPACE_RECONCILED_KEY, true);
+            current.flush();
+            return EncryptedPrefs.tryReadLocalPassword(current, Scarlet.dir, activeGlobalPassword) != null;
+        }
+        catch (Exception ex)
+        {
+            LOG.warn("Could not safely re-wrap the imported interim Scarlet preference seed", ex);
+            return false;
+        }
+    }
+
+    /** Returns the active imported-store password without creating or changing a key file. */
+    static String currentImportedGlobalPassword()
+    {
+        String environment = System.getenv("SCARLET_GLOBAL_PW");
+        if (environment != null)
+            return environment;
+        String property = System.getProperty("scarlet.global.pw");
+        if (property != null)
+            return property;
+        try
+        {
+            File dir = Scarlet.dir;
+            if (dir == null)
+                return null;
+            Path key = new File(dir, "global-prefs.key").toPath();
+            if (!Files.isRegularFile(key))
+                return null;
+            String value = new String(Files.readAllBytes(key), StandardCharsets.UTF_8).trim();
+            return value.isEmpty() ? null : value;
+        }
+        catch (Exception ex)
+        {
+            LOG.warn("Could not read the imported Scarlet preference encryption key", ex);
+            return null;
+        }
+    }
+
+    private static OffsetDateTime parsePreferenceTimestamp(String value)
+    {
+        if (value == null)
+            return null;
+        try
+        {
+            return OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+        }
+        catch (RuntimeException ex)
+        {
+            return null;
+        }
+    }
+
+    private static boolean preferenceNodeHasData(Preferences node) throws BackingStoreException
+    {
+        return node.keys().length != 0 || node.childrenNames().length != 0;
+    }
+
+    private static void clearPreferenceTree(Preferences node) throws BackingStoreException
+    {
+        for (String childName : node.childrenNames())
+            node.node(childName).removeNode();
+        for (String key : node.keys())
+            node.remove(key);
+        node.flush();
+    }
+
+    private static void copyPreferenceTree(Preferences source, Preferences destination) throws BackingStoreException
+    {
+        for (String key : source.keys())
+        {
+            String value = source.get(key, null);
+            if (value != null)
+                destination.put(key, value);
+        }
+        for (String childName : source.childrenNames())
+            copyPreferenceTree(source.node(childName), destination.node(childName));
+    }
+
+    private static boolean backupPreferenceNode(Preferences node, String label)
+    {
+        File dataDir = Scarlet.dir;
+        if (dataDir == null)
+            return false;
+        try
+        {
+            Path directory = new File(dataDir, "preference-namespace-backups").toPath();
+            Files.createDirectories(directory);
+            try
+            {
+                Files.setPosixFilePermissions(directory, EnumSet.of(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.OWNER_EXECUTE));
+            }
+            catch (UnsupportedOperationException ignored)
+            {
+            }
+            String timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
+                .withZone(ZoneOffset.UTC)
+                .format(java.time.Instant.now());
+            Path backup = directory.resolve(timestamp + "-" + label + ".xml");
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            node.exportSubtree(bytes);
+            writeOwnerOnlyNewFile(backup, bytes.toByteArray());
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LOG.warn("Could not create owner-only backup for Preferences node {}", node.absolutePath(), ex);
+            return false;
+        }
+    }
+
+    /**
      * Reconcile the registry and the data-folder secure-store file without destroying anything, and
      * return a plain report. When {@code cutover} is true and the file already byte-matches every
      * registry entry, the registry is snapshotted and then emptied so the file becomes the primary
@@ -446,6 +685,7 @@ public class ScarletSettings
     Preferences preferences;
     EncryptedPrefs encrypted;
     private JsonObject json;
+    private boolean jsonLoadFailed;
     public final RegistryString lastRunVersion;
     public final RegistryString lastAnnouncementId;
     public final RegistryOffsetDateTime lastRunTime, lastAuditQuery, lastInstancesCheck, lastAuthRefresh, lastUpdateCheck, lastAnnouncementCheck, nextPollAction, nextModSummary, nextOutstandingMod;
@@ -536,34 +776,35 @@ public class ScarletSettings
         {
             return this.type;
         }
-        public T get()
+        public synchronized T get()
         {
             T cached_ = this.cached;
             if (cached_ == null)
             {
-                cached_ = ScarletSettings.this.getObject(this.id, this.type);
-                this.cached = cached_;
-            }
-            if (cached_ == null)
-            {
-                cached_ = this.ifNull.get();
+                T stored = ScarletSettings.this.getObject(this.id, this.type);
+                cached_ = stored == null ? null : this.validate.apply(stored);
+                if (cached_ == null)
+                {
+                    T fallback = this.ifNull.get();
+                    cached_ = fallback == null ? null : this.validate.apply(fallback);
+                }
+                if (cached_ != null && !Objects.deepEquals(stored, cached_))
+                    ScarletSettings.this.setObject(this.id, this.type, cached_);
                 this.cached = cached_;
             }
             return cached_;
         }
-        public boolean set(T value_, String source)
+        public synchronized boolean set(T value_, String source)
         {
             T prev = this.cached;
-            if (Objects.deepEquals(prev, value_))
-                return true;
             if (value_ == null)
                 value_ = this.ifNull.get();
-            T validated = this.validate.apply(value_);
+            T validated = value_ == null ? null : this.validate.apply(value_);
             boolean valid = validated != null;
             if (valid)
             {
-                this.cached = value_;
-                ScarletSettings.this.setObject(this.id, this.type, value_);
+                this.cached = validated;
+                ScarletSettings.this.setObject(this.id, this.type, validated);
             }
             this.listeners.onMaybeChange(prev, valid ? validated : value_, valid, source);
             return valid;
@@ -585,6 +826,58 @@ public class ScarletSettings
         protected <TT> TT visit(FileValuedVisitor<TT> visitor)
         {
             return visitor.visitBoolean(this, this.defaultValue);
+        }
+    }
+    /** A default-off permission that can only be newly enabled by an explicit confirmation. */
+    public class FileValuedConsentBoolean extends FileValuedBoolean
+    {
+        public FileValuedConsentBoolean(String id, String name)
+        {
+            super(id, name, false);
+        }
+        private long consentGeneration;
+
+        /** Generic settings writers may revoke permission, but cannot grant it. */
+        @Override
+        public synchronized boolean set(Boolean value, String source)
+        {
+            this.consentGeneration++;
+            if (Boolean.TRUE.equals(value))
+                return Boolean.TRUE.equals(this.get());
+            return super.set(Boolean.FALSE, source);
+        }
+
+        /**
+         * Prompts outside the setting lock so a concurrent revoke can take effect.
+         * A revoke or newer attempt invalidates any earlier pending approval.
+         */
+        public boolean setWithConsent(Boolean value, String source, BooleanSupplier confirmation)
+        {
+            if (!Boolean.TRUE.equals(value))
+                return this.set(Boolean.FALSE, source);
+            final long generation;
+            synchronized (this)
+            {
+                if (Boolean.TRUE.equals(this.get()))
+                    return true;
+                generation = ++this.consentGeneration;
+            }
+            boolean approved = false;
+            try
+            {
+                approved = confirmation != null && confirmation.getAsBoolean();
+            }
+            catch (RuntimeException ex)
+            {
+                LOG.warn("Consent confirmation failed for setting {}; permission was not granted", this.id);
+            }
+            synchronized (this)
+            {
+                if (generation != this.consentGeneration)
+                    return false;
+                this.consentGeneration++;
+                return approved && super.set(Boolean.TRUE, source);
+            }
         }
     }
     public class FileValuedIntRange extends FileValued<Integer>
@@ -834,7 +1127,7 @@ public class ScarletSettings
         protected void write(String string)
         {
             ScarletSettings.this.awaitPrefs("writing encrypted preference " + this.name);
-            (this.globalOnly ? ScarletSettings.this.globalEncrypted : ScarletSettings.this.encrypted).put(this.name, string);
+            (this.globalOnly ? ScarletSettings.this.globalEncrypted : ScarletSettings.this.encrypted).putVerified(this.name, string);
         }
         /**
          * Removes this encrypted value from both the global and namespace
@@ -921,43 +1214,70 @@ public class ScarletSettings
         JsonObject json = this.json;
         if (json != null)
             return json;
-        if (this.settingsFile.exists())
+        try
         {
-            try (Reader r = MiscUtils.reader(this.settingsFile))
+            if (ScarletData.existingRecord(this.settingsFile))
             {
-                json = Scarlet.GSON_PRETTY.fromJson(r, JsonObject.class);
+                try (Reader r = this.openSettingsReader())
+                {
+                    json = Scarlet.GSON_PRETTY.fromJson(r, JsonObject.class);
+                }
+                catch (Exception ex)
+                {
+                    // An inaccessible newer primary cannot safely be replaced by an older
+                    // backup: the original bytes may not even be readable for preservation.
+                    if (physicalReadFailure(ex)) throw ex;
+                    LOG.error("Exception loading settings", ex);
+                }
+                // Keep the existing valid-backup recovery, but never invent an empty config
+                // when an existing primary and every available backup cannot be read.
+                if (json == null) json = loadNewestGoodBackup();
+                if (json == null) throw new java.io.IOException("No readable settings object or valid backup");
             }
-            catch (Exception ex)
+            else
             {
-                LOG.error("Exception loading settings", ex);
-                json = null;
+                if (this.jsonLoadFailed)
+                    throw new java.io.IOException("Previously unreadable settings were removed; restore or repair them before reloading");
+                json = new JsonObject();
             }
-            // The file exists but came back empty / whitespace / literal-null (Gson returns null
-            // without throwing) or unparseable (throws) -- i.e. truncated or corrupt, which after a
-            // hard crash / power loss / BSOD is exactly how settings appear to "reset". Before
-            // falling back to a blank config, recover the newest parseable dated backup so the
-            // team's UI and configuration survive an unclean shutdown.
-            if (json == null)
-                json = loadNewestGoodBackup();
+            this.jsonLoadFailed = false;
+            this.json = json;
+            return json;
         }
-        // Missing file (fresh install or a deliberate reset) -- or no usable backup -- starts blank.
-        if (json == null)
-            json = new JsonObject();
-        this.json = json;
-        return json;
+        catch (Exception ex)
+        {
+            this.jsonLoadFailed = true;
+            throw new java.io.UncheckedIOException("Settings could not be read; saved files were preserved. Restore or repair settings.json before retrying.",
+                ex instanceof java.io.IOException ? (java.io.IOException) ex : new java.io.IOException(ex));
+        }
+    }
+
+    Reader openSettingsReader() throws java.io.IOException { return MiscUtils.reader(this.settingsFile); }
+
+    private static boolean physicalReadFailure(Throwable failure)
+    {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause())
+            if (cause instanceof SecurityException || (cause instanceof java.io.IOException
+                && !(cause instanceof com.google.gson.stream.MalformedJsonException)
+                && !(cause instanceof java.io.EOFException))) return true;
+        return false;
     }
 
     private JsonObject loadNewestGoodBackup()
     {
         for (File bak : FileBackups.backupsNewestFirst(this.settingsFile))
         {
-            try (Reader r = MiscUtils.reader(bak))
+            try
             {
-                JsonObject recovered = Scarlet.GSON_PRETTY.fromJson(r, JsonObject.class);
-                if (recovered != null && recovered.size() > 0)
+                if (!ScarletData.existingRecord(bak)) continue;
+                try (Reader r = MiscUtils.reader(bak))
                 {
-                    LOG.warn("settings.json was empty or corrupt (likely an unclean shutdown); recovered {} setting(s) from backup {}", recovered.size(), bak.getName());
-                    return recovered;
+                    JsonObject recovered = Scarlet.GSON_PRETTY.fromJson(r, JsonObject.class);
+                    if (recovered != null && recovered.size() > 0)
+                    {
+                        LOG.warn("settings.json was empty or corrupt (likely an unclean shutdown); recovered {} setting(s) from backup {}", recovered.size(), bak.getName());
+                        return recovered;
+                    }
                 }
             }
             catch (Exception ex)
@@ -970,18 +1290,23 @@ public class ScarletSettings
 
     public synchronized void saveJson()
     {
+        if (this.jsonLoadFailed)
+            throw new java.io.UncheckedIOException(new java.io.IOException("Settings save refused because the existing file could not be read. Restore or repair it first."));
         JsonObject json = this.json;
         if (json == null)
             return;
         if (!this.settingsFile.getParentFile().isDirectory())
             this.settingsFile.getParentFile().mkdirs();
-        try (Writer w = FileBackups.writer(this.settingsFile))
+        try (FileBackups.AtomicWriter w = FileBackups.writer(this.settingsFile))
         {
             Scarlet.GSON_PRETTY.toJson(json, JsonObject.class, w);
+            w.commit();
         }
         catch (Exception ex)
         {
             LOG.error("Exception saving settings", ex);
+            throw new java.io.UncheckedIOException("Settings were not saved. In-memory changes remain available for retry; the previous file was not deliberately replaced.",
+                ex instanceof java.io.IOException ? (java.io.IOException) ex : new java.io.IOException(ex));
         }
     }
 
@@ -999,7 +1324,8 @@ public class ScarletSettings
             if (!elem.isJsonNull())
                 return elem.getAsString();
         }
-        return System.getProperty("net.sybyline.scarlet.setting."+key);
+        String value = System.getProperty("net.sybyline.scarlet.setting."+key);
+        return value != null ? value : System.getProperty("net.hatson321.scarlet.setting."+key);
     }
     public synchronized void setString(String key, String value)
     {

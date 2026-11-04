@@ -44,8 +44,9 @@ import java.util.Objects;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.Base64;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
@@ -54,6 +55,7 @@ import java.util.stream.Stream;
 import javax.swing.JOptionPane;
 
 import org.scalasbt.ipcsocket.UnixDomainServerSocket;
+import org.scalasbt.ipcsocket.UnixDomainSocket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,7 +63,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
 import io.github.vrchatapi.model.Avatar;
-import io.github.vrchatapi.model.GroupAuditLogEntry;
+import io.github.vrchatapi.model.GroupAuditLogEntryUnknown;
 import io.github.vrchatapi.model.GroupInstance;
 import io.github.vrchatapi.model.GroupPermissions;
 import io.github.vrchatapi.model.User;
@@ -89,7 +91,7 @@ import net.sybyline.scarlet.util.EnforcementListState;
 
 public class Scarlet implements Closeable
 {
-    private static final String DATA_FOLDER_NOTICE_ACK_FILENAME = "kozyblake-data-folder-notice-v1.flag";
+    private static final String DATA_FOLDER_NOTICE_ACK_FILENAME = "hatson321-scarlet-logger-data-folder-notice-v1.flag";
     static final String DEFAULT_AUTO_INVITE_GROUP_ID = "grp_abc12345-6789-0abc-def0-123456789abc";
     private static final long META_CACHE_BUSTER_INTERVAL_MILLIS = 5L * 60L * 1_000L;
     private static final Pattern SAFE_RELEASE_TAG = Pattern.compile("^[A-Za-z0-9._+-]+$");
@@ -154,29 +156,21 @@ public class Scarlet implements Closeable
     }
 
     public static final String
-        GROUP = "KozyBlake",
-        LEGACY_GROUP = legacyGroupName(),
-        NAME = "Scarlet",
+        GROUP = "Hatson321",
+        NAME = "Scarlet Logger",
         VERSION = appVersion(),
         APP_NAME = GROUP+"/"+NAME,
         FORK_GROUP = GROUP,
-        FORK_REPOSITORY = NAME,
-        FORK_NOTE = "Fork by KozyBlake \u2014 Windows & Linux",
-        DEV_DISCORD = "Discord:@vinyarion/Vinyarion#0292/393412191547555841",
-        SCARLET_DISCORD_URL = "https://discord.gg/CP3AyhypBF",
+        FORK_REPOSITORY = "Scarlet",
+        FORK_NOTE = "Maintained by Hatson321 \u2014 Windows & Linux",
 
-        // ── Fork repository (KozyBlake) ────────────────────────────────────────
-        // This is the maintained fork. GITHUB_URL points here so update checks,
-        // licence links, and help menu entries reflect the active repository.
+        // Maintained repository and support endpoints.
         FORK_GITHUB_URL = "https://github.com/"+FORK_GROUP+"/"+FORK_REPOSITORY,
         GITHUB_URL = FORK_GITHUB_URL,
-
-        // ── VRChat groups ──────────────────────────────────────────────────────
-        SCARLET_VRCHAT_GROUP_ID = "grp_eb2eb120-67bd-404e-9665-498f567cb56d",
-        SCARLET_VRCHAT_GROUP_URL = "https://vrchat.com/home/group/"+SCARLET_VRCHAT_GROUP_ID,
+        SUPPORT_URL = GITHUB_URL+"/issues",
 
         USER_AGENT_NAME = GROUP+"-"+NAME,
-        USER_AGENT = USER_AGENT_NAME+"/"+VERSION+" "+DEV_DISCORD+"; "+SCARLET_DISCORD_URL+"; "+GITHUB_URL,
+        USER_AGENT = USER_AGENT_NAME+"/"+VERSION+"; "+GITHUB_URL,
         LICENSE_URL = GITHUB_URL+"?tab=MIT-1-ov-file",
         // Single endpoint that carries both update-version metadata and the
         // optional broadcast announcement. See {@link ScarletMeta}.
@@ -206,18 +200,46 @@ public class Scarlet implements Closeable
             if (implementationVersion != null && !implementationVersion.trim().isEmpty())
                 return implementationVersion.trim();
         }
-        return "0.4.20";
+        return "0.6.0";
     }
 
     public static void main(String[] args) throws Exception
     {
+        ScarletLogger.setConsoleOnly(true);
         launchArgs = args == null ? new String[0] : args.clone();
         Thread.setDefaultUncaughtExceptionHandler(Scarlet::uncaughtException);
+        if (ScarletOfflineTools.isOfflineCommand(launchArgs))
+        {
+            ScarletLogger.setConsoleOnly(true);
+            try { ScarletOfflineTools.run(launchArgs); }
+            catch (Exception failure)
+            {
+                ScarletOfflineTools.showFailure(failure);
+                System.exit(1);
+            }
+            return;
+        }
+        // Argument-aware discovery must not copy legacy data during an offline operation.
+        resolveDataDirectory(true);
+        if (ScarletStartupRestore.shouldOffer(dir, GraphicsEnvironment.isHeadless()))
+        {
+            ScarletLogger.setConsoleOnly(true);
+            if (!ScarletStartupRestore.offer()) return;
+        }
         int exitCode = 0;
         try
         {
             try
             {
+                // Hold this lock until process exit, including any stubborn background
+                // worker during shutdown. The offline importer uses the same lock.
+                dataDirectoryLease = acquireDataDirectoryForStartup();
+                // Different data homes may run together, but they share Java Preferences.
+                // An offline importer must exclude every such producer, not only this home.
+                preferencesLease = ProcLock.acquirePreferences(ProcLock.preferencesLockDirectory(), true, 5_000L);
+                Files.createDirectories(dir.toPath());
+                ScarletLogger.setConsoleOnly(false);
+                logRuntimeInformation();
                 if (Platform.isPowerPC() && Platform.isPpcEdition())
                     LOG.warn("PowerPC edition on a PowerPC CPU: skipping startup security self-tests (their PBKDF2 derivations take many minutes without a JIT). Real encryption is unchanged.");
                 else
@@ -231,18 +253,78 @@ public class Scarlet implements Closeable
             catch (Throwable t)
             {
                 exitCode = -1;
-                LOG.error("Exception in main", t);
+                // The file logger creates its output directory lazily. Do not initialize it
+                // when storage acquisition failed: an importer may currently own this home.
+                if (dataDirectoryLease != null && preferencesLease != null)
+                    LOG.error("Exception in main", t);
+                else
+                {
+                    System.err.println("Scarlet startup stopped before obtaining storage access.");
+                    t.printStackTrace(System.err);
+                }
+                String privacyFailure = privacyPolicyStartupFailureMessage(t);
+                if (privacyFailure != null && !GraphicsEnvironment.isHeadless())
+                    Swing.invokeWait(() -> JOptionPane.showMessageDialog(null, Swing.dialogMessage(privacyFailure),
+                        "Scarlet stopped - secret-staff privacy", JOptionPane.ERROR_MESSAGE));
             }
         }
         finally
         {
-            if (exitCode == 69 && !Boolean.getBoolean("scarlet.restart.externalOnly") && relaunchSelf())
+            if (offlineModeOnExit != null && exitCode == 0)
+            {
+                try
+                {
+                    if (ScarletLogger.errorCount() != offlineShutdownErrorCount)
+                        throw new IOException("Shutdown reported errors. No offline export or restore was started. Check the Scarlet log before retrying.");
+                    new ProcessBuilder(buildOfflineCommand(offlineModeOnExit))
+                        .directory(new File(System.getProperty("user.dir"))).inheritIO().start();
+                }
+                catch (Exception failure)
+                {
+                    ScarletOfflineTools.showFailure(failure);
+                    exitCode = -1;
+                }
+            }
+            else if (exitCode == 69 && !Boolean.getBoolean("scarlet.restart.externalOnly") && relaunchSelf())
                 exitCode = 0;
             System.exit(exitCode);
         }
     }
 
     private static volatile String[] launchArgs = new String[0];
+
+    static String privacyPolicyStartupFailureMessage(Throwable failure)
+    {
+        // Do not show arbitrary exception details or policy contents in a desktop popup.
+        Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Throwable, Boolean>());
+        for (Throwable cause = failure; cause != null && seen.add(cause); cause = cause.getCause())
+            if (cause instanceof ScarletSecretStaffList.PersistenceException)
+                return "Scarlet stopped to protect secret-staff privacy because its list "
+                    + "could not be safely loaded or saved.\n\n"
+                    + "Preserve secret_staff_list.json and its backups. Verify and restore the complete current list "
+                    + "before restarting. An older backup may omit newer secret staff; do not delete the file "
+                    + "or replace it with an empty list to bypass this check.\n\nSee the local Scarlet log for details.";
+        return null;
+    }
+    private static volatile String offlineModeOnExit;
+    private static volatile long offlineShutdownErrorCount;
+    private static volatile ProcLock.Lease dataDirectoryLease;
+    private static volatile ProcLock.Lease preferencesLease;
+
+    private static ProcLock.Lease acquireDataDirectoryForStartup() throws IOException, InterruptedException
+    {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (true)
+        {
+            try { return ProcLock.acquireDataDirectory(dir); }
+            catch (IOException busy)
+            {
+                // A restart child can briefly overlap the parent's final System.exit.
+                if (System.nanoTime() >= deadline) throw busy;
+                Thread.sleep(100L);
+            }
+        }
+    }
 
     private static boolean relaunchSelf()
     {
@@ -295,6 +377,24 @@ public class Scarlet implements Closeable
         return command;
     }
 
+    static List<String> buildOfflineCommand(String mode)
+    {
+        if (!"--restore".equals(mode) && !"--export".equals(mode))
+            throw new IllegalArgumentException("Unsupported offline operation");
+        List<String> command = buildRelaunchCommand();
+        // Remove application arguments, then pin the exact home before the class/JAR argument.
+        for (int i = 0; i < launchArgs.length; i++) command.remove(command.size() - 1);
+        // Last -D wins: inherited VM arguments must not override either offline property.
+        int entry = command.indexOf("-jar");
+        if (entry < 0) entry = command.indexOf("-cp");
+        command.add(entry, "-DSCARLET_HOME=" + dir.getAbsolutePath());
+        command.add(entry, "-Dscarlet.offline=true");
+        command.add(mode);
+        command.add("--after-process");
+        command.add(Long.toString(ProcessHandle.current().pid()));
+        return command;
+    }
+
     private static String javaExecutableForRelaunch()
     {
         File bin = new File(System.getProperty("java.home"), "bin");
@@ -325,9 +425,14 @@ public class Scarlet implements Closeable
 
 
     public static final File user_home = new File(System.getProperty("user.home"));
-    public static final File dir, LEGACY_DIR;
-    static final DataFolderMigrationResult DATA_FOLDER_MIGRATION;
+    public static volatile File dir, LEGACY_DIR;
+    static volatile DataFolderMigrationResult DATA_FOLDER_MIGRATION;
     static
+    {
+        resolveDataDirectory(false);
+    }
+
+    private static void resolveDataDirectory(boolean allowMigration)
     {
         String scarletHome = System.getenv("SCARLET_HOME"),
                localappdata = System.getenv("LOCALAPPDATA"),
@@ -351,8 +456,8 @@ public class Scarlet implements Closeable
         else
         {
             dir0 = defaultDataDir(GROUP, NAME, localappdata, xdgDataHome);
-            legacyDir0 = defaultDataDir(LEGACY_GROUP, NAME, localappdata, xdgDataHome);
-            migration0 = copyLegacyDataDir(legacyDir0, dir0);
+            legacyDir0 = selectLegacyDataDir(localappdata, xdgDataHome);
+            if (allowMigration) migration0 = copyLegacyDataDir(legacyDir0, dir0);
         }
 
         // Data-folder auto-discovery: if the resolved folder has no usable settings.json but a
@@ -362,7 +467,7 @@ public class Scarlet implements Closeable
         // data dir has drifted between versions or launchers. An explicit SCARLET_HOME path is
         // always respected and never overridden. Fully guarded so a bad candidate cannot break
         // static initialisation.
-        if (!explicitHome && !settingsFileUsable(dir0))
+        if (allowMigration && !explicitHome && !settingsFileUsable(dir0))
         {
             java.util.List<File> discovered = findAllUsableDataDirs(dir0, localappdata, xdgDataHome);
             if (!discovered.isEmpty())
@@ -379,13 +484,8 @@ public class Scarlet implements Closeable
             }
         }
 
-        if (!dir0.isDirectory())
-        {
-            if (!dir0.mkdirs())
-            {
-                System.err.println("Failed to create directory: " + dir0);
-            }
-        }
+        // Resolve only: normal startup creates the home after acquiring both leases;
+        // the offline importer creates it inside its exclusive import transaction.
         dir = dir0;
         LEGACY_DIR = legacyDir0;
         DATA_FOLDER_MIGRATION = migration0;
@@ -456,8 +556,9 @@ public class Scarlet implements Closeable
                 candidates.add(new File(user_home, "AppData/Local/"+g+"/"+NAME));
                 candidates.add(new File(user_home, "."+g+"/"+NAME));
             }
-            // Bare ~/Scarlet, used by older SCARLET_HOME layouts / early builds.
+            // Bare product folders used by older SCARLET_HOME layouts / early builds.
             candidates.add(new File(user_home, NAME));
+            candidates.add(new File(user_home, FORK_REPOSITORY));
             try
             {
                 if (MavenDepsLoader.jarPath() != null)
@@ -497,8 +598,9 @@ public class Scarlet implements Closeable
                 candidates.add(new File(user_home, "AppData/Local/"+g+"/"+NAME));
                 candidates.add(new File(user_home, "."+g+"/"+NAME));
             }
-            // Bare ~/Scarlet, used by older SCARLET_HOME layouts / early builds.
+            // Bare product folders used by older SCARLET_HOME layouts / early builds.
             candidates.add(new File(user_home, NAME));
+            candidates.add(new File(user_home, FORK_REPOSITORY));
             try
             {
                 if (MavenDepsLoader.jarPath() != null)
@@ -596,8 +698,79 @@ public class Scarlet implements Closeable
         return new String(new char[] { 'S', 'y', 'b', 'y', 'l', 'i', 'n', 'e', 'N', 'e', 't', 'w', 'o', 'r', 'k' });
     }
 
+    static String previousForkGroupName()
+    {
+        // Constructed rather than embedded as a product string so the retired identity is not
+        // present in source, resources, or compiled-artifact string tables. This value is used only
+        // to find an existing data directory during the one-time compatibility migration.
+        return new String(new char[] { 'K', 'o', 'z', 'y', 'B', 'l', 'a', 'k', 'e' });
+    }
+
+    static String previousForkNoticeFilename()
+    {
+        return new String(new char[] {
+            'k', 'o', 'z', 'y', 'b', 'l', 'a', 'k', 'e', '-',
+            'd', 'a', 't', 'a', '-', 'f', 'o', 'l', 'd', 'e', 'r', '-',
+            'n', 'o', 't', 'i', 'c', 'e', '-', 'v', '1', '.', 'f', 'l', 'a', 'g'
+        });
+    }
+
+    static File selectLegacyDataDir(String localappdata, String xdgDataHome)
+    {
+        File previousFork = defaultDataDir(previousForkGroupName(), FORK_REPOSITORY, localappdata, xdgDataHome);
+        File originalUpstream = defaultDataDir(legacyGroupName(), FORK_REPOSITORY, localappdata, xdgDataHome);
+        if (settingsFileUsable(previousFork))
+            return previousFork;
+        if (settingsFileUsable(originalUpstream))
+            return originalUpstream;
+        if (previousFork.isDirectory())
+            return previousFork;
+        if (originalUpstream.isDirectory())
+            return originalUpstream;
+        return previousFork;
+    }
+
     static DataFolderMigrationResult copyLegacyDataDir(File legacyDir, File newDir)
     {
+        if (legacyDir == null || newDir == null || legacyDir.equals(newDir) || !legacyDir.isDirectory())
+            return DataFolderMigrationResult.notNeeded();
+        try
+        {
+            return copyLegacyDataDirWithLeases(legacyDir, newDir,
+                () -> confirmLegacyDataTransfer(legacyDir, newDir), ProcLock.preferencesLockDirectory(), 5_000L);
+        }
+        catch (IOException failure)
+        {
+            // This runs during class initialization, before main's long-lived leases.
+            // Abort rather than falling through to auto-discovery or writing an acknowledgement.
+            throw new java.io.UncheckedIOException(
+                "Scarlet data-folder migration could not obtain safe storage access. Close every Scarlet instance and retry startup.",
+                failure);
+        }
+    }
+
+    /** Explicit lock directory keeps migration exclusion tests away from real user state. */
+    static DataFolderMigrationResult copyLegacyDataDirWithLeases(File legacyDir, File newDir,
+            java.util.function.BooleanSupplier transferDecision, File preferencesLockDirectory) throws IOException
+    {
+        return copyLegacyDataDirWithLeases(legacyDir, newDir, transferDecision, preferencesLockDirectory, 0L);
+    }
+
+    static DataFolderMigrationResult copyLegacyDataDirWithLeases(File legacyDir, File newDir,
+            java.util.function.BooleanSupplier transferDecision, File preferencesLockDirectory, long waitMillis) throws IOException
+    {
+        // Match main/import acquisition order. Hold both leases across the prompt, the
+        // destination recheck and every copy/acknowledgement, including the failure path.
+        try (ProcLock.Lease data = ProcLock.acquireDataDirectory(newDir, waitMillis);
+             ProcLock.Lease preferences = ProcLock.acquirePreferences(preferencesLockDirectory, true, waitMillis))
+        {
+            return copyLegacyDataDir(legacyDir, newDir, transferDecision);
+        }
+    }
+
+    static DataFolderMigrationResult copyLegacyDataDir(File legacyDir, File newDir, java.util.function.BooleanSupplier transferDecision)
+    {
+        Objects.requireNonNull(transferDecision, "transferDecision");
         if (legacyDir == null || newDir == null || legacyDir.equals(newDir) || !legacyDir.isDirectory())
             return DataFolderMigrationResult.notNeeded();
         if (isDataFolderNoticeAcknowledged(newDir))
@@ -607,7 +780,19 @@ public class Scarlet implements Closeable
             if (newDir.exists())
             {
                 if (!newDir.isDirectory())
-                    return DataFolderMigrationResult.failed(legacyDir, newDir, "The KozyBlake data path already exists but is not a directory.");
+                    return DataFolderMigrationResult.failed(legacyDir, newDir, "The Scarlet Logger data path already exists but is not a directory.");
+                if (!isDirectoryEmpty(newDir))
+                    return DataFolderMigrationResult.skippedExistingTarget(legacyDir, newDir);
+            }
+            boolean transfer = transferDecision.getAsBoolean();
+
+            // The prompt itself must be side-effect free. Re-check after the user answers in case
+            // another process populated the destination while the prompt was open, then create the
+            // directory only when we are about to copy or persist a deliberate "Start fresh" choice.
+            if (newDir.exists())
+            {
+                if (!newDir.isDirectory())
+                    return DataFolderMigrationResult.failed(legacyDir, newDir, "The Scarlet Logger data path already exists but is not a directory.");
                 if (!isDirectoryEmpty(newDir))
                     return DataFolderMigrationResult.skippedExistingTarget(legacyDir, newDir);
             }
@@ -615,7 +800,8 @@ public class Scarlet implements Closeable
             {
                 Files.createDirectories(newDir.toPath());
             }
-            if (!confirmLegacyDataTransfer(legacyDir, newDir))
+
+            if (!transfer)
             {
                 DataFolderMigrationResult declined = DataFolderMigrationResult.declined(legacyDir, newDir);
                 acknowledgeDataFolderNotice(newDir, declined);
@@ -630,7 +816,10 @@ public class Scarlet implements Closeable
         {
             DataFolderMigrationResult failed = DataFolderMigrationResult.failed(legacyDir, newDir, ex.toString());
             showDataFolderTransferFailure(failed);
-            acknowledgeDataFolderNotice(newDir, failed);
+            // Do not create a destination merely because the prompt or preflight failed. If the
+            // copy path already created it, retaining a one-time failure acknowledgement is safe.
+            if (newDir.isDirectory())
+                acknowledgeDataFolderNotice(newDir, failed);
             return failed;
         }
     }
@@ -649,7 +838,7 @@ public class Scarlet implements Closeable
             int result = JOptionPane.showOptionDialog(
                 null,
                 Swing.dialogMessage(message),
-                "Transfer Data to KozyBlake/Scarlet?",
+                "Transfer Data to Hatson321/Scarlet Logger?",
                 JOptionPane.YES_NO_OPTION,
                 JOptionPane.WARNING_MESSAGE,
                 null,
@@ -675,38 +864,33 @@ public class Scarlet implements Closeable
     static String dataFolderTransferPromptMessage(File legacyDir, File newDir, boolean dryRun)
     {
         return (dryRun ? "[CLI popup test: no data will be copied and no choice will be saved.]\n\n" : "") +
-            "KozyBlake/Scarlet uses a separate data folder from the original repo.\n\n" +
-            "Would you like to transfer your existing original-repo data into the KozyBlake/Scarlet folder before startup continues?\n\n" +
-            "Existing data folder:\n" +
-            pathOrUnavailable(legacyDir) + "\n\n" +
-            "KozyBlake/Scarlet data folder:\n" +
+            "Hatson321/Scarlet Logger uses a separate data folder from earlier Scarlet builds.\n\n" +
+            "Would you like to copy your existing Scarlet data into the Hatson321/Scarlet Logger folder before startup continues?\n\n" +
+            "An existing Scarlet data folder was detected and will remain untouched.\n\n" +
+            "Hatson321/Scarlet Logger data folder:\n" +
             pathOrUnavailable(newDir) + "\n\n" +
-            "This will copy your data into the KozyBlake/Scarlet folder. The existing folder will not be moved, renamed, or deleted.\n\n" +
-            "Heads up: transferring can cause future issues because this fork and the original repo will use different data folders. " +
-            "If you switch back to the original repo later, changes made in the KozyBlake/Scarlet folder will not sync back automatically, " +
-            "and you will more than likely need to set everything up again there.\n\n" +
-            (dryRun ? "This test will only report your choice." : "KozyBlake/Scarlet will remember this choice and will not ask again.");
+            "This will copy your data into the Hatson321/Scarlet Logger folder. The existing folder will not be moved, renamed, modified, or deleted.\n\n" +
+            "Changes made afterward in either folder will not sync automatically.\n\n" +
+            (dryRun ? "This test will only report your choice." : "Hatson321/Scarlet Logger will remember this choice and will not ask again.");
     }
 
     static void showDataFolderTransferFailure(DataFolderMigrationResult migration)
     {
         String message =
-            "KozyBlake/Scarlet could not transfer your data into the KozyBlake/Scarlet folder.\n\n" +
-            "Existing data folder:\n" +
-            pathOrUnavailable(migration.legacyDir) + "\n\n" +
-            "KozyBlake/Scarlet data folder:\n" +
+            "Hatson321/Scarlet Logger could not transfer your existing Scarlet data.\n\n" +
+            "Hatson321/Scarlet Logger data folder:\n" +
             pathOrUnavailable(migration.newDir) + "\n\n" +
             "Error:\n" +
             (migration.error == null ? "unknown" : migration.error) + "\n\n" +
-            "Startup will continue using the KozyBlake/Scarlet folder.";
+            "Startup will continue using the Hatson321/Scarlet Logger folder.";
         if (!GraphicsEnvironment.isHeadless())
         {
-            JOptionPane.showMessageDialog(null, Swing.dialogMessage(message), "KozyBlake/Scarlet Data Transfer Failed", JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(null, Swing.dialogMessage(message), "Hatson321/Scarlet Logger Data Transfer Failed", JOptionPane.WARNING_MESSAGE);
         }
         else
         {
             System.err.println();
-            System.err.println("KozyBlake/Scarlet Data Transfer Failed");
+            System.err.println("Hatson321/Scarlet Logger Data Transfer Failed");
             System.err.println(message);
             System.err.println();
         }
@@ -728,7 +912,10 @@ public class Scarlet implements Closeable
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
             {
-                Path target = targetRoot.resolve(sourceRoot.relativize(file));
+                Path relative = sourceRoot.relativize(file);
+                if (relative.getNameCount() == 1 && previousForkNoticeFilename().equals(relative.getFileName().toString()))
+                    return FileVisitResult.CONTINUE;
+                Path target = targetRoot.resolve(relative);
                 copyFileKeepingAttributesWhenPossible(file, target);
                 return FileVisitResult.CONTINUE;
             }
@@ -821,6 +1008,11 @@ public class Scarlet implements Closeable
         GsonBuilder gb = JsonAdapters.gson();
         GSON = gb.create();
         GSON_PRETTY = gb.setPrettyPrinting().create();
+    }
+
+    /** File logging must begin only after normal startup owns both storage leases. */
+    private static void logRuntimeInformation()
+    {
         LOG.info(String.format("App: %s %s", APP_NAME, VERSION));
         LOG.info(String.format("OS: %s (%s)", System.getProperty("os.name"), System.getProperty("os.arch")));
         LOG.info(String.format("VM: %s %s (%s) %s-bit", System.getProperty("java.version"), System.getProperty("java.vendor"), System.getProperty("java.vm.name"), System.getProperty("sun.arch.data.model")));
@@ -843,6 +1035,15 @@ public class Scarlet implements Closeable
     {
         this.skipShutdownPersistence = true;
         return this.stop("migration import", 0);
+    }
+    public synchronized boolean requestOfflineMigration(String mode)
+    {
+        if (!"--restore".equals(mode) && !"--export".equals(mode))
+            throw new IllegalArgumentException("Unsupported offline operation");
+        if (!this.running) return false;
+        offlineShutdownErrorCount = ScarletLogger.errorCount();
+        offlineModeOnExit = mode;
+        return this.stop("offline " + mode.substring(2) + " (saving before shutdown)", 0);
     }
     public boolean requestDataWipeOnShutdown()
     {
@@ -888,6 +1089,7 @@ public class Scarlet implements Closeable
         LOG.info("Queuing "+kind+"...");
         this.running = false;
         this.exitCode = exitCode;
+        this.stopIpc();
         return true;
     }
     boolean shouldPersistOnShutdown()
@@ -899,9 +1101,18 @@ public class Scarlet implements Closeable
     public void close() throws IOException
     {
         this.stop();
+        // Cancel launch/exit waits before draining other workers. Shutdown never
+        // authorizes another client close or a new VRChat launch.
+        net.sybyline.scarlet.ext.VrcLaunch.stopLaunching();
+        // Some failure paths clear running directly; still wake IPC before waiting.
+        this.stopIpc();
         this.exec.shutdown();
         this.execModal.shutdown();
         this.execIPC.shutdown();
+        // Cancel/drain network snapshot workers before offline export can save data.
+        // Do not swallow shutdown failure: an undrained writer must block migration.
+        if (this.vrc != null && !this.vrc.shutdownSnapshots())
+            throw new IOException("Snapshot workers did not stop; offline migration was not started");
         try
         {
             if (!this.exec.awaitTermination(3_000L, TimeUnit.MILLISECONDS))
@@ -912,6 +1123,8 @@ public class Scarlet implements Closeable
         }
         catch (InterruptedException iex)
         {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while stopping Scarlet workers; offline migration was not started", iex);
         }
         try
         {
@@ -923,28 +1136,44 @@ public class Scarlet implements Closeable
         }
         catch (InterruptedException iex)
         {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while stopping Scarlet dialogs; offline migration was not started", iex);
         }
         try
         {
             if (!this.execIPC.awaitTermination(3_000L, TimeUnit.MILLISECONDS))
             {
                 int unstarted = this.execIPC.shutdownNow().size();
-                LOG.error("Forcibly terminated modal executor service, "+unstarted+" unstarted task(s)");
+                LOG.error("Forcibly terminated IPC executor service, "+unstarted+" unstarted task(s)");
             }
         }
         catch (InterruptedException iex)
         {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while stopping Scarlet IPC; offline migration was not started", iex);
         }
         if (this.ttsService != null)
             MiscUtils.close(this.ttsService);
-        MiscUtils.close(this.mobile);
-        MiscUtils.close(this.discord);
+        if (this.discord != null) this.discord.close();
+        MiscUtils.close(this.vrc);
         MiscUtils.close(this.logs);
         MiscUtils.close(this.ui);
         if (this.shouldPersistOnShutdown())
         {
             this.data.saveAll();
             this.settings.updateRunVersionAndTime();
+            if (offlineModeOnExit != null)
+            {
+                try
+                {
+                    this.settings.preferences.flush();
+                    this.settings.globalPreferences.flush();
+                }
+                catch (java.util.prefs.BackingStoreException failure)
+                {
+                    throw new IOException("Credential preferences could not be saved; offline migration was not started", failure);
+                }
+            }
         }
         else
         {
@@ -985,9 +1214,22 @@ public class Scarlet implements Closeable
     private volatile boolean stdinUsable = true;
     final Runnable explicitGC = MiscUtils.withMinimumInterval(3600_000L, System::gc);
     final AtomicInteger threadidx = new AtomicInteger();
-    public final ScheduledExecutorService exec = Executors.newScheduledThreadPool(4, runnable -> new Thread(runnable, "KozyBlake/Scarlet Worker Thread "+this.threadidx.incrementAndGet())),
-                                          execModal = Executors.newSingleThreadScheduledExecutor(runnable -> new Thread(runnable, "KozyBlake/Scarlet Modal UI Thread "+this.threadidx.incrementAndGet())),
-                                          execIPC = Executors.newSingleThreadScheduledExecutor(runnable -> new Thread(runnable, "KozyBlake/Scarlet IPC Thread "+this.threadidx.incrementAndGet()));
+    final ScarletIpcLifecycle ipcLifecycle = new ScarletIpcLifecycle();
+    public final ScheduledExecutorService exec = newScheduler(4, runnable -> new Thread(runnable, "Hatson321/Scarlet Logger Worker Thread "+this.threadidx.incrementAndGet())),
+                                          execModal = newScheduler(1, runnable -> new Thread(runnable, "Hatson321/Scarlet Logger Modal UI Thread "+this.threadidx.incrementAndGet())),
+                                          execIPC = newScheduler(1, runnable -> new Thread(runnable, "Hatson321/Scarlet Logger IPC Thread "+this.threadidx.incrementAndGet()));
+
+    static ScheduledThreadPoolExecutor newScheduler(int threads, ThreadFactory threadFactory)
+    {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(threads, threadFactory);
+        // Future retries, avatar lookups and UI timers are not unfinished saves. Cancel
+        // those timers at shutdown, while allowing already-running work to finish before
+        // the final data/cookie/preference flush and offline migration handoff.
+        scheduler.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        scheduler.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        scheduler.setRemoveOnCancelPolicy(true);
+        return scheduler;
+    }
     
     // ── Multi-core data directory ───────────────────────────────────────────────
     /** Scarlet's data directory (settings, watch lists, tags, session store, Discord config, etc.). */
@@ -1109,7 +1351,7 @@ public class Scarlet implements Closeable
     final ScarletVRChatReportTemplate vrcReport = new ScarletVRChatReportTemplate(new File(dataDir, "report_template.txt"));
     final ScarletData data = new ScarletData(new File(dataDir, "data"));
     final ScarletVRChat vrc = new ScarletVRChat(this, "global", new File(dataDir, "store.bin"));
-    final ScarletMobile mobile = new ScarletMobile(this, new File(dataDir, "mobile_devices.json"));
+    final ScarletDesktopNotifications desktopNotifications = new ScarletDesktopNotifications(this);
     final ScarletDiscord discord = new ScarletDiscordJDA(this, new File(dataDir, "discord_bot.json"), new File(dataDir, "discord_perms.json"));
     private TtsService ttsService = null;
     final ScarletCalendar calendar = new ScarletCalendar(this, new File(dataDir, "event_schedule.json"));
@@ -1128,8 +1370,8 @@ public class Scarlet implements Closeable
                                      announceVerifyComplete = this.settings.new FileValuedBoolean("announce_verify_complete", I18n.tr("setting.announce_verify_complete"), true),
                                      trainingMode = this.settings.new FileValuedBoolean("training_mode_enabled", I18n.tr("setting.training_mode_enabled"), false),
                                      uiAccentHeaders = this.settings.new FileValuedBoolean("ui_accent_headers", I18n.tr("setting.ui_accent_headers"), false);
-    /** One-time first-launch flag: the user has seen and accepted the "vibe-coded / AI-assisted" disclosure. */
-    final ScarletSettings.FileValued<Boolean> vibecodedNoticeAcknowledged = this.settings.new FileValuedBoolean("vibecoded_notice_acknowledged", I18n.tr("setting.vibecoded_notice_acknowledged"), false);
+    /** One-time first-launch flag: the user has seen and accepted the maintainer and release-process notice. */
+    final ScarletSettings.FileValued<Boolean> maintainerNoticeAcknowledged = this.settings.new FileValuedBoolean("vibecoded_notice_acknowledged", I18n.tr("setting.maintainer_notice_acknowledged"), false);
     /** Desktop UI language override; blank/"system" follows the operating system language. Applied at startup (restart to change). */
     final ScarletSettings.FileValued<String> uiLanguage = this.settings.new FileValuedStringChoice("ui_language", I18n.tr("setting.ui_language"), "system", () ->
     {
@@ -1147,6 +1389,7 @@ public class Scarlet implements Closeable
     final ScarletSettings.FileValued<EnforcementListState> enforceInstancesWorlds = this.settings.new FileValuedEnum<>("enforce_instances_worlds", I18n.tr("setting.enforce_instances_worlds"), EnforcementListState.DISABLED);
     final ScarletSettings.FileValued<String[]> enforceInstancesWorldList = this.settings.new FileValuedStringArrayPattern("enforce_instances_world_list", I18n.tr("setting.enforce_instances_world_list"), new String[0], VrcIds.P_ID_WORLD, true);
     final ScarletSettings.FileValued<Integer> autoCloseBotInstanceMinutes = this.settings.new FileValuedIntRange("auto_close_bot_instance_minutes", I18n.tr("setting.auto_close_bot_instance_minutes"), 0, 0, 1440);
+    final ScarletSettings.FileValued<Boolean> exitVrchatOnClosedEmptyInstance = this.settings.new FileValuedBoolean("vrchat_client_exit_closed_empty", I18n.tr("setting.vrchat_client_exit_closed_empty"), false);
     final ScarletSettings.FileValued<Integer> auditPollingInterval = this.settings.new FileValuedIntRange("audit_polling_interval", I18n.tr("setting.audit_polling_interval"), 60, 10, 300);
     final ScarletSettings.FileValued<Integer> auditCatchupMaxDays = this.settings.new FileValuedIntRange("audit_catchup_max_days", I18n.tr("setting.audit_catchup_max_days"), 14, 1, 90);
     // How often (seconds) to poll the group's live open instances so the follow-into-new-instance
@@ -1224,11 +1467,9 @@ public class Scarlet implements Closeable
     // Fires the capture hotkey for kick/ban moderation events when enabled. Called from the audit
     // processing loop; runs off-thread so a slow key injection never stalls audit handling.
     /**
-     * Expiry sweep for timed group bans. Runs periodically: for every ban whose window has
-     * elapsed, confirm the user is still banned and then lift the ban, attributing the unban to
-     * the moderator who set it. Non-destructive on failure — a null/unknown membership status or a
-     * failed unban leaves the record in place to retry on the next tick, so a transient VRChat API
-     * hiccup can never silently strand a user as banned or drop the timer.
+     * Expiry sweep for confirmed timers in this installation's one configured group.
+     * Unknown action outcomes and legacy records are retained for manual review: retrying
+     * an unban blindly could otherwise lift a later ban after a crash or failed save.
      */
     void processTimedBans()
     {
@@ -1236,51 +1477,27 @@ public class Scarlet implements Closeable
         ScarletVRChat vrc = this.vrc;
         if (pma == null || vrc == null)
             return;
-        String groupId = vrc.groupId;
-        if (groupId == null || groupId.isEmpty())
-            return;
+        ScarletTimedBanProcessor.process(pma, () -> vrc.groupId, System::currentTimeMillis,
+            vrc::getTimedBanMembershipStatus,
+            (group, user, timer) -> ScarletTimedBanContinuity.check(vrc, group, user, timer),
+            vrc::unbanFromGroupDetailed);
+        String review = pma.timedBanReviewSummary(vrc.groupId);
         long now = System.currentTimeMillis();
-        for (java.util.Map.Entry<String, ScarletPendingModActions.TimedBan> e : pma.timedBansSnapshot().entrySet())
+        if (review == null)
+            this.timedBanReviewNotice = null;
+        else if (!review.equals(this.timedBanReviewNotice) || now - this.timedBanReviewNoticeAt >= 3600_000L)
         {
-            String userId = e.getKey();
-            ScarletPendingModActions.TimedBan tb = e.getValue();
-            if (tb == null || tb.expiresAt > now)
-                continue; // still within the ban window
-
-            io.github.vrchatapi.model.GroupMemberStatus status;
-            try
-            {
-                status = vrc.getGroupMembershipStatus(groupId, userId);
-            }
-            catch (Exception ex)
-            {
-                LOG.warn("Timed-ban sweep: membership lookup failed for {}; will retry next tick", userId, ex);
-                continue;
-            }
-            if (status == null)
-                continue; // transient/unknown — do NOT drop the record; retry next tick
-            if (status != io.github.vrchatapi.model.GroupMemberStatus.BANNED)
-            {
-                // The ban was already lifted (e.g. manually); the timer is moot.
-                pma.removeTimedBan(userId);
-                continue;
-            }
-
-            String actorId = tb.actorUserId;
-            if (pma.addPending(GroupAuditType.USER_UNBAN, userId, actorId) != null)
-                continue; // another assisted/automated action is already pending; retry next tick
-            if (vrc.unbanFromGroup(userId))
-            {
-                pma.removeTimedBan(userId);
-                LOG.info("Timed ban expired: unbanned {} (attributed to actor {})", userId, actorId);
-            }
-            else
-            {
-                pma.pollPending(GroupAuditType.USER_UNBAN, userId);
-                LOG.warn("Timed ban for {} expired but the unban call failed; will retry next tick", userId);
-            }
+            this.timedBanReviewNotice = review;
+            this.timedBanReviewNoticeAt = now;
+            LOG.warn(review);
+            if (this.splash != null)
+                this.splash.queueFeedbackPopup(null, 30_000L, "Automatic unbans need review", review,
+                    java.awt.Color.ORANGE, java.awt.Color.ORANGE);
         }
     }
+
+    private String timedBanReviewNotice;
+    private long timedBanReviewNoticeAt;
 
     void captureEvidenceIfKickBan(String eventType)
     {
@@ -1459,16 +1676,16 @@ public class Scarlet implements Closeable
         switch (migration.kind)
         {
             case COPIED:
-                LOG.info("KozyBlake/Scarlet data folder initialized from existing legacy original-repo data. Active data directory: {}", dir);
+                LOG.info("Hatson321/Scarlet Logger data folder initialized from existing Scarlet data. Active data directory: {}", dir);
                 break;
             case DECLINED:
-                LOG.info("KozyBlake/Scarlet data folder transfer was declined. Active data directory: {}", dir);
+                LOG.info("Hatson321/Scarlet Logger data folder transfer was declined. Active data directory: {}", dir);
                 break;
             case SKIPPED_EXISTING_TARGET:
-                LOG.info("KozyBlake/Scarlet data folder already had data; legacy original-repo data was left untouched. Active data directory: {}", dir);
+                LOG.info("Hatson321/Scarlet Logger data folder already had data; the earlier Scarlet data was left untouched. Active data directory: {}", dir);
                 break;
             case FAILED:
-                LOG.warn("KozyBlake/Scarlet data folder copy did not complete. Active data directory: {}. Error: {}", dir, migration.error);
+                LOG.warn("Hatson321/Scarlet Logger data folder copy did not complete. Active data directory: {}. Error: {}", dir, migration.error);
                 break;
             default:
                 break;
@@ -1485,13 +1702,13 @@ public class Scarlet implements Closeable
                 Swing.invokeWait(() -> JOptionPane.showMessageDialog(
                     this.ui.getParentComponent(),
                     dialogMessage,
-                    "KozyBlake/Scarlet Data Folder",
+                    "Hatson321/Scarlet Logger Data Folder",
                     JOptionPane.INFORMATION_MESSAGE));
             }
             else
             {
                 System.out.println();
-                System.out.println("KozyBlake/Scarlet Data Folder");
+                System.out.println("Hatson321/Scarlet Logger Data Folder");
                 System.out.println(dialogMessage);
                 System.out.println();
             }
@@ -1515,28 +1732,26 @@ public class Scarlet implements Closeable
     {
         StringBuilder message = new StringBuilder();
         message
-            .append("KozyBlake/Scarlet now uses a KozyBlake/Scarlet data folder.\n\n")
+            .append("Hatson321/Scarlet Logger now uses its maintained data folder.\n\n")
             .append("Active data folder:\n")
             .append(pathOrUnavailable(dir))
             .append("\n\n")
-            .append("Going forward, this fork reads and writes data in that active folder instead of the legacy upstream folder.\n\n")
-            .append("Legacy data folder kept for rollback:\n")
-            .append(pathOrUnavailable(migration.legacyDir))
-            .append("\n\n");
+            .append("Going forward, this build reads and writes data in that active folder.\n\n")
+            .append("The earlier Scarlet data folder remains untouched for rollback.\n\n");
         switch (migration.kind)
         {
             case COPIED:
-                message.append("KozyBlake/Scarlet copied your existing data into the active KozyBlake/Scarlet folder because that folder was empty or missing.\n\n");
+                message.append("Hatson321/Scarlet Logger copied your existing data into the active folder because that folder was empty or missing.\n\n");
                 break;
             case DECLINED:
-                message.append("You chose to start fresh in the active KozyBlake/Scarlet folder. No legacy data was copied.\n\n");
+                message.append("You chose to start fresh in the active Hatson321/Scarlet Logger folder. No earlier data was copied.\n\n");
                 break;
             case SKIPPED_EXISTING_TARGET:
-                message.append("KozyBlake/Scarlet found legacy data, but the active KozyBlake/Scarlet folder already contains data, so nothing was copied automatically.\n\n");
+                message.append("Hatson321/Scarlet Logger found earlier data, but the active folder already contains data, so nothing was copied automatically.\n\n");
                 break;
             case FAILED:
                 message
-                    .append("KozyBlake/Scarlet tried to copy your existing data into the active KozyBlake/Scarlet folder, but the copy did not complete.\n")
+                    .append("Hatson321/Scarlet Logger tried to copy your existing data into the active folder, but the copy did not complete.\n")
                     .append("Error: ")
                     .append(migration.error == null ? "unknown" : migration.error)
                     .append("\n\n");
@@ -1584,7 +1799,7 @@ public class Scarlet implements Closeable
         }
         catch (Exception ex)
         {
-            System.err.println("Failed to persist KozyBlake/Scarlet data folder notice acknowledgement at " + ackFile + ": " + ex);
+            System.err.println("Failed to persist Hatson321/Scarlet Logger data folder notice acknowledgement at " + ackFile + ": " + ex);
         }
     }
 
@@ -1604,25 +1819,22 @@ public class Scarlet implements Closeable
     }
 
     /**
-     * First-launch disclosure. Scarlet (this fork) is maintained by KozyBlake and developed largely
-     * with AI assistance -- a "vibe-coded" project. Shown once; the user may decline and close.
+     * First-launch disclosure of the current maintainer, assisted API-update process, human review,
+     * release testing, and detailed HTML change report. Shown once; the user may decline and close.
      * Headless runs log the notice once and continue, since a scheduled bot has no one to click.
      */
-    void showVibecodedNoticeIfNeeded()
+    void showMaintainerNoticeIfNeeded()
     {
-        if (Boolean.TRUE.equals(this.vibecodedNoticeAcknowledged.get()))
+        if (Boolean.TRUE.equals(this.maintainerNoticeAcknowledged.get()))
             return;
-        String title = "Scarlet \u2014 a note before you start";
-        String plain = "This fork of Scarlet is maintained by KozyBlake and developed largely with AI"
-            + " assistance \u2014 a \"vibe-coded\" project. Code is written and reasoned through with an"
-            + " AI pair, then reviewed and built by KozyBlake.\n\n"
-            + "That isn't for everyone, and that's completely fair. If you would rather not run a"
-            + " vibe-coded project, you can close Scarlet now \u2014 no hard feelings.";
+        String title = "Scarlet \u2014 maintainer and release process";
+        String plain = "scarlet is now under a new maintainer hatson321 ai is used to assist in the api updates and gets proof read by hatson321 and the other scarlet admin team members before release. "
+            + "tests are performed as well before release to ensure safe operational status and a fully detailed update html is provided disclosing what was changed and tested.";
         if (Platform.forceHeadlessUi() || GraphicsEnvironment.isHeadless())
         {
             LOG.warn("{}: {}", title, plain.replace("\n\n", " "));
-            LOG.warn("(Headless: continuing. Shown once; remove 'vibecoded_notice_acknowledged' from settings.json to see it again.)");
-            this.vibecodedNoticeAcknowledged.set(Boolean.TRUE, "first-run-notice");
+            LOG.warn("(Headless: continuing. Shown once; reset the maintainer-notice acknowledgement in settings.json to see it again.)");
+            this.maintainerNoticeAcknowledged.set(Boolean.TRUE, "first-run-notice");
             return;
         }
         int result = JOptionPane.showOptionDialog(
@@ -1636,10 +1848,10 @@ public class Scarlet implements Closeable
             "Continue");
         if (result != 0) // index 0 == "Continue"; "Close Scarlet" (1) or dismissed (-1) both exit
         {
-            LOG.info("User declined the vibe-coded notice; exiting.");
+            LOG.info("User declined the maintainer and release-process notice; exiting.");
             System.exit(0);
         }
-        this.vibecodedNoticeAcknowledged.set(Boolean.TRUE, "first-run-notice");
+        this.maintainerNoticeAcknowledged.set(Boolean.TRUE, "first-run-notice");
     }
 
     public void run()
@@ -1648,11 +1860,10 @@ public class Scarlet implements Closeable
         System.out.println("  " + APP_NAME + " " + VERSION);
         System.out.println("  Type 'help' for available CLI commands.");
         System.out.println("===========================================");
-        this.showVibecodedNoticeIfNeeded();
+        this.showMaintainerNoticeIfNeeded();
         this.ui.loadSettings();
         this.maybeShowDataFolderMigrationNotice();
         this.eventListener.settingsLoaded();
-        this.mobile.settingsLoaded();
         this.checkVrchatApiPreflight();
         // Initialize TTS after UI is ready (for dialog parent component)
         this.splash.splashSubtext(I18n.tr("splash.initTts"));
@@ -1688,10 +1899,10 @@ public class Scarlet implements Closeable
         if (Features.DISCORD_KICK_BAN_ENABLED && !this.discordKickBanPrompted.get())
         {
             this.settings.requireConfirmYesNoAsync(
-                "KozyBlake/Scarlet includes built-in Discord slash commands for warning, kicking, and banning server members\n" +
+                "Hatson321/Scarlet Logger includes built-in Discord slash commands for warning, kicking, and banning server members\n" +
                 "(/discord-warn, /discord-kick, and /discord-ban).\n\n" +
                 "Many users prefer to use a dedicated moderation bot for this instead.\n\n" +
-                "Would you like to enable KozyBlake/Scarlet's built-in Discord moderation commands?",
+                "Would you like to enable Hatson321/Scarlet Logger's built-in Discord moderation commands?",
                 "Discord Moderation Commands",
                 () -> {
                     this.discordKickBanEnabled.set(true, "user-prompt");
@@ -1711,6 +1922,10 @@ public class Scarlet implements Closeable
         this.exec.scheduleWithFixedDelay(this::healthWatchdogTick, 90L, 60L, TimeUnit.SECONDS);
         // Lift expired timed group bans (see processTimedBans). Cheap and failure-tolerant.
         this.exec.scheduleWithFixedDelay(this::processTimedBans, 60L, 60L, TimeUnit.SECONDS);
+        this.exec.scheduleWithFixedDelay(() -> {
+            try { this.eventListener.clientExitMonitor.tick(); }
+            catch (Exception ex) { LOG.warn("Automatic VRChat exit check failed; client left running", ex); }
+        }, 5L, 5L, TimeUnit.SECONDS);
         try
         {
             long filecheck = 3;
@@ -1913,40 +2128,43 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
 */
     void runIPC()
     {
-        try (ServerSocket ipcServer = createIpcServer())
+        if (!this.running || this.ipcLifecycle.isStopped()) return;
+        try
         {
+            ServerSocket ipcServer = createIpcServer();
+            ScarletIpcLifecycle.WakeAccept wake = Platform.CURRENT.isNT() ? null : () -> {
+                try (Socket emptyWake = new UnixDomainSocket("/tmp/ScarletIPC-"+this.vrc.groupId+".sock", false)) { }
+            };
+            if (!this.ipcLifecycle.publishServer(ipcServer, wake)) return;
             try
             {
                 LOG.info("Listening ipc: "+ipcServer);
-                byte[] buf = new byte[65536];
                 String line;
-                while (this.running)
+                while (this.running && !this.ipcLifecycle.isStopped())
                 {
                     line = null;
-                    try (Socket socket =  ipcServer.accept())
+                    Socket socket = null;
+                    try
                     {
-                        InputStream in = socket.getInputStream();
-                        int i = 0;
-                        try
-                        {
-                            int b;
-                            for (; i < 65536 && (b = in.read()) != -1; i++) buf[i] = (byte) b;
-                        }
-                        catch (IOException ioex)
-                        {
-                            if (!"ReadFile() failed: 109".equals(ioex.getMessage()))
-                                LOG.error("Exception in ipc read: ", ioex);
-                        }
-                        line = new String(buf, 0, i, StandardCharsets.UTF_8);
-                        LOG.info("CLI from ipc ("+i+" bytes)");
+                        socket = ipcServer.accept();
+                        if (!this.ipcLifecycle.publishClient(socket)) break;
+                        if (!this.running) break;
+                        byte[] commandBytes = this.ipcLifecycle.readCommandBytes(socket, 65536);
+                        if (commandBytes == null || !this.running) break;
+                        line = new String(commandBytes, StandardCharsets.UTF_8);
+                        LOG.info("CLI from ipc ("+commandBytes.length+" bytes)");
                     }
                     catch (IOException ioex)
                     {
                         // Ignore exception caused by intentional shutdown
-                        if (this.running || !"GetOverlappedResult() failed for connect operation: 0".equals(ioex.getMessage()))
+                        if (this.running && !this.ipcLifecycle.isStopped())
                             LOG.error("Exception in ipc loop", ioex);
                     }
-                    this.rawCommandFromIpc(line);
+                    finally
+                    {
+                        if (socket != null) this.ipcLifecycle.releaseClient(socket);
+                    }
+                    if (this.running && !this.ipcLifecycle.isStopped()) this.rawCommandFromIpc(line);
                 }
             }
             finally
@@ -1956,8 +2174,15 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         }
         catch (Exception ex)
         {
-            LOG.error("Exception in ipc", ex);
+            if (this.running && !this.ipcLifecycle.isStopped()) LOG.error("Exception in ipc", ex);
         }
+        finally { this.stopIpc(); }
+    }
+
+    private void stopIpc()
+    {
+        try { this.ipcLifecycle.close(); }
+        catch (Exception failure) { LOG.error("Could not close Scarlet IPC safely", failure); }
     }
 
     /**
@@ -2113,6 +2338,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
 
     void rawCommandFromIpc(String line)
     {
+        if (!this.running || this.ipcLifecycle.isStopped()) return;
         if (Boolean.getBoolean("scarlet.ipc.insecure"))
         {
             this.rawCommand(line);
@@ -2203,16 +2429,16 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             } break;
             case "info":
             case "help": {
-                StringBuilder sb = new StringBuilder("KozyBlake/Scarlet CLI commands:");
+                StringBuilder sb = new StringBuilder("Hatson321/Scarlet Logger CLI commands:");
                 sb.append("\n  help               — show this list (alternate: info)");
                 sb.append("\n  logout             — log out of VRChat");
-                sb.append("\n  exit               — stop KozyBlake/Scarlet (alternate: halt, quit, stop)");
-                sb.append("\n  explore            — open the KozyBlake/Scarlet data folder");
+                sb.append("\n  exit               — stop Hatson321/Scarlet Logger (alternate: halt, quit, stop)");
+                sb.append("\n  explore            — open the Hatson321/Scarlet Logger data folder");
                 sb.append("\n  tts <text>         — submit text to the TTS service");
                 sb.append("\n  link <usr_id> <sf> — link a VRChat user to a Discord snowflake");
                 sb.append("\n  importgroups <file|URL>     — import watched groups (legacy CSV)");
                 sb.append("\n  importgroupsjson <file|URL> — import watched groups (JSON)");
-                sb.append("\n  reboot             - fully restart KozyBlake/Scarlet (alternate: restart)");
+                sb.append("\n  reboot             - fully restart Hatson321/Scarlet Logger (alternate: restart)");
                 sb.append("\n  translate-advisories        — translate watched-group advisories to your UI language");
                 sb.append("\n  restore-advisories          — restore original (untranslated) advisories");
                 sb.append("\n  repair-secure-store         — reconcile the registry + data-folder secure store (report only)");
@@ -2244,14 +2470,14 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             case "quit":
             case "stop": {
                 this.running = false;
-                String msg = "Stopping KozyBlake/Scarlet...";
+                String msg = "Stopping Hatson321/Scarlet Logger...";
                 LOG.info(msg);
                 if (out != null) out.accept(msg);
             } break;
             case "reboot":
             case "restart": {
                 String msg = this.restart()
-                    ? "Restarting KozyBlake/Scarlet..."
+                    ? "Restarting Hatson321/Scarlet Logger..."
                     : "Restart is already queued";
                 LOG.info(msg);
                 if (out != null) out.accept(msg);
@@ -2483,7 +2709,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         switch (popup)
         {
             case "data-transfer": {
-                File legacyDir = LEGACY_DIR != null ? LEGACY_DIR : defaultDataDir(LEGACY_GROUP, NAME, System.getenv("LOCALAPPDATA"), System.getenv("XDG_DATA_HOME"));
+                File legacyDir = LEGACY_DIR != null ? LEGACY_DIR : selectLegacyDataDir(System.getenv("LOCALAPPDATA"), System.getenv("XDG_DATA_HOME"));
                 boolean transfer = confirmLegacyDataTransfer(legacyDir, dir, true);
                 String msg = "Popup test result: data-transfer selected `" + (transfer ? "Transfer data" : "Start fresh") + "`. No data was copied and no acknowledgement flag was written.";
                 LOG.info(msg);
@@ -2511,7 +2737,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
 
     DataFolderMigrationResult popupTestMigrationResult(String kind)
     {
-        File legacyDir = LEGACY_DIR != null ? LEGACY_DIR : defaultDataDir(LEGACY_GROUP, NAME, System.getenv("LOCALAPPDATA"), System.getenv("XDG_DATA_HOME"));
+        File legacyDir = LEGACY_DIR != null ? LEGACY_DIR : selectLegacyDataDir(System.getenv("LOCALAPPDATA"), System.getenv("XDG_DATA_HOME"));
         if ("copied".equals(kind) || "transfer".equals(kind) || "transferred".equals(kind))
             return DataFolderMigrationResult.copied(legacyDir, dir);
         if ("declined".equals(kind) || "fresh".equals(kind) || "start-fresh".equals(kind))
@@ -2747,8 +2973,8 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             StringBuilder text = new StringBuilder(report.message);
             if (report.updateAvailable)
             {
-                text.append("\n\nKozyBlake/Scarlet will continue starting, but if VRChat features behave oddly, you may need a newer KozyBlake/Scarlet build with an updated API adapter.");
-                text.append("\n\nIf this is causing problems, please open a ticket in the KozyBlake/Scarlet Discord server and ping BlakeBelladonna or Vinyarion.");
+                text.append("\n\nHatson321/Scarlet Logger will continue starting, but if VRChat features behave oddly, you may need a newer build with an updated API adapter.");
+                text.append("\n\nIf this is causing problems, please open an issue in the maintained Scarlet repository.");
                 int choice = JOptionPane.showOptionDialog(
                     this.ui.getParentComponent(),
                     Swing.dialogMessage(text.toString()),
@@ -2756,13 +2982,13 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
                     JOptionPane.DEFAULT_OPTION,
                     JOptionPane.WARNING_MESSAGE,
                     null,
-                    new Object[] { "Continue", "Open API Page", "Open Discord" },
+                    new Object[] { "Continue", "Open API Page", "Open Support" },
                     "Continue"
                 );
                 if (choice == 1)
                     MiscUtils.AWTDesktop.browse(URI.create(VRCHAT_API_RELEASES_URL));
                 else if (choice == 2)
-                    MiscUtils.AWTDesktop.browse(URI.create(SCARLET_DISCORD_URL));
+                    MiscUtils.AWTDesktop.browse(URI.create(SUPPORT_URL));
                 return;
             }
             JOptionPane.showMessageDialog(
@@ -3190,98 +3416,11 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         }
     }
 
-    // Auto-close the bot's OWN instance once everyone else has left and the configured idle time
-    // elapses. Deliberately uses the live log-tailed roster (Scarlet's own presence data), NOT the
-    // group-instance API, so a genuinely active instance is never mistaken for empty. Only ever
-    // touches the one instance the bot is currently in.
-    private String autoCloseTrackedLocation = null;
-    private OffsetDateTime autoCloseIdleSince = null; // when it last became bot-only; null while others are present
+    // This policy owns its current log session and requires fresh server confirmation.
+    // Remembered UI/legacy roster fields must never authorize an unattended close.
     void maybeAutoCloseBotInstance()
     {
-        int minutes = this.autoCloseBotInstanceMinutes.get();
-        String loc = this.eventListener.clientLocation;
-        if (minutes <= 0 || loc == null)
-        {
-            // Feature off, or the bot isn't in an instance (e.g. a host/mod already closed it): stand down.
-            this.autoCloseTrackedLocation = null;
-            this.autoCloseIdleSince = null;
-            return;
-        }
-        if (!loc.equals(this.autoCloseTrackedLocation))
-        {
-            // Bot moved to a different instance: start fresh on this one.
-            this.autoCloseTrackedLocation = loc;
-            this.autoCloseIdleSince = null;
-        }
-        if (this.countOtherUsersInClientInstance() > 0)
-        {
-            // Someone else is here: keep it open, reset the idle timer to the full duration.
-            this.autoCloseIdleSince = null;
-            return;
-        }
-        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        if (this.autoCloseIdleSince == null)
-        {
-            // Just became bot-only: begin counting.
-            this.autoCloseIdleSince = now;
-            return;
-        }
-        if (now.isBefore(this.autoCloseIdleSince.plusMinutes(minutes)))
-            return; // Idle, but not long enough yet.
-        // Timer elapsed: re-check the roster one last time before acting, then close.
-        if (this.countOtherUsersInClientInstance() > 0)
-        {
-            this.autoCloseIdleSince = null; // Someone showed up at the last moment.
-            return;
-        }
-        this.autoCloseIdleBotInstance(loc, minutes);
-        this.autoCloseTrackedLocation = null;
-        this.autoCloseIdleSince = null;
-    }
-    /** Users in the bot's current instance other than the bot itself, from the live join/leave roster. */
-    int countOtherUsersInClientInstance()
-    {
-        Set<String> roster = this.eventListener.clientLocation_userIdsJoinOrder;
-        if (roster == null)
-            return 0;
-        String self = this.vrc.currentUserId;
-        int count = 0;
-        synchronized (roster)
-        {
-            for (String userId : roster)
-                if (userId != null && !userId.equals(self))
-                    count++;
-        }
-        return count;
-    }
-    void autoCloseIdleBotInstance(String location, int minutes)
-    {
-        Location locationModel = Location.of(location);
-        if (locationModel == null || !locationModel.isConcrete())
-        {
-            LOG.warn("Auto-close: could not parse the bot's instance location '"+location+"'; not closing.");
-            return;
-        }
-        String worldName;
-        try
-        {
-            io.github.vrchatapi.model.World world = this.vrc.getWorld(locationModel.world);
-            worldName = world == null ? locationModel.world : world.getName();
-        }
-        catch (Exception ex)
-        {
-            worldName = locationModel.world;
-        }
-        if (this.vrc.closeInstance(locationModel.world, locationModel.instance, Boolean.TRUE, null) != null)
-        {
-            LOG.info("Auto-closed idle bot instance "+location+" ("+worldName+") after "+minutes+" min bot-only.");
-            try { this.discord.emitExtendedInstanceEnforcement(this, location, worldName, "Auto-closed: idle ("+minutes+" min, bot only)"); }
-            catch (Exception ex) { LOG.warn("Auto-close: failed to emit close notice", ex); }
-        }
-        else
-        {
-            LOG.warn("Auto-close: failed to close idle bot instance "+location+" ("+worldName+").");
-        }
+        this.eventListener.idleInstanceClose.tick();
     }
 
     OffsetDateTime lastCalendarUpdate = OffsetDateTime.now(ZoneOffset.UTC);
@@ -3520,6 +3659,9 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
     }
     void queryEmit(long currentPollInterval)
     {
+        // Pending delivery is independent of the API polling cursor and must
+        // still progress while a new audit query is unavailable.
+        this.discord.retryPending(this);
         long offsetMillis = this.vrc.getLocalDriftMillis();
         if (currentPollInterval < 30_000L)
         {
@@ -3586,7 +3728,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         }
         
         LOG.debug("Querying from "+from+" to "+(to!=null?to:"now"));
-        List<GroupAuditLogEntry> entries = this.vrc.auditQuery(from, to);
+        List<GroupAuditLogEntryUnknown> entries = this.vrc.auditQuery(from, to);
         
         if (entries == null)
         {
@@ -3599,13 +3741,16 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             return;
         }
         
-        for (GroupAuditLogEntry entry : entries) try
+        boolean completeBatch = true;
+        for (GroupAuditLogEntryUnknown entry : entries) try
         {
             if (lastAuditQuery.isBefore(entry.getCreatedAt()))
             {
                 lastAuditQuery = entry.getCreatedAt();
             }
-            if (this.data.auditEntryMetadataExists(entry.getId()))
+            // The overlap window may recover closure proof even for a delivered Discord event.
+            this.discord.observeClientExitAudit(this, entry);
+            if (this.discord.isAuditProcessed(this, entry.getId()))
             {
                 // Already seen (re-fetched via the query overlap window):
                 // ScarletDiscord.process would dedupe this by ID anyway, but
@@ -3644,11 +3789,15 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         }
         catch (Exception ex)
         {
-            LOG.error("Exception processing audit entry "+entry.getId()+" of type "+entry.getEventType()+": `"+entry.toJson()+"`", ex);
-            ex.printStackTrace();
+            LOG.error("Audit batch remains pending because an entry could not be safely recorded", ex);
+            completeBatch = false;
+            break;
         }
 
-        this.settings.lastAuditQuery.set(lastAuditQuery);
+        // A failed durable outbox write must never be hidden behind a later cursor.
+        // Replay the batch; already acknowledged entries are deduplicated by ID.
+        if (completeBatch)
+            this.settings.lastAuditQuery.set(lastAuditQuery);
     }
 
 }

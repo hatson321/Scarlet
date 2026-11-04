@@ -12,7 +12,7 @@ public abstract class Main
         if (Platform.forceHeadlessUi() && System.getProperty("java.awt.headless") == null)
         {
             System.setProperty("java.awt.headless", "true");
-            System.err.println("Android/Termux runtime detected; forcing headless UI mode");
+            System.err.println("Headless UI mode requested; forcing java.awt.headless=true");
         }
         MavenDepsLoader.init();
         // After dependencies (incl. JNA) are loaded, switch console + stdout/stderr

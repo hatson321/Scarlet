@@ -31,11 +31,17 @@ public class DAudioDaveSession implements DaveSession, Closeable
 
     public DAudioDaveSession(DaveProtocolCallbacks callbacks, long userId, long channelId)
     {
+        this(callbacks, userId, channelId, Dave.INSTANCE.createSession(null, null, null, null), new DaveEncryptor());
+    }
+
+    DAudioDaveSession(DaveProtocolCallbacks callbacks, long userId, long channelId,
+        DaveSessionInstance session, DaveEncryptor encryptor)
+    {
         this.callbacks = callbacks;
         this.selfUserId = userId;
         this.channelId = channelId;
-        this.session = Dave.INSTANCE.createSession(null, null, null, null);
-        this.encryptor = new DaveEncryptor();
+        this.session = session;
+        this.encryptor = encryptor;
         this.decryptors = new ConcurrentHashMap<>();
         this.preparedTransitions = new ConcurrentHashMap<>();
         this.currentProtocolVersion = DaveLibrary.DAVE_DISABLED_PROTOCOL_VERSION;
@@ -54,11 +60,25 @@ public class DAudioDaveSession implements DaveSession, Closeable
     @Override
     public synchronized void close()
     {
+        if (this.closed)
+            return;
         this.closed = true;
-        this.encryptor.close();
-        this.decryptors.values().forEach(DaveDecryptor::close);
-        this.decryptors.clear();
-        this.session.close();
+        try { this.encryptor.close(); }
+        finally
+        {
+            try
+            {
+                for (DaveDecryptor decryptor : this.decryptors.values())
+                    try { decryptor.close(); }
+                    catch (RuntimeException ex) { LOG.warn("DAVE decryptor cleanup failed", ex); }
+            }
+            finally
+            {
+                this.decryptors.clear();
+                this.preparedTransitions.clear();
+                this.session.close();
+            }
+        }
     }
 
     @Override
@@ -124,7 +144,10 @@ public class DAudioDaveSession implements DaveSession, Closeable
         default: return false;
         }
         LongByReference bytesWritten = new LongByReference();
-        return this.encryptor.encrypt(mediaType, ssrc, data, encrypted, bytesWritten) == DaveLibrary.DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS;
+        int start = encrypted.position(), available = encrypted.remaining();
+        int result = this.encryptor.encrypt(mediaType, ssrc, data, encrypted, bytesWritten);
+        return finishOutput(encrypted, start, available, bytesWritten.getValue(),
+            result == DaveLibrary.DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS);
     }
 
     @Override
@@ -142,7 +165,18 @@ public class DAudioDaveSession implements DaveSession, Closeable
         if (decryptor == null)
             return false;
         LongByReference bytesWritten = new LongByReference();
-        return decryptor.decrypt(mediaType, encrypted, decrypted, bytesWritten) == DaveLibrary.DAVE_DECRYPTOR_RESULT_CODE_SUCCESS;
+        int start = decrypted.position(), available = decrypted.remaining();
+        int result = decryptor.decrypt(mediaType, encrypted, decrypted, bytesWritten);
+        return finishOutput(decrypted, start, available, bytesWritten.getValue(),
+            result == DaveLibrary.DAVE_DECRYPTOR_RESULT_CODE_SUCCESS);
+    }
+
+    private static boolean finishOutput(ByteBuffer output, int start, int available, long written, boolean success)
+    {
+        boolean valid = success && written >= 0L && written <= available;
+        output.position(start);
+        output.limit(start + (valid ? (int)written : 0));
+        return valid;
     }
 
     @Override

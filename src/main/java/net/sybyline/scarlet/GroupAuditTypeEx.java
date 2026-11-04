@@ -68,6 +68,12 @@ public enum GroupAuditTypeEx implements DEnum.DEnumString<GroupAuditTypeEx>
         return this.color;
     }
 
+    /** Only these extended emitters currently implement a separate confidential route. */
+    public boolean supportsSecretRouting()
+    {
+        return this == INSTANCE_MONITOR || this == ACTION_FAIL || this == LIVE_PLAYERLIST;
+    }
+
     static final Map<String, GroupAuditTypeEx> BY_ID = new HashMap<>();
     static
     {

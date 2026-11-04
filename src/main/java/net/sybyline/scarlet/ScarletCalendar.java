@@ -1,8 +1,12 @@
 package net.sybyline.scarlet;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -20,11 +24,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonElement;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 
 import io.github.vrchatapi.JSON;
 import io.github.vrchatapi.model.CalendarEvent;
 import io.github.vrchatapi.model.CreateCalendarEventRequest;
 import io.github.vrchatapi.model.CreateInstanceRequest;
+import io.github.vrchatapi.model.CreateInstanceRequestRegion;
 import io.github.vrchatapi.model.GroupPermissions;
 import io.github.vrchatapi.model.Instance;
 import io.github.vrchatapi.model.InstanceType;
@@ -56,6 +64,7 @@ public class ScarletCalendar
 
     public void update()
     {
+        if (this.loadFailed) return;
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         if (!this.eventSpecs.isEmpty())
         {
@@ -78,9 +87,10 @@ public class ScarletCalendar
         public Duration duration = Duration.ofHours(1L);
         
         public CreateCalendarEventRequest vrcCalendarEventParameters = new CreateCalendarEventRequest();
-        public CreateInstanceRequest vrcInstanceParameters = new CreateInstanceRequest();
+        public CreateInstanceRequest vrcInstanceParameters = new CreateInstanceRequest().region(CreateInstanceRequestRegion.US);
         
         public Map<LocalDate, Scheduled> pending = new HashMap<>();
+        private transient boolean receiptSavePending;
         
         public synchronized EmbedBuilder embed(EmbedBuilder builder)
         {
@@ -113,6 +123,15 @@ public class ScarletCalendar
         
         public synchronized void update(ScarletCalendar calendar, ScarletVRChat vrc, String groupId, ScarletDiscordJDA discord, OffsetDateTime now)
         {
+            if (calendar.loadFailed) return;
+            if (this.receiptSavePending)
+            {
+                if (!calendar.save()) return;
+                this.receiptSavePending = false;
+            }
+            // An event POST may have succeeded even when its response was lost. Keep
+            // the durable intent for reconciliation; never replay it after restart.
+            if (this.pending.values().stream().anyMatch(s -> s.eventCreationAttempted && s.vrchatEventId == null)) return;
 if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
             if (!this.active)
                 return;
@@ -139,6 +158,7 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
                         if (nextDate != null && !this.hasPending(nextDate))
                         {
                             this.makeEvent(calendar, vrc, groupId, discord, nextDate);
+                            if (!this.active || this.receiptSavePending) return;
                         }
                     }
                 }
@@ -148,12 +168,12 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
             List<LocalDate> removed = new ArrayList<>();
             this.pending.forEach((date, scheduled) ->
             {
-                if (((scheduled.needsCreate != null && scheduled.needsCreate.isAfter(now))
-                 || ((scheduled.start != null && scheduled.start.isAfter(now)))))
+                if (isInstanceDue(scheduled, now))
                 {
                     this.makeInstance(calendar, vrc, scheduled);
                 }
-                if ((scheduled.end != null && scheduled.end.isBefore(now)) || date.isBefore(nowDate))
+                if ((scheduled.end != null && !now.isBefore(scheduled.end))
+                    || (scheduled.end == null && date.isBefore(nowDate)))
                 {
                     removed.add(date);
                 }
@@ -168,21 +188,35 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
         }
         public synchronized void makeEvent(ScarletCalendar calendar, ScarletVRChat vrc, String groupId, ScarletDiscordJDA discord, LocalDate futureDate)
         {
+            if (calendar.loadFailed) return;
             OffsetDateTime start = futureDate.atTime(this.time),
                     end = start.plus(this.duration);
             Scheduled scheduled = this.getOrCreatePending(futureDate, start, end);
             
             CreateCalendarEventRequest request = this.vrcCalendarEventParameters;
             CalendarEvent vrcEvent;
-            if (scheduled.vrchatEventId != null)
+            if (scheduled.vrchatEventId != null || scheduled.eventCreationAttempted)
             {
-                LOG.error("Internal error: tried to schedule duplicate event for `"+this.id+"` on "+futureDate);
+                LOG.error("Event creation already attempted for `"+this.id+"` on "+futureDate+"; reconcile its existing receipt before retrying");
+                return;
+            }
+            scheduled.vrchatGroupId = groupId;
+            scheduled.eventCreationAttempted = true;
+            if (!calendar.save())
+            {
+                // No remote request was made. Do not authorize an event on an
+                // unpersisted intent, and retain the schedule for explicit retry.
+                scheduled.eventCreationAttempted = false;
+                this.active = false;
+                LOG.error("Event creation skipped: could not persist scheduling intent for {}", this.id);
                 return;
             }
             try
             {
                 request.setStartsAt(start.withOffsetSameInstant(ZoneOffset.UTC));
                 request.setEndsAt(end.withOffsetSameInstant(ZoneOffset.UTC));
+                // Scheduled events are published, not the SDK's new draft-by-default events.
+                request.setIsDraft(Boolean.FALSE);
                 if (request.getFeatured() != null && request.getFeatured().booleanValue())
                 {
                     if (!vrc.checkGroupHasAdminTag(GroupAdminTag.FEATURED_EVENTS_ENABLED))
@@ -200,21 +234,26 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
                     }
                 }
                 vrcEvent = vrc.createCalendarEvent(groupId, request);
-                if (vrcEvent == null)
-                    throw new IllegalStateException("vrcEvent == null");
+                if (vrcEvent == null || vrcEvent.getId() == null || vrcEvent.getId().isEmpty())
+                    throw new IllegalStateException("Event creation result has no confirmed identity");
                 this.date = futureDate;
-                calendar.save();
+                scheduled.vrchatEventId = vrcEvent.getId();
+                // Persist the receipt immediately, including when Discord mirroring is off.
+                if (!calendar.save())
+                {
+                    this.receiptSavePending = true;
+                    this.active = false;
+                    LOG.error("Event was created but its receipt could not be saved; scheduling paused for {}", this.id);
+                    return;
+                }
             }
             catch (Exception ex)
             {
-                LOG.error("Exception creating vrchat event `"+this.id+"` on "+futureDate+", deactivating event for now", ex);
-                this.pending.remove(futureDate, scheduled);
+                LOG.error("Event creation result needs reconciliation for `"+this.id+"` on "+futureDate+"; automatic retry is blocked", ex);
                 this.active = false;
-                calendar.save();
+                this.receiptSavePending = !calendar.save();
                 return;
             }
-            scheduled.vrchatGroupId = groupId;
-            scheduled.vrchatEventId = vrcEvent.getId();
             if (this.mirrorOnDiscord)
             {
                 String guildSf = MiscUtils.nonBlankOrNull(calendar.alternateGuildSf, discord.guildSf);
@@ -272,7 +311,7 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
                             throw new IllegalStateException("discordEvent == null");
                         scheduled.discordGuildSf = guildSf;
                         scheduled.discordEventSf = discordEvent.getId();
-                        calendar.save();
+                        this.receiptSavePending = !calendar.save();
                     }
                     catch (Exception ex)
                     {
@@ -286,7 +325,9 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
         @Deprecated
         public synchronized void makeInstance(ScarletCalendar calendar, ScarletVRChat vrc, Scheduled scheduled)
         {
-            if (scheduled == null || scheduled.vrchatGroupId == null || scheduled.vrchatEventId == null || scheduled.vrchatLocation != null)
+            if (calendar.loadFailed) return;
+            if (scheduled == null || scheduled.vrchatGroupId == null || scheduled.vrchatEventId == null
+                || scheduled.vrchatLocation != null || scheduled.instanceCreationAttempted)
                 return;
             CreateInstanceRequest request = this.vrcInstanceParameters;
             if (request == null || request.getWorldId() == null)
@@ -295,26 +336,44 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
             {
                 request.setType(InstanceType.GROUP);
                 request.setOwnerId(scheduled.vrchatGroupId);
+                if (request.getRegion() == null)
+                    request.setRegion(CreateInstanceRequestRegion.US);
 //                request.setCalendarEntryId(scheduled.vrchatEventId);
 //                request.setClosedAt(this.date.atTime(this.time).plus(this.duration).plusMinutes(closeAfterEndMins != null ? closeAfterEndMins.longValue() : 0L));
                 request.setDisplayName(this.vrcCalendarEventParameters.getTitle());
                 requestJson = JSON.getGson().toJsonTree(request, CreateInstanceRequest.class).getAsJsonObject();
                 requestJson.addProperty("calendarEntryId", scheduled.vrchatEventId);
             }
+            // Persist the attempt before the remote operation. An ambiguous timeout or
+            // crash must not create another instance on the next tick or after restart.
+            scheduled.instanceCreationAttempted = true;
+            if (!calendar.save())
+            {
+                scheduled.instanceCreationAttempted = false;
+                LOG.error("Instance creation skipped: could not persist scheduling state");
+                return;
+            }
             try
             {
                 Instance instance = vrc.createInstanceEx(requestJson);
-                if (instance != null)
-                {
-                    scheduled.vrchatLocation = instance.getLocation();
-                }
-                calendar.save();
+                if (instance == null)
+                    throw new IllegalStateException("Instance result unknown; reconcile before retrying");
+                scheduled.vrchatLocation = instance.getLocation();
+                if (!calendar.save())
+                    LOG.error("Instance was created but its location could not be saved; reconcile scheduling state");
                 LOG.info("Created VRChat instance in "+request.getWorldId()+" for "+this.id+"/"+scheduled.vrchatEventId+": "+instance.getInstanceId());
             }
             catch (Exception ex)
             {
-                LOG.error("Failed to create VRChat instance in "+request.getWorldId()+" for "+this.id+"/"+scheduled.vrchatEventId, ex);
+                LOG.error("Instance creation result requires reconciliation before another attempt for "+this.id, ex);
             }
+        }
+        static boolean isInstanceDue(Scheduled scheduled, OffsetDateTime now)
+        {
+            OffsetDateTime due = scheduled.needsCreate != null ? scheduled.needsCreate : scheduled.start;
+            return due != null && scheduled.end != null && !now.isBefore(due)
+                && now.isBefore(scheduled.end) && scheduled.vrchatLocation == null
+                && !scheduled.instanceCreationAttempted;
         }
         synchronized boolean hasPending(LocalDate date)
         {
@@ -356,6 +415,9 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
         public OffsetDateTime end;
         public OffsetDateTime needsClose;
         public String vrchatLocation;
+        public boolean instanceCreationAttempted;
+        /** Persisted before a calendar-event POST; an absent receipt requires manual reconciliation. */
+        public boolean eventCreationAttempted;
         public String vrchatGroupId;
         public String vrchatEventId;
         public String discordGuildSf;
@@ -510,6 +572,8 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
     final File calendarFile;
     String alternateGuildSf;
     final Map<String, EventSpec> eventSpecs;
+    private volatile boolean loadFailed;
+    private boolean loaded;
 
     public static class DataSpec
     {
@@ -517,51 +581,126 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
         public Map<String, EventSpec> eventSpecs;
     }
 
-    public boolean load()
+    public synchronized boolean load()
     {
-        if (!this.calendarFile.isFile())
-        {
-            this.save();
-            return true;
-        }
         DataSpec spec;
-        try (Reader r = MiscUtils.reader(this.calendarFile))
+        try
         {
-            spec = Scarlet.GSON_PRETTY.fromJson(r, DataSpec.class);
+            Path path = this.calendarFile.toPath();
+            if (Files.notExists(path, LinkOption.NOFOLLOW_LINKS))
+            {
+                // Missing after a failure/previous load is not evidence of a fresh installation.
+                // Backups remain a manual recovery decision: activating an old schedule could
+                // replay externally created events whose receipts are absent in that backup.
+                if (this.loadFailed || this.loaded || this.hasBackups())
+                    throw new IOException("Calendar is missing and requires explicit recovery");
+                boolean saved = this.save();
+                this.loaded = saved;
+                this.loadFailed = !saved;
+                return saved;
+            }
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+                throw new IOException("Calendar is not a readable regular file");
+            this.loadFailed = true;
+            try (Reader r = this.openCalendarReader(); JsonReader json = new JsonReader(r))
+            {
+                json.setStrictness(com.google.gson.Strictness.STRICT);
+                JsonElement tree = Scarlet.GSON_PRETTY.getAdapter(JsonElement.class).read(json);
+                if (json.peek() != JsonToken.END_DOCUMENT || tree == null || !tree.isJsonObject()
+                    || !tree.getAsJsonObject().has("eventSpecs")
+                    || !tree.getAsJsonObject().get("eventSpecs").isJsonObject())
+                    throw new IOException("Invalid calendar document");
+                JsonObject object = tree.getAsJsonObject();
+                JsonElement guild = object.get("alternateGuildSf");
+                if (guild != null && !guild.isJsonNull()
+                    && (!guild.isJsonPrimitive() || !guild.getAsJsonPrimitive().isString()))
+                    throw new IOException("Invalid calendar guild");
+                for (Map.Entry<String, JsonElement> entry : object.getAsJsonObject("eventSpecs").entrySet())
+                {
+                    if (entry.getKey().isEmpty() || !entry.getValue().isJsonObject())
+                        throw new IOException("Invalid calendar schedule");
+                    JsonObject value = entry.getValue().getAsJsonObject();
+                    JsonElement id = value.get("id"), pending = value.get("pending");
+                    if (id == null || !id.isJsonPrimitive() || !id.getAsJsonPrimitive().isString()
+                        || !entry.getKey().equals(id.getAsString()) || pending == null || !pending.isJsonObject())
+                        throw new IOException("Incomplete calendar schedule identity or receipts");
+                }
+                spec = Scarlet.GSON_PRETTY.fromJson(tree, DataSpec.class);
+                if (spec == null || spec.eventSpecs == null)
+                    throw new IOException("Missing calendar schedules");
+                for (EventSpec event : spec.eventSpecs.values())
+                {
+                    if (event == null || event.frequency == null || event.pending == null
+                        || event.pending.containsKey(null) || event.pending.containsValue(null))
+                        throw new IOException("Invalid calendar schedule state");
+                    // Older versions could save a pending date before its successful
+                    // API receipt. Absence of that receipt is not permission to replay.
+                    for (Scheduled scheduled : event.pending.values())
+                        if (scheduled.vrchatEventId == null) scheduled.eventCreationAttempted = true;
+                }
+            }
         }
         catch (Exception ex)
         {
-            LOG.error("Exception loading pending moderation actions", ex);
+            this.loadFailed = true;
+            LOG.error("Calendar could not be loaded; scheduling and saves are disabled until a valid file is restored and reloaded", ex);
             return false;
         }
-        this.alternateGuildSf = null;
-        if (spec != null && spec.alternateGuildSf != null && !spec.alternateGuildSf.isEmpty())
-        {
-            this.alternateGuildSf = spec.alternateGuildSf;
-        }
+        // Publish only after the entire document is parsed and validated. Failed reloads
+        // retain the last known in-memory data, but cannot act on it or overwrite disk.
+        this.alternateGuildSf = spec.alternateGuildSf == null || spec.alternateGuildSf.isEmpty() ? null : spec.alternateGuildSf;
         this.eventSpecs.clear();
-        if (spec != null && spec.eventSpecs != null && !spec.eventSpecs.isEmpty())
+        this.eventSpecs.putAll(spec.eventSpecs);
+        this.loaded = true;
+        this.loadFailed = false;
+        return true;
+    }
+
+    Reader openCalendarReader() throws IOException { return MiscUtils.reader(this.calendarFile); }
+
+    private boolean hasBackups() throws IOException
+    {
+        Path directory = this.calendarFile.getAbsoluteFile().toPath().getParent().resolve("backups");
+        if (Files.notExists(directory, LinkOption.NOFOLLOW_LINKS)) return false;
+        try (java.nio.file.DirectoryStream<Path> backups = Files.newDirectoryStream(directory,
+            path -> path.getFileName().toString().startsWith(this.calendarFile.getName() + ".")
+                && path.getFileName().toString().endsWith(".bak")))
         {
-            this.eventSpecs.putAll(spec.eventSpecs);
+            return backups.iterator().hasNext();
+        }
+    }
+
+    public synchronized boolean save()
+    {
+        if (this.loadFailed)
+        {
+            LOG.error("Calendar storage could not be loaded; refusing to overwrite schedules or authorize scheduling");
+            return false;
+        }
+        DataSpec spec = new DataSpec();
+        spec.alternateGuildSf = this.alternateGuildSf;
+        spec.eventSpecs = new HashMap<>(this.eventSpecs);
+        try
+        {
+            net.sybyline.scarlet.util.FileBackups.write(this.calendarFile,
+                w -> Scarlet.GSON_PRETTY.toJson(spec, DataSpec.class, w));
+        }
+        catch (Exception ex)
+        {
+            LOG.error("Exception saving calendar schedules", ex);
+            return false;
         }
         return true;
     }
 
-    public boolean save()
+    public synchronized boolean removeAndSave(EventSpec expected) throws java.io.IOException
     {
-        DataSpec spec = new DataSpec();
-        spec.alternateGuildSf = this.alternateGuildSf;
-        spec.eventSpecs = new HashMap<>(this.eventSpecs);
-        try (Writer w = net.sybyline.scarlet.util.FileBackups.writer(this.calendarFile))
-        {
-            Scarlet.GSON_PRETTY.toJson(spec, DataSpec.class, w);
-        }
-        catch (Exception ex)
-        {
-            LOG.error("Exception saving pending moderation actions", ex);
+        if (expected == null || !this.eventSpecs.remove(expected.id, expected))
             return false;
-        }
-        return true;
+        if (this.save())
+            return true;
+        this.eventSpecs.putIfAbsent(expected.id, expected);
+        throw new java.io.IOException("Schedule deletion was not saved; the schedule remains configured");
     }
 
 }

@@ -5,6 +5,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -12,8 +13,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import net.sybyline.scarlet.util.Platform;
 
 /**
  * Comprehensive Linux Package Manager Detection and Management.
@@ -136,9 +135,6 @@ public class LinuxPackageManagerDetector {
         // The install command format uses {pkg} as placeholder for package names.
         
         // Debian/Ubuntu family
-        PACKAGE_MANAGER_DEFINITIONS.put("pkg", new String[]{
-            "pkg install -y {pkg}", "pkg search {pkg}", "espeak", "false"
-        });
         PACKAGE_MANAGER_DEFINITIONS.put("apt", new String[]{
             "apt install -y {pkg}", "apt search {pkg}", "espeak-ng", "true"
         });
@@ -228,10 +224,6 @@ public class LinuxPackageManagerDetector {
 
     static {
         // Format: {id, display_name, command_name, package_names, description}
-        TTS_PACKAGE_OPTIONS.put("pkg", new String[][]{
-            opt("espeak", "eSpeak", "espeak", "espeak", "Termux's compact fallback TTS engine")
-        });
-
         String[][] debianLike = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
@@ -316,7 +308,7 @@ public class LinuxPackageManagerDetector {
         });
         TTS_PACKAGE_OPTIONS.put("brew", new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
-            opt("mimic", "Mimic", "mimic", "mimic", "Mycroft's Flite-derived voices with better English output")
+            opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices supported by Scarlet")
         });
         TTS_PACKAGE_OPTIONS.put("flatpak", new String[0][0]);
 
@@ -353,7 +345,6 @@ public class LinuxPackageManagerDetector {
         // binary_check: Check if the binary exists
         // distro_check: Additional check specific to distro (optional)
         
-        DETECTION_COMMANDS.put("pkg", new String[]{"which pkg", "test -n \"$TERMUX_VERSION\" -o -n \"$TERMUX_APP_PID\""});
         DETECTION_COMMANDS.put("apt", new String[]{"which apt", "test -f /etc/debian_version"});
         DETECTION_COMMANDS.put("apt-get", new String[]{"which apt-get", "test -f /etc/debian_version"});
         DETECTION_COMMANDS.put("dnf", new String[]{"which dnf", "test -f /etc/fedora-release"});
@@ -384,7 +375,6 @@ public class LinuxPackageManagerDetector {
     
     static {
         // Native package managers get highest priority
-        PRIORITY_ORDER.put("pkg", 1);
         PRIORITY_ORDER.put("apt", 10);
         PRIORITY_ORDER.put("apt-get", 11);
         PRIORITY_ORDER.put("dnf", 20);
@@ -524,14 +514,69 @@ public class LinuxPackageManagerDetector {
      * Detect package managers that can install a usable command-line TTS engine.
      */
     public static List<PackageManager> detectAllTtsPackageManagers() {
-        List<PackageManager> managers = detectAllPackageManagers();
+        boolean atomic = isAtomicHost();
+        // Atomic hosts can ship deliberately failing DNF/YUM compatibility wrappers.
+        // Do not offer those, or silently stage an OS deployment for a speech engine.
+        return selectTtsPackageManagers(atomic ? Collections.emptyList() : detectAllPackageManagers(),
+            atomic, LinuxTtsExecutables.find("brew"));
+    }
+
+    public static boolean isAtomicHost() {
+        return isAtomicHost(new File("/run/ostree-booted").exists(),
+            new File("/run/.containerenv").exists() || new File("/.dockerenv").exists());
+    }
+
+    static boolean isAtomicHost(boolean ostreeBooted, boolean container) {
+        return ostreeBooted && !container;
+    }
+
+    static List<PackageManager> selectTtsPackageManagers(List<PackageManager> managers,
+        boolean atomic, String brewExecutable) {
         List<PackageManager> result = new ArrayList<>();
+        PackageManager brew = brewExecutable == null ? null : new PackageManager(
+            "brew", "Homebrew (Linux, current user)", quoteShellArgument(brewExecutable) + " install {pkg}",
+            quoteShellArgument(brewExecutable) + " search {pkg}", "espeak-ng", false, true,
+            "resolved executable");
+        if (atomic) {
+            if (brew != null) result.add(brew);
+            return result;
+        }
+        boolean addedBrew = false;
         for (PackageManager pm : managers) {
-            if (!getTtsPackageOptions(pm).isEmpty()) {
+            if ("brew".equals(pm.name)) {
+                if (brew != null && !addedBrew) {
+                    result.add(brew);
+                    addedBrew = true;
+                }
+            } else if (!getTtsPackageOptions(pm).isEmpty()) {
                 result.add(pm);
             }
         }
+        if (brew != null && !addedBrew) result.add(brew);
         return result;
+    }
+
+    static String quoteShellArgument(String value) {
+        return "'" + value.replace("'", "'\"'\"'") + "'";
+    }
+
+    /** Guidance only; never passed to an installer as a shell command. */
+    public static String getTtsInstallGuidance() {
+        return getTtsInstallGuidance(isAtomicHost());
+    }
+
+    static String getTtsInstallGuidance(boolean atomic) {
+        if (atomic) {
+            return "Atomic/immutable Linux detected. TTS setup uses an existing Homebrew installation as the current user, "
+                + "not the host DNF/YUM wrappers. Scarlet does not install Homebrew, layer OS packages, or reboot the device. "
+                + "If Homebrew is unavailable or not writable by your account, follow your distribution's Homebrew setup "
+                + "instructions, then retry. Manual Homebrew command: brew install espeak-ng. "
+                + "Bazzite guidance: https://docs.bazzite.gg/Installing_and_Managing_Software/Homebrew/ . "
+                + "If you independently choose rpm-ostree package layering, a reboot is normally required before "
+                + "the engine is usable; Scarlet will not perform that operation automatically.";
+        }
+        return "Install a supported command-line speech engine, such as espeak-ng or flite, using your distribution's "
+            + "documented package manager, then retry. Scarlet will not guess an APT command on an unrecognized system.";
     }
 
     /**
@@ -604,10 +649,7 @@ public class LinuxPackageManagerDetector {
     public static String getTtsInstallCommand() {
         PackageManager pm = getPrimaryTtsPackageManager();
         if (pm == null) {
-            if (Platform.isTermux()) {
-                return "pkg install -y espeak";
-            }
-            return "sudo apt-get install -y espeak-ng"; // Default fallback
+            return ""; // Unknown host: guidance is separate from executable commands.
         }
         return pm.getInstallCommand();
     }
@@ -734,7 +776,6 @@ public class LinuxPackageManagerDetector {
     private static String getDisplayName(String name) {
         switch (name) {
             case "apt": return "APT (Debian/Ubuntu)";
-            case "pkg": return "Termux pkg";
             case "apt-get": return "APT-GET (Debian/Ubuntu Legacy)";
             case "dnf": return "DNF (Fedora)";
             case "yum": return "YUM (RHEL/CentOS)";

@@ -34,6 +34,21 @@ import java.awt.image.*;
 
 public class GifDecoder {
 
+	private final int maxDimension, maxFrames;
+	private final long maxDecodedBytes;
+
+	public GifDecoder() {
+		this(2048, 256, 128L * 1024 * 1024);
+	}
+
+	public GifDecoder(int maxDimension, int maxFrames, long maxDecodedBytes) {
+		if (maxDimension < 1 || maxDimension > 2048 || maxFrames < 1 || maxDecodedBytes < 1)
+			throw new IllegalArgumentException("Invalid GIF decode limits");
+		this.maxDimension = maxDimension;
+		this.maxFrames = maxFrames;
+		this.maxDecodedBytes = maxDecodedBytes;
+	}
+
 	/**
 	 * File read status: No errors.
 	 */
@@ -665,6 +680,17 @@ public class GifDecoder {
 		iw = readShort();
 		ih = readShort();
 
+		// Check before both the LZW pixel array and full-canvas frame allocation.
+		long canvasBytes = 4L * width * height;
+		long projectedBytes = canvasBytes * (frameCount + 1L) + (long)iw * ih
+			+ 65536L * (frameCount + 1L) + 1024L * 1024L;
+		if (iw <= 0 || ih <= 0 || iw > maxDimension || ih > maxDimension
+			|| ix < 0 || iy < 0 || (long)ix + iw > width || (long)iy + ih > height
+			|| frameCount >= maxFrames || projectedBytes > maxDecodedBytes) {
+			status = STATUS_FORMAT_ERROR;
+			return;
+		}
+
 		int packed = read();
 		lctFlag = (packed & 0x80) != 0; // 1 - local color table flag
 		interlace = (packed & 0x40) != 0; // 2 - interlace flag
@@ -722,6 +748,11 @@ public class GifDecoder {
 		// logical screen size
 		width = readShort();
 		height = readShort();
+		if (width <= 0 || height <= 0 || width > maxDimension || height > maxDimension
+			|| 5L * width * height + 65536L + 1024L * 1024L > maxDecodedBytes) {
+			status = STATUS_FORMAT_ERROR;
+			return;
+		}
 
 		// packed fields
 		int packed = read();

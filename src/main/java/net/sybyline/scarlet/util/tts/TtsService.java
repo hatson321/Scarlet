@@ -487,14 +487,12 @@ public class TtsService implements Closeable
      * On desktop Linux, offers to install a CLI audio player (via the system
      * package manager) the first time playback finds none. Runs the prompt on a
      * background thread so the playback queue is not blocked, and re-arms player
-     * detection if an install succeeds. No-op on Windows/macOS (Java Sound works
-     * there) and on Android/Termux (TTS is routed to Discord).
+     * detection if an install succeeds. No-op on Windows/macOS, where Java Sound
+     * provides local playback.
      */
     private void maybePromptAudioPlayerInstall()
     {
-        if (net.sybyline.scarlet.util.Platform.CURRENT != net.sybyline.scarlet.util.Platform.$NIX
-            || net.sybyline.scarlet.util.Platform.isTermux()
-            || net.sybyline.scarlet.util.Platform.isAndroid())
+        if (net.sybyline.scarlet.util.Platform.CURRENT != net.sybyline.scarlet.util.Platform.$NIX)
             return;
         if (!this.playerInstallPrompted.compareAndSet(false, true))
             return;

@@ -20,18 +20,23 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.ObjIntConsumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
@@ -882,44 +887,35 @@ public class DInteractions
         }
         public static void autocomplete(CommandAutoCompleteInteractionEvent event, Command.Choice[] values, boolean includeTyping)
         {
-            String typing = event.getFocusedOption().getValue().trim();
+            event.replyChoices(choices(event.getFocusedOption().getValue(), values, includeTyping)).queue();
+        }
+        static Command.Choice[] choices(String input, Command.Choice[] values, boolean includeTyping)
+        {
+            String typing = input == null ? "" : input.trim();
             if (!typing.isEmpty())
             {
-                values = (Stream.concat(includeTyping ? Stream.of(new Command.Choice(typing, typing)) : Stream.empty(), Arrays.stream(values).sorted(choicesByLevenshtein(typing)))).limit(25L).toArray(Command.Choice[]::new);
+                String normalized = typing.toLowerCase(Locale.ROOT);
+                Comparator<Command.Choice> order = Comparator
+                    .comparingInt((Command.Choice choice) -> matchRank(normalized, choice))
+                    .thenComparingInt(choice -> Math.min(
+                        MiscUtils.levenshtein(normalized, choice.getName().toLowerCase(Locale.ROOT)),
+                        MiscUtils.levenshtein(normalized, choice.getAsString().toLowerCase(Locale.ROOT))));
+                values = (Stream.concat(includeTyping ? Stream.of(new Command.Choice(typing, typing)) : Stream.empty(), Arrays.stream(values).sorted(order))).limit(25L).toArray(Command.Choice[]::new);
             }
             else if (values.length > 25)
             {
                 values = Arrays.copyOf(values, 25);
             }
-            event.replyChoices(values).queue();
+            return values;
         }
-    }
-    public static class SlashOptionsMultiChoicesUnsanitized<DE extends Enum<DE> & DEnum<DE, String>> implements SlashCompleteHandler
-    {
-        public SlashOptionsMultiChoicesUnsanitized(Supplier<Command.Choice[]> values, boolean includeTyping)
+        private static int matchRank(String typing, Command.Choice choice)
         {
-            this.values = values;
-            this.includeTyping = includeTyping;
-        }
-        final Supplier<Command.Choice[]> values;
-        final boolean includeTyping;
-        @Override
-        public void autocomplete(CommandAutoCompleteInteractionEvent event)
-        {
-            autocomplete(event, this.values.get(), this.includeTyping);
-        }
-        public static void autocomplete(CommandAutoCompleteInteractionEvent event, Command.Choice[] values, boolean includeTyping)
-        {
-            String typing = event.getFocusedOption().getValue().trim();
-            if (!typing.isEmpty())
-            {
-                values = (Stream.concat(includeTyping ? Stream.of(new Command.Choice(typing, typing)) : Stream.empty(), Arrays.stream(values).sorted(choicesByLevenshtein(typing)))).limit(25L).toArray(Command.Choice[]::new);
-            }
-            else if (values.length > 25)
-            {
-                values = Arrays.copyOf(values, 25);
-            }
-            event.replyChoices(values).queue();
+            String name = choice.getName().toLowerCase(Locale.ROOT),
+                   value = choice.getAsString().toLowerCase(Locale.ROOT);
+            if (name.equals(typing) || value.equals(typing)) return 0;
+            if (name.startsWith(typing) || value.startsWith(typing)) return 1;
+            if (name.contains(typing) || value.contains(typing)) return 2;
+            return 3;
         }
     }
     public static class SlashOption<T>
@@ -1006,7 +1002,28 @@ public class DInteractions
         }
         public static <DE extends Enum<DE> & DEnum<DE, ?>> SlashOption<DE> ofEnum(String name, String desc, boolean required, DE _instance, DE fallback)
         {
-            return new SlashOption<>(_instance.type(), name, desc, required, fallback, ((DEnum<DE, ?>)_instance)::mapEnum, _instance.choices());
+            return new SlashOption<>(_instance.type(), name, desc, required, fallback,
+                mapping -> resolveEnum(_instance, mapping), _instance.choices());
+        }
+        static <DE extends Enum<DE> & DEnum<DE, ?>> DE resolveEnum(DE instance, OptionMapping mapping)
+        {
+            // Discord autocomplete is advisory: a client can still submit arbitrary text.
+            // Never let an unknown value silently become the enum's first/default member.
+            for (DE value : instance.getDeclaringClass().getEnumConstants())
+            {
+                Command.Choice choice = value.choice();
+                if (choice.getType() != mapping.getType()) continue;
+                boolean matches;
+                switch (choice.getType())
+                {
+                case STRING: matches = choice.getAsString().equals(mapping.getAsString()); break;
+                case INTEGER: matches = choice.getAsLong() == mapping.getAsLong(); break;
+                case NUMBER: matches = Double.compare(choice.getAsDouble(), mapping.getAsDouble()) == 0; break;
+                default: matches = false;
+                }
+                if (matches) return value;
+            }
+            throw new InvalidSlashOptionException();
         }
         public static <DE extends Enum<DE> & DEnum<DE, ?>> SlashOption<DE> ofEnum(String name, String desc, boolean required, DE fallback)
         {
@@ -1018,7 +1035,11 @@ public class DInteractions
         }
         public static <E extends Enum<E>> SlashOption<E> ofDOptionEnum(DOptionEnum<E> dOptionEnum, boolean required)
         {
-            return new SlashOption<E>(OptionType.STRING, dOptionEnum.name, dOptionEnum.description, required, null, dOptionEnum::getAsEnum, dOptionEnum.choices);
+            return new SlashOption<E>(OptionType.STRING, dOptionEnum.name, dOptionEnum.description, required, null, mapping -> {
+                E value = dOptionEnum.getAsEnum(mapping);
+                if (value == null) throw new InvalidSlashOptionException();
+                return value;
+            }, dOptionEnum.choices);
         }
         public static SlashOption<ZoneId> ofZoneId(String name, String desc, boolean required, ZoneId fallback)
         {
@@ -1077,7 +1098,7 @@ public class DInteractions
         }
         SlashOption(OptionData data, T fallback, Function<? super OptionMapping, ? extends T> resolver, Command.Choice[] choices)
         {
-            this(data.setAutoComplete(choices != null && choices.length > 25), fallback, resolver, choices == null || choices.length <= 25 ? (SlashCompleteHandler)null : new SlashOptionsChoicesUnsanitized(() -> choices, true));
+            this(data.setAutoComplete(choices != null && choices.length > 25), fallback, resolver, choices == null || choices.length <= 25 ? (SlashCompleteHandler)null : new SlashOptionsChoicesUnsanitized(() -> choices, false));
             if (choices != null && choices.length <= 25)
                 this.data.addChoices(choices);
         }
@@ -1108,7 +1129,13 @@ public class DInteractions
         }
         public T get(CommandInteractionPayload command)
         {
-            return command.getOption(this.data.getName(), this.fallback, this.resolver);
+            OptionMapping mapping = command.getOption(this.data.getName());
+            if (mapping == null)
+            {
+                if (this.data.isRequired()) throw new InvalidSlashOptionException();
+                return this.fallback;
+            }
+            return this.resolver.apply(mapping);
         }
         public MethodHandle mh(Class<?> rt, Class<?> cipt)
         {
@@ -1159,11 +1186,16 @@ public class DInteractions
                 builder = builder.setDefaultValues(defaultPopulate.value().toString());
             StringSelectMenu base = builder.build();
             Function<? super DE, ? extends LabelChildComponent> populator = populateValue -> populateValue == null ? base : base.createCopy().setDefaultValues(populateValue.value().toString()).build();
-            return new ModalFlowOption<>(id, name, desc, ((DEnum<DE, ?>)_const)::mapEnum, populator);
+            return new ModalFlowOption<>(id, name, desc, mapping -> {
+                List<String> selected = selections(mapping, required, 1, 1);
+                if (selected.isEmpty()) return null;
+                for (DE value : clazz.getEnumConstants())
+                    if (value.value().toString().equals(selected.get(0))) return value;
+                throw new InvalidSlashOptionException();
+            }, populator);
         }
         public static <DES extends Enum<DES> & DEnum.DEnumString<DES>> ModalFlowOption<DES[]> ofUniqueEnums(String id, String name, String desc, boolean required, String placeholder, int minChoices, int maxChoices, Class<DES> clazz, DES[] defaultPopulate)
         {
-            DES _const = (defaultPopulate != null && defaultPopulate.length > 0 && defaultPopulate[0] != null ? defaultPopulate : clazz.getEnumConstants())[0];
             StringSelectMenu.Builder builder = StringSelectMenu.create(id)
                 .setRequired(required)
                 .setPlaceholder(placeholder)
@@ -1173,29 +1205,62 @@ public class DInteractions
             if (defaultPopulate != null)
                 builder = builder.setDefaultValues(MiscUtils.map(defaultPopulate, String[]::new, DES::value));
             StringSelectMenu base = builder.build();
-            Function<? super DES[], ? extends LabelChildComponent> populator = populateValue -> populateValue == null ? base : base.createCopy().setDefaultValues(MiscUtils.map(defaultPopulate, String[]::new, DES::value)).build();
-            return new ModalFlowOption<DES[]>(id, name, desc, ((DEnum.DEnumString<DES>)_const)::mapEnums, populator);
+            Function<? super DES[], ? extends LabelChildComponent> populator = populateValue -> populateValue == null ? base : base.createCopy().setDefaultValues(MiscUtils.map(populateValue, String[]::new, DES::value)).build();
+            return new ModalFlowOption<DES[]>(id, name, desc, mapping -> {
+                List<String> selected = selections(mapping, required, minChoices, maxChoices);
+                DES[] result = Arrays.copyOf(clazz.getEnumConstants(), selected.size());
+                for (int index = 0; index < selected.size(); index++)
+                {
+                    result[index] = DEnum.of(clazz, selected.get(index));
+                    if (result[index] == null) throw new InvalidSlashOptionException();
+                }
+                return result;
+            }, populator);
+        }
+        static List<String> selections(ModalMapping mapping, boolean required, int minChoices, int maxChoices)
+        {
+            List<String> selected = mapping == null ? Collections.emptyList() : mapping.getAsStringList();
+            if (selected.isEmpty() && !required) return selected;
+            if (selected.size() < Math.max(required ? 1 : 0, minChoices) || selected.size() > maxChoices
+                || selected.stream().distinct().count() != selected.size())
+                throw new InvalidSlashOptionException();
+            return selected;
         }
         public static ModalFlowOption<GroupRole[]> ofUniqueGroupRoles(String id, String name, String desc, boolean required, String placeholder, int minChoices, int maxChoices, Map<String, GroupRole> map)
         {
-            StringSelectMenu.Builder builder = StringSelectMenu.create(id)
-                .setRequired(required)
-                .setPlaceholder(placeholder)
-                ;
-            Function<? super ModalMapping, ? extends GroupRole[]> resolver = mapping -> mapping.getAsStringList().stream().map(map::get).filter(Objects::nonNull).toArray(GroupRole[]::new);
-            Function<? super GroupRole[], ? extends LabelChildComponent> populator = populateValue -> builder.setRequiredRange(minChoices, Math.min(maxChoices, Math.min(map.size(), 25))).addOptions(map.entrySet().stream().limit(25L).map($ -> SelectOption.of($.getValue().getName(), $.getKey())).toArray(SelectOption[]::new)).setDefaultValues(populateValue == null ? new String[0] : MiscUtils.map(populateValue, String[]::new, GroupRole::getId)).build();
-            return new ModalFlowOption<GroupRole[]>(id, name, desc, resolver, populator);
+            return groupRolesPage(id, name, desc, required, placeholder, minChoices, maxChoices, map, 0);
         }
         public static ModalFlowOption<GroupRole[]> ofUniqueGroupRolesNext25(String id, String name, String desc, boolean required, String placeholder, int minChoices, int maxChoices, Map<String, GroupRole> map)
         {
-            StringSelectMenu.Builder builder = StringSelectMenu.create(id)
-                .setRequired(required)
-                .setPlaceholder(placeholder)
-                .setRequiredRange(minChoices, maxChoices)
-                ;
-            Function<? super ModalMapping, ? extends GroupRole[]> resolver = mapping -> mapping.getAsStringList().stream().map(map::get).filter(Objects::nonNull).toArray(GroupRole[]::new);
-            Function<? super GroupRole[], ? extends LabelChildComponent> populator = populateValue -> builder.setRequiredRange(minChoices, Math.min(maxChoices, Math.min(map.size() - 25, 25))).addOptions(map.entrySet().stream().skip(25L).limit(25L).map($ -> SelectOption.of($.getValue().getName(), $.getKey())).toArray(SelectOption[]::new)).setDefaultValues(populateValue == null ? new String[0] : MiscUtils.map(populateValue, String[]::new, GroupRole::getId)).build();
-            return new ModalFlowOption<GroupRole[]>(id, name, desc, resolver, populator);
+            return groupRolesPage(id, name, desc, required, placeholder, minChoices, maxChoices, map, 25);
+        }
+        private static ModalFlowOption<GroupRole[]> groupRolesPage(String id, String name, String desc, boolean required, String placeholder, int minChoices, int maxChoices, Map<String, GroupRole> map, int offset)
+        {
+            Function<? super ModalMapping, ? extends GroupRole[]> resolver = mapping -> selectedGroupRoles(mapping, required, minChoices, maxChoices, map);
+            Function<? super GroupRole[], ? extends ModalTopLevelComponent> populator = populateValue -> {
+                // Take a fresh, stable page on every opening; never append to a reused builder.
+                List<Map.Entry<String, GroupRole>> page = map.entrySet().stream()
+                    .filter(entry -> entry.getValue() != null)
+                    .sorted(Map.Entry.comparingByKey()).skip(offset).limit(25L).collect(Collectors.toList());
+                if (page.isEmpty()) return TextDisplay.of(name + ": no roles available on this page.");
+                List<String> pageIds = page.stream().map(Map.Entry::getKey).collect(Collectors.toList());
+                String[] defaults = populateValue == null ? new String[0] : Arrays.stream(populateValue)
+                    .filter(Objects::nonNull).map(GroupRole::getId).filter(pageIds::contains).distinct().toArray(String[]::new);
+                StringSelectMenu menu = StringSelectMenu.create(id).setRequired(required).setPlaceholder(placeholder)
+                    .setRequiredRange(Math.min(minChoices, page.size()), Math.min(maxChoices, page.size()))
+                    .addOptions(page.stream().map(entry -> SelectOption.of(entry.getValue().getName(), entry.getKey())).collect(Collectors.toList()))
+                    .setDefaultValues(defaults).build();
+                return Label.of(name, desc, menu);
+            };
+            return new ModalFlowOption<GroupRole[]>(id, name, desc, resolver, populator, null);
+        }
+        static GroupRole[] selectedGroupRoles(ModalMapping mapping, boolean required, int minChoices, int maxChoices, Map<String, GroupRole> map)
+        {
+            return selections(mapping, required, minChoices, maxChoices).stream().map(id -> {
+                GroupRole role = map.get(id);
+                if (role == null) throw new InvalidSlashOptionException();
+                return role;
+            }).toArray(GroupRole[]::new);
         }
         public static ModalFlowOption<List<User>> ofDiscordUsers(String id, String name, String desc, boolean required, String placeholder, int minChoices, int maxChoices)
         {
@@ -1392,6 +1457,18 @@ public class DInteractions
             this.additional = additional;
             return this;
         }
+        public Pagination restrictTo(String ownerId, java.util.function.Predicate<net.dv8tion.jda.api.interactions.Interaction> authorization)
+        {
+            this.ownerId = java.util.Objects.requireNonNull(ownerId);
+            this.authorization = java.util.Objects.requireNonNull(authorization);
+            return this;
+        }
+        boolean permits(net.dv8tion.jda.api.interactions.Interaction interaction)
+        {
+            return this.ownerId == null || (this.ownerId.equals(interaction.getUser().getId()) && this.authorization.test(interaction));
+        }
+        private String ownerId;
+        private java.util.function.Predicate<net.dv8tion.jda.api.interactions.Interaction> authorization;
         final String paginationId;
         final Paginator[] pages;
         final Paginator.Selector[] pageSelectors;
@@ -1496,34 +1573,68 @@ public class DInteractions
     }
     public <MF extends ModalFlow<MF>> ModalCallbackAction submitModalFlow(IModalCallback cb, MF mf)
     {
+        return this.submitModalFlow(cb, mf, event -> true);
+    }
+    public <MF extends ModalFlow<MF>> ModalCallbackAction submitModalFlow(IModalCallback cb, MF mf,
+        Predicate<ModalInteractionEvent> context)
+    {
         @SuppressWarnings("unchecked")
         ModalFlowInfo<MF> info = (ModalFlowInfo<MF>)this.modalFlowInfos.get(mf.getClass());
         if (info == null)
             throw new IllegalStateException("ModalFlowInfo missing or unregistered for "+mf.getClass()+" in "+this);
         if (!info.type.isInstance(mf))
             throw new IllegalStateException("ModalFlowInfo of "+info.type+", but ModelFlow is of "+mf.getClass()+" in "+this);
-        ModalCallbackAction action = cb.replyModal(info.modal(mf));
-        this.modalFlows.put(cb.getUser().getId(), mf);
-        return action;
+        long expiresAt = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(15);
+        return this.submitModalFlow(cb, info.modal(mf), event -> info.handle(event, mf,
+            submitted -> System.currentTimeMillis() < expiresAt && cb instanceof SlashCommandInteractionEvent
+                && this.modalAuthorization.test(submitted, ((SlashCommandInteractionEvent)cb).getFullCommandName())
+                && context.test(submitted)), context);
     }
     public static @FunctionalInterface interface ModalFlowImmediate extends ModalSubmitHandler
     {
-        class Holder
-        {
-            Holder(String modalId, ModalFlowImmediate immediate)
-            {
-                this.modalId = modalId;
-                this.immediate = immediate;
-            }
-            final String modalId;
-            final ModalFlowImmediate immediate;
-        }
     }
-    public <MF extends ModalFlow<MF>> ModalCallbackAction submitModalFlow(IModalCallback cb, Modal modal, ModalFlowImmediate mfi)
+    public ModalCallbackAction submitModalFlow(IModalCallback cb, Modal modal, ModalFlowImmediate mfi)
     {
-        ModalCallbackAction action = cb.replyModal(modal);
-        this.modalFlowImmediates.put(cb.getUser().getId(), new ModalFlowImmediate.Holder(modal.getId(), mfi));
+        return this.submitModalFlow(cb, modal, mfi, event -> true);
+    }
+    public ModalCallbackAction submitModalFlow(IModalCallback cb, Modal modal, ModalFlowImmediate mfi,
+        Predicate<ModalInteractionEvent> context)
+    {
+        if (!(cb instanceof SlashCommandInteractionEvent) || cb.getGuild() == null)
+            throw new IllegalArgumentException("A modal flow requires its originating guild slash command");
+        String operation = ((SlashCommandInteractionEvent)cb).getFullCommandName();
+        ModalSession session = new ModalSession(cb.getUser().getId(), cb.getGuild().getId(), operation,
+            System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(15), context, mfi);
+        ModalCallbackAction action = cb.replyModal(Modal.create(session.modalId, modal.getTitle())
+            .addComponents(modal.getComponents()).build());
+        this.modalSessions.put(session.requesterId, session);
         return action;
+    }
+
+    /** Session authority always comes from the original command, never a generic modal allow-list. */
+    public void setModalAuthorization(BiPredicate<ModalInteractionEvent, String> authorization)
+    {
+        this.modalAuthorization = Objects.requireNonNull(authorization);
+    }
+
+    static final class ModalSession
+    {
+        final String modalId = "modal-flow:" + UUID.randomUUID();
+        final String requesterId, guildId, operation;
+        final long expiresAt;
+        final Predicate<ModalInteractionEvent> context;
+        final ModalSubmitHandler handler;
+
+        ModalSession(String requesterId, String guildId, String operation, long expiresAt,
+            Predicate<ModalInteractionEvent> context, ModalSubmitHandler handler)
+        {
+            this.requesterId = Objects.requireNonNull(requesterId);
+            this.guildId = Objects.requireNonNull(guildId);
+            this.operation = Objects.requireNonNull(operation);
+            this.expiresAt = expiresAt;
+            this.context = Objects.requireNonNull(context);
+            this.handler = Objects.requireNonNull(handler);
+        }
     }
     class ModalFlowInfo<MF extends ModalFlow<MF>> implements ModalSubmitHandler
     {
@@ -1580,31 +1691,40 @@ public class DInteractions
         @Override
         public void handle(ModalInteractionEvent event)
         {
-            String userSf = event.getUser().getId();
-            ModalFlow<?> mf_ = DInteractions.this.modalFlows.get(userSf);
-            if (mf_ == null)
+            event.reply("This form has no verifiable session. Reopen its original command. No changes were applied.").setEphemeral(true).queue();
+        }
+        void handle(ModalInteractionEvent event, MF mf, Predicate<ModalInteractionEvent> finalAuthorization)
+        {
+            // Resolve the entire form before touching its fields or running its save handler.
+            // A stale/invalid selection must not silently retain defaults and partially save.
+            Map<Field, Object> resolved = new LinkedHashMap<>();
+            long validationStarted = System.nanoTime();
+            try
             {
-                LOG.error("modal flow `"+this.id+"` == null for "+event.getUser().getName()+" ("+userSf+")");
+                for (Map.Entry<Field, ModalFlowOption<?>> entry : this.options.entrySet())
+                    resolved.put(entry.getKey(), entry.getValue().get(event));
+                // Modal options must resolve only submitted values and bounded in-memory catalogs.
+                // The interaction's role snapshot must not authorize work after a slow lookup.
+                boolean authorized = finalAuthorization.test(event);
+                if (!authorized || !withinModalValidationWindow(validationStarted))
+                {
+                    DInteractions.this.rejectModalSession(event);
+                    return;
+                }
+                for (Map.Entry<Field, Object> entry : resolved.entrySet())
+                    entry.getKey().set(mf, entry.getValue());
+            }
+            catch (InvalidSlashOptionException ex)
+            {
+                event.reply(ex.getMessage()).setEphemeral(true).queue();
                 return;
             }
-            if (!this.type.isInstance(mf_))
+            catch (Exception ex)
             {
-                LOG.error("modal flow `"+this.id+"` == wrong "+mf_.getClass()+" for "+event.getUser().getName()+" ("+event.getUser().getId()+")");
+                LOG.error("modal flow `"+this.id+"`: Could not validate form; save handler was not run", ex);
+                event.reply("The form could not be validated. No changes were applied. Reopen it and try again.").setEphemeral(true).queue();
                 return;
             }
-            DInteractions.this.modalFlows.remove(userSf, mf_);
-            MF mf = this.type.cast(mf_); // should always be OK, since it was just checked above
-            this.options.forEach((field, option) ->
-            {
-                try
-                {
-                    field.set(mf, option.get(event));
-                }
-                catch (Exception ex)
-                {
-                    LOG.error("modal flow `"+this.id+"`: Exception setting option `"+option.id+"`", ex);
-                }
-            });
             mf.handle(event);
         }
     }
@@ -1629,8 +1749,13 @@ public class DInteractions
     final Map<Class<? extends ModalFlow<?>>, ModalFlowInfo<?>> modalFlowInfos = new HashMap<>();
     final Map<String, ModalFlowOption<?>> modalFlowOptionsBound = new HashMap<>();
     final Map<String, Pagination> pagination = new ConcurrentHashMap<>();
-    final Map<String, ModalFlow<?>> modalFlows = new ConcurrentHashMap<>();
-    final Map<String, ModalFlowImmediate.Holder> modalFlowImmediates = new ConcurrentHashMap<>();
+    final Map<String, ModalSession> modalSessions = new ConcurrentHashMap<>();
+    private BiPredicate<ModalInteractionEvent, String> modalAuthorization = (event, operation) -> false;
+
+    static boolean withinModalValidationWindow(long started)
+    {
+        return System.nanoTime() - started < TimeUnit.SECONDS.toNanos(1);
+    }
 
     final boolean warnMissing;
     final ExecutorService exec;
@@ -1790,6 +1915,15 @@ public class DInteractions
         return this.modalSubmits.putIfAbsent(name, handler) != null;
     }
 
+    public static final class InvalidSlashOptionException extends IllegalArgumentException
+    {
+        private static final long serialVersionUID = 1L;
+        public InvalidSlashOptionException()
+        {
+            super("Select a valid option from the suggested choices. The command was not applied.");
+        }
+    }
+
     public Object handleAsync(IReplyCallback event, boolean ephemeral, DeferredHandler handler)
     {
         event.deferReply(ephemeral).queue(hook -> this.exec.execute(() ->
@@ -1798,6 +1932,10 @@ public class DInteractions
             {
                 LOG.trace("Async handling event of type "+event.getClass().getSimpleName());
                 handler.handle(hook);
+            }
+            catch (InvalidSlashOptionException ex)
+            {
+                hook.sendMessage(ex.getMessage()).setEphemeral(true).queue();
             }
             catch (Exception ex)
             {
@@ -1810,21 +1948,23 @@ public class DInteractions
 
     void interactionError(Interaction interaction, Throwable err)
     {
-        LOG.error("Error processing interaction of type "+interaction.getClass().getSimpleName(), err);
-        String reply = "Error processing interaction:\n`"+err+"`";
+        boolean invalidOption = err instanceof InvalidSlashOptionException;
+        if (!invalidOption)
+            LOG.error("Error processing interaction of type "+interaction.getClass().getSimpleName(), err);
+        String reply = invalidOption ? err.getMessage() : "Error processing interaction:\n`"+err+"`";
         if (interaction instanceof IReplyCallback)
         {
             IReplyCallback replyCallback = (IReplyCallback)interaction;
             if (!replyCallback.isAcknowledged())
             {
-                replyCallback.reply(reply).queue();
+                replyCallback.reply(reply).setEphemeral(invalidOption).queue();
                 return;
             }
         }
         if (interaction instanceof IDeferrableCallback)
         {
             IDeferrableCallback replyCallback = (IDeferrableCallback)interaction;
-            replyCallback.getHook().sendMessage(reply).queue();
+            replyCallback.getHook().sendMessage(reply).setEphemeral(invalidOption).queue();
             return;
         }
     }
@@ -1853,6 +1993,10 @@ public class DInteractions
                 event.reply("Pagination interaction expired")
                     .setEphemeral(true)
                     .queue(m -> m.deleteOriginal().queueAfter(3L, TimeUnit.SECONDS));
+            }
+            else if (!pagination.permits(event))
+            {
+                event.reply("This interaction belongs to another requester or you no longer have permission.").setEphemeral(true).queue();
             }
             else switch (op)
             {
@@ -1924,6 +2068,10 @@ public class DInteractions
                     .setEphemeral(true)
                     .queue(m -> m.deleteOriginal().queueAfter(3L, TimeUnit.SECONDS));
             }
+            else if (!pagination.permits(event))
+            {
+                event.reply("This interaction belongs to another requester or you no longer have permission.").setEphemeral(true).queue();
+            }
             else switch (op)
             {
             case "pagination-submission": {
@@ -1963,6 +2111,10 @@ public class DInteractions
                     .setEphemeral(true)
                     .queue(m -> m.deleteOriginal().queueAfter(3L, TimeUnit.SECONDS));
             }
+            else if (!pagination.permits(event))
+            {
+                event.reply("This interaction belongs to another requester or you no longer have permission.").setEphemeral(true).queue();
+            }
             else
             {
                 int pageOrdinal = Integer.parseInt(event.getValue("pagination-ordinal").getAsString());
@@ -1987,21 +2139,42 @@ public class DInteractions
 
     boolean handleFlowImmediate(ModalInteractionEvent event, String id, String[] parts, String op)
     {
+        if (!"modal-flow".equals(op)) return false;
         String userSf = event.getUser().getId();
-        ModalFlowImmediate.Holder holder = this.modalFlowImmediates.get(userSf);
-        if (holder == null)
-            return false;
-        if (!Objects.equals(holder.modalId, id))
-            return false;
-        this.modalFlowImmediates.remove(userSf, holder);
+        ModalSession session = this.modalSessions.get(userSf);
+        if (session == null || !session.modalId.equals(id)
+            || !this.modalSessions.remove(userSf, session))
+        {
+            this.rejectModalSession(event);
+            return true;
+        }
+        boolean executing = false;
         try
         {
-            holder.immediate.handle(event);
+            long validationStarted = System.nanoTime();
+            boolean authorized = System.currentTimeMillis() < session.expiresAt && event.getGuild() != null
+                && session.requesterId.equals(userSf) && session.guildId.equals(event.getGuild().getId())
+                && this.modalAuthorization.test(event, session.operation) && session.context.test(event);
+            if (!authorized || System.currentTimeMillis() >= session.expiresAt
+                || !withinModalValidationWindow(validationStarted))
+            {
+                this.rejectModalSession(event);
+                return true;
+            }
+            executing = true;
+            session.handler.handle(event);
         }
         catch (Exception ex)
         {
-            LOG.error("Exception sync handling immediate modal flow of "+id, ex);
-            event.reply("Exception sync handling immediate modal flow of "+id+":\n`"+ex+"`").setEphemeral(true).queue();
+            LOG.error("Could not validate or handle modal session", ex);
+            if (!event.isAcknowledged())
+            {
+                if (executing)
+                    event.reply("The form could not be completed. Check the current saved state before retrying.").setEphemeral(true).queue();
+                else
+                    this.rejectModalSession(event);
+            }
+            return true;
         }
         if (!event.isAcknowledged())
         {
@@ -2012,16 +2185,20 @@ public class DInteractions
     }
     public boolean isImmediateModalFlow(ModalInteractionEvent event)
     {
-        if (event == null)
-            return false;
-        String userSf = event.getUser().getId();
-        ModalFlowImmediate.Holder holder = this.modalFlowImmediates.get(userSf);
-        return holder != null && Objects.equals(holder.modalId, event.getModalId());
+        // Route unknown/expired/replayed session IDs here too, so they fail closed with an explanation.
+        return event != null && event.getModalId().startsWith("modal-flow:");
+    }
+    private void rejectModalSession(ModalInteractionEvent event)
+    {
+        event.reply("This form expired, was replaced, or its original permissions/context changed. Reopen the command. No changes were applied.")
+            .setEphemeral(true).queue();
     }
 
     public void clearDeadPagination()
     {
         new ArrayList<>(this.pagination.values()).forEach(Pagination::removeIfExpired);
+        long now = System.currentTimeMillis();
+        this.modalSessions.entrySet().removeIf(entry -> now >= entry.getValue().expiresAt);
     }
 
     public boolean handle(SlashCommandInteractionEvent event)

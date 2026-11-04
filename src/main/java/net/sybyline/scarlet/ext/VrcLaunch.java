@@ -1,7 +1,6 @@
 package net.sybyline.scarlet.ext;
 
 import java.io.File;
-import java.net.URI;
 import java.nio.charset.StandardCharsets;
 
 import org.slf4j.Logger;
@@ -13,7 +12,6 @@ import com.sun.jna.platform.win32.WinReg;
 import com.sun.jna.ptr.IntByReference;
 
 import net.sybyline.scarlet.util.Location;
-import net.sybyline.scarlet.util.MiscUtils;
 import net.sybyline.scarlet.util.Platform;
 import net.sybyline.scarlet.util.Sys;
 import net.sybyline.scarlet.util.URLs;
@@ -22,6 +20,21 @@ public interface VrcLaunch
 {
 
     Logger LOG = LoggerFactory.getLogger("Scarlet/VrcLaunch");
+
+    ManagedVrcClient.Tracker MANAGED_CLIENTS = new ManagedVrcClient.Tracker();
+
+    /** Only a uniquely identified client launched in this Scarlet session is returned. */
+    static ManagedVrcClient.Client managedClient()
+    {
+        return MANAGED_CLIENTS.current();
+    }
+
+    /** Only a verified managed client can receive a normal close request. */
+    static ManagedVrcClient.CloseResult closeManagedClient(ManagedVrcClient.Client expected,
+                                                          java.util.function.BooleanSupplier revalidate)
+    {
+        return MANAGED_CLIENTS.close(expected, revalidate);
+    }
 
     // vrchat://launch?ref=<Organization>&id=<Location>&shortName=<ShortName|SecureName>&attach=<integer>
 
@@ -73,22 +86,30 @@ public interface VrcLaunch
      */
     static void launch(String userId, String location, String shortName, LaunchMode mode) throws Exception
     {
-        // If a VRChat client is already running we must not cold-start a second one.
-        // To "follow" into the new instance we quit the running client and then cold
-        // launch into the target. A cold launch boots straight into the instance with
-        // no prompt, so this is fully automatic and needs no launch flags. VRChat gives
-        // external tools no way to move a running client in place without an in-game
-        // prompt, so quit-and-relaunch is the only prompt-free path when one is already
-        // up; when no client is running, the cold launch below simply joins directly.
-        if (location != null && isVrChatRunning())
-        {
-            LOG.info("VRChat already running; quitting it to follow into {} with a single client", location);
-            quitVrChat();
-        }
-        if (Platform.CURRENT.isNT())
-            launch_win(userId, location, shortName, mode);
-        else
-            launch_linux(userId, location, shortName, mode);
+        launch(userId, location, shortName, mode, true);
+    }
+
+    /** Wizard opening is not permission to stop a client that appeared after its UI check. */
+    static void launchIfNotRunning(String userId, String location, String shortName, LaunchMode mode) throws Exception
+    {
+        launch(userId, location, shortName, mode, false);
+    }
+
+    static void launch(String userId, String location, String shortName, LaunchMode mode, boolean allowManagedRestart) throws Exception
+    {
+        MANAGED_CLIENTS.launch(location, allowManagedRestart, guard -> ManagedVrcClient.startedProcess(
+            Platform.CURRENT.isNT() ? launch_win(userId, location, shortName, mode, guard)
+                : launch_linux(userId, location, shortName, mode, guard)));
+    }
+
+    static void cancelPendingLaunches()
+    {
+        MANAGED_CLIENTS.cancelPendingLaunches();
+    }
+
+    static void stopLaunching()
+    {
+        MANAGED_CLIENTS.stopLaunching();
     }
 
     /** Appends the VRChat deep-link query for a location, including {@code &shortName=} when present. */
@@ -109,7 +130,7 @@ public interface VrcLaunch
     {
         if (location == null)
             return null;
-        StringBuilder uri = new StringBuilder("vrchat://launch?ref=KozyBlakeScarlet&id=").append(location);
+        StringBuilder uri = new StringBuilder("vrchat://launch?ref=Hatson321ScarletLogger&id=").append(location);
         if (shortName != null && !shortName.trim().isEmpty())
             uri.append("&shortName=").append(URLs.encode(shortName.trim()));
         if (attach)
@@ -117,99 +138,16 @@ public interface VrcLaunch
         return uri.toString();
     }
 
-    /** Whether a VRChat client is currently running. */
+    /** Unknown inventory and an unresolved startup are conservatively treated as running. */
     static boolean isVrChatRunning()
     {
-        return !findVrChatPids().isEmpty();
+        return MANAGED_CLIENTS.hasClientsOrPending();
     }
 
-    /**
-     * PIDs of running VRChat clients (empty if none / detection failed). Windows asks
-     * {@code tasklist} for VRChat.exe; other platforms use {@code pgrep} (VRChat runs
-     * under Proton/Wine as VRChat.exe). Detection failure yields an empty list, so it
-     * can only ever fall back to a normal cold launch, never block one.
-     */
-    static java.util.List<String> findVrChatPids()
+    /** Confirmed live clients only; uncertainty must not authorize a privacy rescan. */
+    static java.util.List<String> confirmedClientPids()
     {
-        java.util.List<String> pids = new java.util.ArrayList<>();
-        try
-        {
-            ProcessBuilder pb = Platform.CURRENT.isNT()
-                ? new ProcessBuilder("tasklist", "/FI", "IMAGENAME eq VRChat.exe", "/FO", "CSV", "/NH")
-                : new ProcessBuilder("pgrep", "-f", "VRChat.exe");
-            Process proc = pb.redirectErrorStream(true).start();
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8)))
-            {
-                String line;
-                while ((line = reader.readLine()) != null)
-                {
-                    line = line.trim();
-                    if (Platform.CURRENT.isNT())
-                    {
-                        if (!line.startsWith("\"VRChat.exe\""))
-                            continue;
-                        String[] cols = line.split("\",\"");
-                        if (cols.length > 1)
-                        {
-                            String pid = cols[1].replace("\"", "").trim();
-                            if (pid.matches("\\d+"))
-                                pids.add(pid);
-                        }
-                    }
-                    else if (line.matches("\\d+"))
-                    {
-                        pids.add(line);
-                    }
-                }
-            }
-            proc.waitFor(5L, java.util.concurrent.TimeUnit.SECONDS);
-        }
-        catch (Exception ex)
-        {
-            LOG.warn("VRChat pid lookup failed: {}", ex.getMessage());
-        }
-        return pids;
-    }
-
-    /**
-     * Quits any running VRChat client - gracefully first, forcibly if it will not
-     * exit - so a following cold launch lands in the new instance with exactly one
-     * client and no in-game prompt.
-     */
-    static void quitVrChat()
-    {
-        if (findVrChatPids().isEmpty())
-            return;
-        try
-        {
-            if (Platform.CURRENT.isNT())
-                new ProcessBuilder("taskkill", "/IM", "VRChat.exe").redirectErrorStream(true).start().waitFor(5L, java.util.concurrent.TimeUnit.SECONDS);
-            else
-            {
-                java.util.List<String> cmd = new java.util.ArrayList<>();
-                cmd.add("kill"); cmd.add("-TERM"); cmd.addAll(findVrChatPids());
-                new ProcessBuilder(cmd).redirectErrorStream(true).start().waitFor(5L, java.util.concurrent.TimeUnit.SECONDS);
-            }
-            for (int i = 0; i < 20 && !findVrChatPids().isEmpty(); i++)
-                Thread.sleep(500L);
-            java.util.List<String> survivors = findVrChatPids();
-            if (!survivors.isEmpty())
-            {
-                LOG.warn("VRChat did not exit gracefully; forcing {}", survivors);
-                if (Platform.CURRENT.isNT())
-                    new ProcessBuilder("taskkill", "/F", "/IM", "VRChat.exe").redirectErrorStream(true).start().waitFor(5L, java.util.concurrent.TimeUnit.SECONDS);
-                else
-                {
-                    java.util.List<String> cmd = new java.util.ArrayList<>();
-                    cmd.add("kill"); cmd.add("-KILL"); cmd.addAll(survivors);
-                    new ProcessBuilder(cmd).redirectErrorStream(true).start().waitFor(5L, java.util.concurrent.TimeUnit.SECONDS);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            LOG.warn("Failed to quit running VRChat: {}", ex.getMessage());
-        }
+        return MANAGED_CLIENTS.confirmedClientPids();
     }
 
     /**
@@ -220,7 +158,7 @@ public interface VrcLaunch
      *   2. steam steam://rungameid/438100    — works when steam binary is present but arg passing is unreliable
      *   3. xdg-open vrchat://...            — original behaviour, relies on URI handler registration
      */
-    static void launch_linux(String userId, String location, String shortName, LaunchMode mode) throws Exception
+    static Process launch_linux(String userId, String location, String shortName, LaunchMode mode, ManagedVrcClient.LaunchGuard guard) throws Exception
     {
         if (mode == null)
             mode = LaunchMode.DESKTOP;
@@ -246,13 +184,15 @@ public interface VrcLaunch
                 cmd.add("-applaunch");
                 cmd.add(VrcAppData.VRCHAT_APP_ID);
                 cmd.addAll(vrcArgs);
-                LOG.info("Launching VRChat via: {}", cmd);
-                new ProcessBuilder(cmd).inheritIO().start();
-                return;
+                LOG.info("Requesting VRChat launch through Steam; launch arguments are private");
+                ProcessBuilder builder = privateOutput(new ProcessBuilder(cmd));
+                guard.check();
+                return builder.start();
             }
+            catch (InterruptedException interrupted) { throw interrupted; }
             catch (Exception ex)
             {
-                LOG.warn("steam -applaunch failed, trying steam:// URI: {}", ex.getMessage());
+                LOG.warn("Steam launch process could not be started; trying its URI handler ({})", ex.getClass().getSimpleName());
             }
 
             // Strategy 2: steam steam://rungameid/438100//<args>
@@ -271,14 +211,15 @@ public interface VrcLaunch
                         runGameId.append(vrcArgs.get(i));
                     }
                 }
-                LOG.info("Launching VRChat via {}", runGameId);
-                new ProcessBuilder("steam", runGameId.toString())
-                    .inheritIO().start();
-                return;
+                LOG.info("Requesting VRChat launch through Steam URI; launch arguments are private");
+                ProcessBuilder builder = privateOutput(new ProcessBuilder("steam", runGameId.toString()));
+                guard.check();
+                return builder.start();
             }
+            catch (InterruptedException interrupted) { throw interrupted; }
             catch (Exception ex)
             {
-                LOG.warn("steam rungameid failed, falling back to xdg-open URI: {}", ex.getMessage());
+                LOG.warn("Steam URI process could not be started; falling back to the desktop handler ({})", ex.getClass().getSimpleName());
             }
         }
         else
@@ -289,11 +230,14 @@ public interface VrcLaunch
         // Strategy 3: original xdg-open / URI handler fallback
         if (vrchatUri != null)
         {
-            LOG.info("Launching VRChat via URI handler: {}", vrchatUri);
-            MiscUtils.AWTDesktop.browse(URI.create(vrchatUri));
+            LOG.info("Requesting VRChat launch through the desktop URI handler; ownership may remain unverified");
+            ProcessBuilder builder = privateOutput(new ProcessBuilder("xdg-open", vrchatUri));
+            guard.check();
+            return builder.start();
         }
+        return null; // A desktop/Steam singleton handoff is not proof of child ownership.
     }
-    static void launch_win(String userId, String location, String shortName, LaunchMode mode) throws Exception
+    static Process launch_win(String userId, String location, String shortName, LaunchMode mode, ManagedVrcClient.LaunchGuard guard) throws Exception
     {
         if (mode == null)
             mode = LaunchMode.DESKTOP;
@@ -339,8 +283,16 @@ public interface VrcLaunch
         cmd.add("--enable-verbose-logging");
         cmd.add("--log-debug-levels=API;All;Always;AssetBundleDownloadManager;ContentCreator;Errors;NetworkData;NetworkProcessing;NetworkTransport;Warnings");
 
-        LOG.info("Cold-launching VRChat: uri={} cmd={}", vrchatUri, cmd);
-        new ProcessBuilder(cmd).start();
+        LOG.info("Requesting VRChat launch through its registered launcher; launch arguments are private");
+        ProcessBuilder builder = privateOutput(new ProcessBuilder(cmd));
+        guard.check();
+        return builder.start();
+    }
+
+    /** Launchers can echo secure instance arguments; do not inherit their output. */
+    static ProcessBuilder privateOutput(ProcessBuilder builder)
+    {
+        return builder.redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
     }
 
 }

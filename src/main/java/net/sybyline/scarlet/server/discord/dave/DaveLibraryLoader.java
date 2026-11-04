@@ -3,10 +3,8 @@ package net.sybyline.scarlet.server.discord.dave;
 import java.awt.Desktop;
 import java.awt.EventQueue;
 import java.awt.GraphicsEnvironment;
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.URL;
 import java.nio.file.Files;
@@ -29,6 +27,8 @@ import com.sun.jna.Native;
 
 import net.sybyline.scarlet.Scarlet;
 import net.sybyline.scarlet.util.Platform;
+import net.sybyline.scarlet.util.PkexecInstaller;
+import net.sybyline.scarlet.util.Sys;
 import net.sybyline.scarlet.util.tts.LinuxPackageManagerDetector;
 
 /**
@@ -184,15 +184,6 @@ public class DaveLibraryLoader
         List<String> candidates = new ArrayList<>();
         if (osDir == null || archDir == null)
             return candidates;
-        if (Platform.isTermux())
-        {
-            candidates.add("termux-" + archDir);
-            candidates.add("android-" + archDir);
-        }
-        else if (Platform.isAndroid())
-        {
-            candidates.add("android-" + archDir);
-        }
         candidates.add(osDir + "-" + archDir);
         return candidates;
     }
@@ -222,13 +213,6 @@ public class DaveLibraryLoader
 
         String resourceName = getNativeResourceName();
         List<Path> candidates = new ArrayList<>();
-        if (Platform.isTermux())
-        {
-            candidates.add(Scarlet.dir.toPath().resolve("native").resolve("termux").resolve(resourceName));
-            candidates.add(Scarlet.dir.toPath().resolve("native").resolve("android").resolve(resourceName));
-        }
-        if (Platform.isAndroid())
-            candidates.add(Scarlet.dir.toPath().resolve("native").resolve("android").resolve(resourceName));
         candidates.add(Scarlet.dir.toPath().resolve("native").resolve(resourceName));
         for (Path candidate : candidates)
         {
@@ -262,7 +246,7 @@ public class DaveLibraryLoader
         {
             showDialog("Incompatible DAVE Native Library",
                 "The bundled DAVE native library was built against glibc (expects libc.so.6), but this runtime does not provide glibc.\n\n"
-                    + "On Termux/Android this means Discord voice E2EE cannot be enabled with the current native binary.\n\n"
+                    + "Discord voice E2EE cannot be enabled with the current native binary.\n\n"
                     + "Error: " + errorMessage,
                 JOptionPane.ERROR_MESSAGE);
             return false;
@@ -382,7 +366,7 @@ public class DaveLibraryLoader
                 switch (JOptionPane.showOptionDialog(null, net.sybyline.scarlet.ui.Swing.dialogMessage(msg), "Missing Dependency - " + missingLib,
                     JOptionPane.DEFAULT_OPTION, JOptionPane.WARNING_MESSAGE, null, opts, opts[0]))
                 {
-                    case 0: result.set(runInstallCommand(installCommand)); break;
+                    case 0: result.set(true); break;
                     case 1: openBrowser(OPUS_DOWNLOAD_URL); showManualInstructions(packageName, installCommand); break;
                     case 2: showManualInstructions(packageName, installCommand); break;
                 }
@@ -393,7 +377,9 @@ public class DaveLibraryLoader
             LOG.error("Error showing install dialog", e);
             System.err.println("Run: " + installCommand);
         }
-        return result.get();
+        // Only the user's choice runs on the EDT. PkexecInstaller owns a worker
+        // and a responsive modal progress/cancel dialog; no process I/O is done here.
+        return result.get() && runInstallCommand(installCommand);
     }
 
     private static void showManualInstallDialog(String missingLib)
@@ -476,63 +462,20 @@ public class DaveLibraryLoader
     {
         try
         {
-            String[] cmd;
-            if (installCommand.startsWith("sudo "))
-            {
-                if (Platform.isTermux())
-                {
-                    showDialog("Error",
-                        "This runtime appears to be Termux, but the suggested install command still requires sudo:\n"
-                            + installCommand + "\n\nPlease install the dependency manually with pkg/apt inside Termux.",
-                        JOptionPane.ERROR_MESSAGE);
-                    return false;
-                }
-                String inner = installCommand.substring(5);
-                if (isCommandAvailable("pkexec"))
-                    cmd = new String[]{"pkexec", "sh", "-c", inner};
-                else if (isCommandAvailable("gksudo"))
-                    cmd = new String[]{"gksudo", "sh", "-c", inner};
-                else if (isCommandAvailable("kdesu"))
-                    cmd = new String[]{"kdesu", "-c", inner};
-                else if (isCommandAvailable("xterm"))
-                    cmd = new String[]{"xterm", "-e", "sh", "-c", installCommand + "; echo 'Press Enter to close'; read"};
-                else if (isCommandAvailable("gnome-terminal"))
-                    cmd = new String[]{"gnome-terminal", "--", "sh", "-c", installCommand + "; echo 'Press Enter to close'; read"};
-                else if (isCommandAvailable("konsole"))
-                    cmd = new String[]{"konsole", "-e", "sh", "-c", installCommand + "; echo 'Press Enter to close'; read"};
-                else
-                {
-                    showDialog("Error", "Could not find a suitable method to run:\n" + installCommand, JOptionPane.ERROR_MESSAGE);
-                    return false;
-                }
-            }
-            else
-            {
-                if (Platform.isTermux())
-                    cmd = new String[]{"sh", "-c", installCommand};
-                else
-                    cmd = installCommand.split("\\s+");
-            }
-
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectErrorStream(true);
-            Process proc = pb.start();
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader r = new BufferedReader(new InputStreamReader(proc.getInputStream())))
-            {
-                for (String line; (line = r.readLine()) != null;)
-                {
-                    output.append(line).append("\n");
-                    LOG.info("[install] {}", line);
-                }
-            }
-            int exit = proc.waitFor();
+            int exit = installCommand.startsWith("sudo ")
+                ? PkexecInstaller.run(null, "Install Discord voice dependency", installCommand)
+                : PkexecInstaller.runUserCommand(null, "Install Discord voice dependency", installCommand);
+            // NOT_STARTED guarantees that no child ran. Cancellation, deadline,
+            // output failure, and any actual process exit never trigger a second install.
+            if (exit == PkexecInstaller.NOT_STARTED && installCommand.startsWith("sudo "))
+                exit = PkexecInstaller.runTerminalCommand(null, "Install Discord voice dependency", installCommand);
             if (exit == 0)
             {
-                showDialog("Installation Complete", "Installation successful!\n\nPlease restart KozyBlake/Scarlet for the changes to take effect.", JOptionPane.INFORMATION_MESSAGE);
+                showDialog("Installation Complete", "Installation successful!\n\nPlease restart Hatson321/Scarlet Logger for the changes to take effect.", JOptionPane.INFORMATION_MESSAGE);
                 return true;
             }
-            showDialog("Installation Error", "Installation failed with exit code " + exit + "\n\nOutput:\n" + output, JOptionPane.ERROR_MESSAGE);
+            showDialog("Installation not completed", "The installer did not report success (exit code " + exit + ").\n\n"
+                + "Review the installer output and package-manager state before retrying. No automatic retry will be started.", JOptionPane.WARNING_MESSAGE);
             return false;
         }
         catch (Exception e)
@@ -545,8 +488,7 @@ public class DaveLibraryLoader
 
     private static boolean isCommandAvailable(String cmd)
     {
-        try { return new ProcessBuilder("which", cmd).redirectErrorStream(true).start().waitFor() == 0; }
-        catch (Exception e) { return false; }
+        return Sys.hasInPath(cmd);
     }
 
     private static void openBrowser(String url)

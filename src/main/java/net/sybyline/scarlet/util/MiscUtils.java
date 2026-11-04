@@ -531,7 +531,7 @@ public interface MiscUtils
     /**
      * Scarlet-specific version comparison. Standard semver (see
      * {@link #compareSemVer(String, String)}) treats "0.4.17-b2" as a
-     * pre-release of "0.4.17" and therefore older. For the KozyBlake fork's
+     * pre-release of "0.4.17" and therefore older. For Scarlet Logger's
      * own update notifications we instead want the suffix to mean "iteration
      * ahead of the bare release" - so "0.4.17-b2" is <em>newer</em> than
      * "0.4.17", and "0.4.17-b3" is newer than "0.4.17-b2".
@@ -579,14 +579,13 @@ public interface MiscUtils
                     : -1
                 : rx == null
                     ? 1
-                    : lx.compareTo(rx);
+                    : compareScarletVersionKind(lx, rx);
             if (cmp != 0) return cmp;
 
             lx = lm.group("build");
             rx = rm.group("build");
-            // When parsed as kind only ("b1" → kind="b1", build=null) the
-            // comparison above already covered things; this branch handles
-            // versions where the regex split out a numeric build group.
+            // Attached iteration numbers (a9, a10) were compared numerically
+            // above. This branch handles a separate numeric build group.
             li = lx == null ? 0 : Integer.parseInt(lx);
             ri = rx == null ? 0 : Integer.parseInt(rx);
             if ((cmp = Integer.compare(li, ri)) != 0) return cmp;
@@ -597,6 +596,21 @@ public interface MiscUtils
             // produces a spurious update prompt
         }
         return 0;
+    }
+
+    /** Compare Scarlet suffix labels and their trailing iteration numbers. */
+    static int compareScarletVersionKind(String l, String r)
+    {
+        int li = l.length(), ri = r.length();
+        while (li > 0 && l.charAt(li - 1) >= '0' && l.charAt(li - 1) <= '9') li--;
+        while (ri > 0 && r.charAt(ri - 1) >= '0' && r.charAt(ri - 1) <= '9') ri--;
+        // Compare prefixes consistently, including labels without a trailing
+        // number, so mixed labels cannot create a non-transitive ordering.
+        int cmp = l.substring(0, li).compareTo(r.substring(0, ri));
+        if (cmp != 0) return cmp;
+        boolean ln = li < l.length(), rn = ri < r.length();
+        if (!ln || !rn) return Boolean.compare(ln, rn);
+        return new java.math.BigInteger(l.substring(li)).compareTo(new java.math.BigInteger(r.substring(ri)));
     }
 
     public static List<String> paginateOnLines(StringBuilder input, int maxComponentLen)
@@ -834,7 +848,7 @@ public interface MiscUtils
          *       the default file manager on macOS, and whatever is registered
          *       for directories via {@code xdg-open} on Linux.</li>
          *   <li>Windows: {@code explorer.exe} directly.</li>
-         *   <li>Linux/Termux: {@code xdg-open}, then common file managers
+         *   <li>Linux: {@code xdg-open}, then common file managers
          *       (Nautilus, Dolphin, Thunar, Nemo, PCManFM, Caja).</li>
          *   <li>Last resort: {@code browse(dir.toURI())} — opens in a web
          *       browser if no file manager is available.</li>
@@ -876,7 +890,7 @@ public interface MiscUtils
                 Scarlet.LOG.warn("explorer.exe failed for {}: {}", dir, ex.getMessage());
             }
 
-            // Attempt 3: Linux / Termux — xdg-open, then named file managers
+            // Attempt 3: Linux — xdg-open, then named file managers
             if (Platform.CURRENT.is$nix())
             {
                 for (String cmd : new String[]{
@@ -887,7 +901,6 @@ public interface MiscUtils
                     "nemo",           // Cinnamon
                     "pcmanfm",        // LXDE
                     "caja",           // MATE
-                    "termux-open",    // Termux file open helper
                 })
                 {
                     try

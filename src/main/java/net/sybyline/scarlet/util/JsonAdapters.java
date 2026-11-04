@@ -102,6 +102,19 @@ public interface JsonAdapters
         .registerTypeAdapter(byte[].class, new ByString<>(JsonAdapters::bytes2json, JsonAdapters::json2bytes))
         .registerTypeAdapter(UniqueStrings.class, new UniqueStrings.Adapter())
         .registerTypeAdapter(Void.class, new VoidAdapter())
+        // SDK 1.23 wraps these scalar fields; keep existing cache JSON as strings.
+        .registerTypeAdapterFactory(new io.github.vrchatapi.model.PrivateProfileActivityLastActivity.CustomTypeAdapterFactory())
+        .registerTypeAdapterFactory(new io.github.vrchatapi.model.PublicProfileThemeID.CustomTypeAdapterFactory())
+        // Banner decoration must not make an otherwise valid user/cache unreadable.
+        .registerTypeAdapter(io.github.vrchatapi.model.BannerType.class,
+            new ByString<io.github.vrchatapi.model.BannerType>(
+                io.github.vrchatapi.model.BannerType::getValue, value -> {
+                    for (io.github.vrchatapi.model.BannerType banner : io.github.vrchatapi.model.BannerType.values())
+                        if (banner.getValue().equals(value))
+                            return banner;
+                    return null;
+                }))
+        .registerTypeAdapterFactory(new net.sybyline.scarlet.ScarletAuditData.Factory())
         .disableHtmlEscaping();
     }
 

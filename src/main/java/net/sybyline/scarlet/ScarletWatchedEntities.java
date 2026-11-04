@@ -48,7 +48,8 @@ public class ScarletWatchedEntities<E>
         this.idValid = idValid;
         this.watchedEntities = new ConcurrentHashMap<>();
         this.builder = builder;
-        this.load();
+        if (!this.load())
+            throw new IllegalStateException("Watched entities could not be loaded. Original data was preserved; restore or repair the file before restarting.");
     }
 
     final File watchedEntitiesFile;
@@ -254,17 +255,27 @@ public class ScarletWatchedEntities<E>
         return true;
     }
 
-    public boolean load()
+    private boolean loadFailed;
+
+    public synchronized boolean load()
     {
-        if (!this.watchedEntitiesFile.isFile())
+        boolean failedBefore = this.loadFailed;
+        this.loadFailed = true;
+        try
         {
-            this.save();
-            return true;
+            if (!ScarletData.existingRecord(this.watchedEntitiesFile))
+            {
+                if (failedBefore) throw new java.io.IOException("Previously unreadable watched entities must be restored or repaired before reload");
+                this.loadFailed = false;
+                return this.save();
+            }
         }
+        catch (Exception ex) { LOG.error("Could not inspect watched entity storage", ex); return false; }
         WatchedEntity[] watchedEntitiesArray;
-        try (FileReader fr = new FileReader(this.watchedEntitiesFile))
+        try (FileReader fr = new FileReader(this.watchedEntitiesFile, java.nio.charset.StandardCharsets.UTF_8))
         {
             watchedEntitiesArray = Scarlet.GSON_PRETTY.fromJson(fr, WatchedEntity[].class);
+            if (watchedEntitiesArray == null) throw new java.io.IOException("Existing watched entities must contain a JSON array");
         }
         catch (Exception ex)
         {
@@ -277,15 +288,22 @@ public class ScarletWatchedEntities<E>
             if (watchedEntity != null && watchedEntity.id != null && this.idValid.test(watchedEntity.id))
                 watchedEntities.put(watchedEntity.id, watchedEntity);
         this.watchedEntities = watchedEntities;
+        this.loadFailed = false;
         return true;
     }
 
-    public boolean save()
+    public synchronized boolean save()
     {
+        if (this.loadFailed)
+        {
+            LOG.error("Watched entity storage was not loaded; refusing to overwrite the original data");
+            return false;
+        }
         WatchedEntity[] watchedEntitiesArray = this.watchedEntities.values().toArray(new WatchedEntity[0]);
-        try (java.io.Writer fw = FileBackups.writer(this.watchedEntitiesFile))
+        try (FileBackups.AtomicWriter fw = FileBackups.writer(this.watchedEntitiesFile))
         {
             Scarlet.GSON_PRETTY.toJson(watchedEntitiesArray, WatchedEntity[].class, fw);
+            fw.commit();
         }
         catch (Exception ex)
         {

@@ -10,7 +10,7 @@
     <packaging>pom</packaging>
 
     <name>libdave-jvm</name>
-    <description>Discord Audio &amp; Video End-to-End Encryption (DAVE) for Java - Android Compatible</description>
+    <description>Discord Audio &amp; Video End-to-End Encryption (DAVE) for Java desktop runtimes</description>
     <url>https://github.com/KyokoBot/libdave-jvm</url>
 
     <licenses>
@@ -51,7 +51,6 @@
         <module>api</module>
         <module>impl-jni</module>
         <module>adapter-jda</module>
-        <module>natives-android</module>
     </modules>
 
     <dependencyManagement>

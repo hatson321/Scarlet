@@ -3,6 +3,7 @@ package net.sybyline.scarlet;
 import java.time.OffsetDateTime;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import com.google.gson.JsonElement;
@@ -99,12 +100,12 @@ public enum GroupAuditType implements DEnum.DEnumString<GroupAuditType>
     static
     {
         for (GroupAuditType type : values())
-            BY_ID.put(type.id, type);
+            BY_ID.put(type.id.toLowerCase(Locale.ROOT), type);
     }
 
     public static GroupAuditType of(String id)
     {
-        return id == null ? null : BY_ID.get(id.toLowerCase());
+        return id == null ? null : BY_ID.get(id.toLowerCase(Locale.ROOT));
     }
 
     public static int color(Map<String, Integer> overrides, String id)

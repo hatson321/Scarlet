@@ -34,6 +34,8 @@ public interface AvatarSearch
 
     int SEARCH_N = 5000;
     int HYDRATION_SEARCH_N = 50;
+    // A new key requires explicit confirmation instead of trusting the former plain checkbox.
+    String IDENTIFIED_LOOKUP_CONSENT_KEY = "avatar_search_identified_lookups_consent_v2";
     Logger LOG = LoggerFactory.getLogger("Scarlet/AvatarSearch");
     long RATE_LIMIT_BACKOFF_MILLIS = TimeUnit.MINUTES.toMillis(5L),
          TIMEOUT_BACKOFF_MILLIS = TimeUnit.SECONDS.toMillis(45L),
@@ -77,6 +79,28 @@ public interface AvatarSearch
     static String cacheKey(int n, String search)
     {
         return n == SEARCH_N ? search : Integer.toUnsignedString(n)+"\u0000"+search;
+    }
+
+    /** The same explicit runtime permission applies to every provider lookup mode. */
+    static String[] effectiveProviders(boolean featureEnabled, Boolean consent, Boolean customEnabled,
+            String[] configured, String blockedHost)
+    {
+        if (!featureEnabled || !Boolean.TRUE.equals(consent))
+            return new String[0];
+        String[] selected = Boolean.TRUE.equals(customEnabled) ? configured : URL_ROOTS;
+        if (selected == null)
+            return new String[0];
+        return Arrays.stream(selected).filter(Objects::nonNull).map(String::trim)
+            .filter(url -> !url.isEmpty())
+            .filter(url -> blockedHost == null || blockedHost.isEmpty()
+                || !url.toLowerCase(java.util.Locale.ROOT).contains(blockedHost.toLowerCase(java.util.Locale.ROOT)))
+            .distinct().toArray(String[]::new);
+    }
+
+    /** All active provider GETs share DNS-pinned public-address and redirect checks. */
+    static HttpURLInputStream openProvider(String url) throws IOException
+    {
+        return HttpURLInputStream.get(url, ExtendedUserAgent.init_avatar_provider_conn, HttpURLInputStream.PUBLIC_ONLY);
     }
 
     static boolean providerAvailable(String urlRoot)
@@ -601,7 +625,7 @@ public interface AvatarSearch
             return VrcxAvatar.NONE;
         if (!providerAvailable(urlRoot))
             return null;
-        try (HttpURLInputStream in = HttpURLInputStream.get(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&search=" + URLs.encode(search), ExtendedUserAgent.init_conn))
+        try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&search=" + URLs.encode(search)))
         {
             VrcxAvatar[] results = parseVrcxResults(in.readAsJson(null, null, JsonElement.class));
             providerSucceeded(urlRoot);
@@ -769,7 +793,7 @@ public interface AvatarSearch
                 return VrcxAvatar.NONE;
             if (!providerAvailable(urlRoot))
                 return null;
-            try (HttpURLInputStream in = HttpURLInputStream.get(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&fileId=" + imageFileId, ExtendedUserAgent.init_conn))
+            try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&fileId=" + URLs.encode(imageFileId)))
             {
                 VrcxAvatar[] results = parseVrcxResults(in.readAsJson(null, null, JsonElement.class));
                 providerSucceeded(urlRoot);
@@ -881,7 +905,7 @@ public interface AvatarSearch
             String stateKey = authorStateKey(urlRoot);
             if (!providerAvailable(stateKey))
                 return null;
-            try (HttpURLInputStream in = HttpURLInputStream.get(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&authorId=" + URLs.encode(authorId), ExtendedUserAgent.init_conn))
+            try (HttpURLInputStream in = openProvider(urlRoot + "?n=" + Integer.toUnsignedString(n) + "&authorId=" + URLs.encode(authorId)))
             {
                 VrcxAvatar[] results = parseVrcxResults(in.readAsJson(null, null, JsonElement.class));
                 providerSucceeded(stateKey);
@@ -929,12 +953,14 @@ public interface AvatarSearch
          * is the owner of the image file, resolved by the caller via VRChat's file
          * API. Empty if the author is unknown or not indexed by any provider.
          */
-        static Stream<VrcxAvatar> vrcxSearchAllByImageViaAuthor(String imageFileId, String authorId)
+        static Stream<VrcxAvatar> vrcxSearchAllByImageViaAuthor(String[] selectedProviders, String imageFileId, String authorId)
         {
             if (imageFileId == null || authorId == null || authorId.isEmpty())
                 return Stream.empty();
-            return Arrays.stream(AUTHOR_LOOKUP_URL_ROOTS)
+            return Arrays.stream(selectedProviders == null ? new String[0] : selectedProviders)
                 .filter(Objects::nonNull)
+                .filter(url -> !URL_ROOT_AVTRDB.equals(url))
+                .distinct()
                 .map($ -> vrcxSearchCachedByAuthor($, SEARCH_N, authorId))
                 .filter(Objects::nonNull)
                 .flatMap(Arrays::stream)
@@ -944,15 +970,25 @@ public interface AvatarSearch
         }
 
         /** By-image with author fallback: native ?fileId= providers (if any) plus the author-match path. */
-        static Stream<VrcxAvatar> vrcxSearchAllByImage(String imageFileId, String authorId)
+        static Stream<VrcxAvatar> vrcxSearchAllByImage(String[] selectedProviders, String imageFileId, String authorId)
         {
-            return Stream.concat(vrcxSearchAllByImage(imageFileId), vrcxSearchAllByImageViaAuthor(imageFileId, authorId));
+            String[] direct = selectedImageProviders(selectedProviders);
+            return Stream.concat(vrcxSearchAllByImage(direct, imageFileId), vrcxSearchAllByImageViaAuthor(selectedProviders, imageFileId, authorId));
         }
 
         /** Cached by-image with author fallback. */
-        static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(String imageFileId, String authorId)
+        static Stream<VrcxAvatar> vrcxSearchAllCachedByImage(String[] selectedProviders, String imageFileId, String authorId)
         {
-            return Stream.concat(vrcxSearchAllCachedByImage(imageFileId), vrcxSearchAllByImageViaAuthor(imageFileId, authorId));
+            String[] direct = selectedImageProviders(selectedProviders);
+            return Stream.concat(vrcxSearchAllCachedByImage(direct, imageFileId), vrcxSearchAllByImageViaAuthor(selectedProviders, imageFileId, authorId));
+        }
+
+        static String[] selectedImageProviders(String[] selectedProviders)
+        {
+            if (selectedProviders == null)
+                return new String[0];
+            java.util.Set<String> supported = new java.util.HashSet<>(Arrays.asList(BY_IMAGE_URL_ROOTS));
+            return Arrays.stream(selectedProviders).filter(Objects::nonNull).filter(supported::contains).distinct().toArray(String[]::new);
         }
     }
 

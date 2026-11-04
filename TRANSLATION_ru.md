@@ -36,7 +36,7 @@ already-keyed references) are omitted. Uses standard Russian software convention
 | Columns | Столбцы |
 | Import watched groups | Импорт отслеживаемых групп |
 | Advanced | Дополнительно |
-| Open KozyBlake/Scarlet's data directory | Открыть папку данных KozyBlake/Scarlet |
+| Open Hatson321/Scarlet Logger's data directory | Открыть папку данных Hatson321/Scarlet Logger |
 | Create a VRChat group instance and open it in the VRChat client | Создать групповой инстанс VRChat и открыть его в клиенте VRChat |
 | Import watched groups from a URL | Импортировать отслеживаемые группы по ссылке |
 | Import watched groups from a local file | Импортировать отслеживаемые группы из локального файла |
@@ -119,7 +119,7 @@ already-keyed references) are omitted. Uses standard Russian software convention
 | Confirmation dialog for group invites | Диалог подтверждения групповых приглашений |
 | Notify for updates | Уведомлять об обновлениях |
 | Notify for preview updates | Уведомлять о предварительных обновлениях |
-| Notify for KozyBlake announcements | Уведомлять об объявлениях KozyBlake |
+| Notify for Hatson321 announcements | Уведомлять об объявлениях Hatson321 |
 | Show UI during load | Показывать интерфейс во время загрузки |
 | Show CLI tab | Показывать вкладку CLI |
 | Enable built-in Discord moderation commands | Включить встроенные команды модерации Discord |

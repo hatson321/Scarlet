@@ -49,7 +49,7 @@ import io.github.vrchatapi.model.CreateGroupAnnouncementRequest;
 import io.github.vrchatapi.model.CreateGroupPostRequest;
 import io.github.vrchatapi.model.Group;
 import io.github.vrchatapi.model.GroupAnnouncement;
-import io.github.vrchatapi.model.GroupAuditLogEntry;
+import io.github.vrchatapi.model.GroupAuditLogEntryUnknown;
 import io.github.vrchatapi.model.GroupGallery;
 import io.github.vrchatapi.model.GroupGalleryImage;
 import io.github.vrchatapi.model.GroupMember;
@@ -86,6 +86,7 @@ import net.dv8tion.jda.api.entities.Role;
 import net.dv8tion.jda.api.entities.Webhook;
 import net.dv8tion.jda.api.entities.channel.Channel;
 import net.dv8tion.jda.api.entities.channel.ChannelType;
+import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.events.interaction.ModalInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.command.CommandAutoCompleteInteractionEvent;
 import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
@@ -256,6 +257,28 @@ public class ScarletDiscordCommands
     }
     public final SlashOption<GroupAuditType> _auditEventType = SlashOption.ofEnum("audit-event-type", "The VRChat Group Audit Log event type", true, GroupAuditType.class);
     public final SlashOption<GroupAuditTypeEx> _auditExEventType = SlashOption.ofEnum("audit-ex-event-type", "The extended audit event type", true, GroupAuditTypeEx.class);
+    public final SlashOption<GroupAuditTypeEx> _auditSecretExEventType = secretAuditExOption();
+    SlashOption<GroupAuditTypeEx> secretAuditExOption()
+    {
+        return SlashOption.ofString("secret-audit-ex-event-type",
+            "A supported secret event, or a saved legacy entry to clear by omitting the channel", true, null,
+            ScarletDiscordCommands::parseSecretAuditExType, false,
+            event -> DInteractions.SlashOptionsChoicesUnsanitized.autocomplete(event,
+                secretAuditExChoices(this.discord.auditExType2secretChannelSf), false));
+    }
+    static GroupAuditTypeEx parseSecretAuditExType(String value)
+    {
+        for (GroupAuditTypeEx type : GroupAuditTypeEx.values())
+            if (type.id.equals(value)) return type;
+        throw new DInteractions.InvalidSlashOptionException();
+    }
+    static Command.Choice[] secretAuditExChoices(Map<String, String> saved)
+    {
+        return Arrays.stream(GroupAuditTypeEx.values())
+            .filter(type -> type.supportsSecretRouting() || saved.containsKey(type.id))
+            .map(type -> new Command.Choice(type.supportsSecretRouting() ? type.title : "Clear legacy entry: " + type.title, type.id))
+            .toArray(Command.Choice[]::new);
+    }
     public final SlashOption<Member> _discordUser = SlashOption.ofMember("discord-user", "The Discord user", true);
     public final SlashOption<Role> _discordRole = SlashOption.ofRole("discord-role", "The Discord role", true);
     public final SlashOption<Channel> _textChannel = SlashOption.ofChannel("discord-text-channel", "The Discord text channel to use, or omit to remove entry", false, ChannelType.TEXT);
@@ -313,7 +336,7 @@ public class ScarletDiscordCommands
         public void user(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("search-query") String searchQuery, @SlashOpt("entries-per-page") int entriesPerPage) throws Exception
         {
             MessageEmbed[] embeds = new UsersApi(ScarletDiscordCommands.this.discord.scarlet.vrc.client)
-                .searchUsers(searchQuery, null, 50, 0, null)
+                .searchUsers(searchQuery, null, null, null, 50, 0, null)
                 .stream()
                 .map($ -> new EmbedBuilder()
                     .setTitle(MiscUtils.maybeEllipsis(256, $.getDisplayName()), VrcWeb.Home.user($.getId()))
@@ -643,12 +666,13 @@ public class ScarletDiscordCommands
         void _vrchatGroup(CommandAutoCompleteInteractionEvent event) {
             AutoCompleteCallbackAction action = event.replyChoices();
             Command.Choice groupChoice = ScarletDiscordCommands.this.discord.userSf2lastEdited_groupId.get(event.getUser().getId());
+            long choicesLeft = 25L;
             if (groupChoice != null)
             {
                 action.addChoices(groupChoice);
+                choicesLeft--;
             }
             String typing = event.getFocusedOption().getValue();
-            long choicesLeft = 25L;
             if (typing != null && !(typing = typing.trim()).isEmpty())
             {
                 if (VrcIds.id_group.matcher(typing).matches() || VrcIds.id_group_code.matcher(typing).matches())
@@ -894,7 +918,7 @@ public class ScarletDiscordCommands
                 }
                 else
                 {
-                    hook.sendMessageFormat("Removing group's message (was `%s`)", message).setEphemeral(true).queue();
+                    hook.sendMessageFormat("Removing group's message (was `%s`)", watchedGroup.message).setEphemeral(true).queue();
                 }
             }
             else
@@ -1469,7 +1493,7 @@ public class ScarletDiscordCommands
                 }
                 else
                 {
-                    hook.sendMessageFormat("Removing "+this._singular()+"'s message (was `%s`)", message).setEphemeral(true).queue();
+                    hook.sendMessageFormat("Removing "+this._singular()+"'s message (was `%s`)", watchedEntity.message).setEphemeral(true).queue();
                 }
             }
             else
@@ -1877,6 +1901,7 @@ public class ScarletDiscordCommands
             List<GroupRole> roleList = ScarletDiscordCommands.this.discord.scarlet.vrc.getGroupRoles(ScarletDiscordCommands.this.discord.scarlet.vrc.groupId);
             Map<String, GroupRole> roles = roleList == null || roleList.isEmpty() ? Collections.emptyMap() : roleList.stream().collect(Collectors.toMap(GroupRole::getId, Function.identity()));
             MessageEmbed[] embeds = Arrays.stream(this._getIds())
+                .filter(id -> "secret staff".equals(this._infoName()) || !ScarletDiscordCommands.this.discord.scarlet.secretStaffList.isSecretStaffId(id))
                 .map($ -> {
                     User sc = ScarletDiscordCommands.this.discord.scarlet.vrc.getUser($, within1day);
                     GroupMember member = ScarletDiscordCommands.this.discord.scarlet.vrc.getGroupMembership(ScarletDiscordCommands.this.discord.scarlet.vrc.groupId, $);
@@ -1926,14 +1951,14 @@ public class ScarletDiscordCommands
                 return;
             }
             
-            if (discordUser != null)
+            boolean added;
+            try { added = this._addId(vrcId); }
+            catch (ScarletSecretStaffList.PersistenceException ex)
             {
-                ScarletDiscordCommands.this.discord.scarlet.data.linkIdToSnowflake(vrcId, discordUser.getId());
-                LOG.info(String.format("Linking VRChat user %s (%s) to Discord user %s (<@%s>)", vrchatUser.getDisplayName(), vrcId, discordUser.getEffectiveName(), discordUser.getId()));
-                hook.sendMessageFormat("Associating %s with VRChat user [%s](%s)", discordUser.getEffectiveName(), vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
+                hook.sendMessage("The secret-staff list could not be saved. No staff-list, account-link, or VRChat-role changes were applied.").setEphemeral(true).queue();
+                return;
             }
-            
-            if (!this._addId(vrcId))
+            if (!added)
             {
                 hook.sendMessageFormat("VRChat user [%s](%s) is already on the "+this._infoName()+" list", vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
             }
@@ -1941,6 +1966,13 @@ public class ScarletDiscordCommands
             {
                 LOG.info(String.format("Adding VRChat user %s (%s) to the "+this._infoName()+" list", vrchatUser.getDisplayName(), vrcId));
                 hook.sendMessageFormat("Adding VRChat user [%s](%s) to the "+this._infoName()+" list", vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
+            }
+
+            if (discordUser != null)
+            {
+                ScarletDiscordCommands.this.discord.scarlet.data.linkIdToSnowflake(vrcId, discordUser.getId());
+                LOG.info(String.format("Linking VRChat user %s (%s) to Discord user %s (<@%s>)", vrchatUser.getDisplayName(), vrcId, discordUser.getEffectiveName(), discordUser.getId()));
+                hook.sendMessageFormat("Associating %s with VRChat user [%s](%s)", discordUser.getEffectiveName(), vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
             }
             
             if (vrchatRoleOpt == null)
@@ -1957,7 +1989,7 @@ public class ScarletDiscordCommands
             }
             
             ScarletDiscordCommands.this.discord.scarlet.vrc.addGroupRole(ScarletDiscordCommands.this.discord.scarlet.vrc.groupId, vrcId, vrchatRoleOpt.getId());
-            hook.sendMessageFormat("Adding the role [%s](%s) to [%s](%s)", vrchatRoleOpt.getName(), VrcWeb.Home.user(vrcId), vrchatRoleOpt.getName(), VrcWeb.Home.groupSettingsRoles(ScarletDiscordCommands.this.discord.scarlet.vrc.groupId, vrchatRoleOpt.getId()), vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
+            hook.sendMessageFormat("Adding the role [%s](%s) to [%s](%s)", vrchatRoleOpt.getName(), VrcWeb.Home.groupSettingsRoles(ScarletDiscordCommands.this.discord.scarlet.vrc.groupId, vrchatRoleOpt.getId()), vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
         }
         protected void _remove(SlashCommandInteractionEvent event, InteractionHook hook, io.github.vrchatapi.model.User vrchatUser, io.github.vrchatapi.model.GroupRole vrchatRoleOpt)
         {
@@ -1965,7 +1997,14 @@ public class ScarletDiscordCommands
             String prefix = vrchatUser != null ? "" : ("No VRChat user found with id %s"+vrcId+"\n");
             String displayName = vrchatUser != null ? vrchatUser.getDisplayName() : vrcId;
             
-            if (!this._removeId(vrcId))
+            boolean removed;
+            try { removed = this._removeId(vrcId); }
+            catch (ScarletSecretStaffList.PersistenceException ex)
+            {
+                hook.sendMessage("The secret-staff list could not be saved. No staff-list or VRChat-role changes were applied.").setEphemeral(true).queue();
+                return;
+            }
+            if (!removed)
             {
                 hook.sendMessageFormat("%sVRChat user [%s](%s) is not on the "+this._infoName()+" list", prefix, displayName, VrcWeb.Home.user(vrcId)).setEphemeral(true).queue();
             }
@@ -2022,6 +2061,7 @@ public class ScarletDiscordCommands
         }
         @SlashCmd("list")
         @Desc("Lists all secret staff users")
+        @Ephemeral
         public void list(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("entries-per-page") int entriesPerPage)
         {
             this._list(event, hook, entriesPerPage);
@@ -2045,6 +2085,7 @@ public class ScarletDiscordCommands
     @SlashCmd("vrchat-user-info")
     @Desc("Lists internal and audit information for a specific VRChat user")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
+    @Ephemeral
     public void vrchatUserInfo(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("vrchat-user") io.github.vrchatapi.model.User vrchatUser) throws Exception
     {
         String vrcId = VrcIds.getAsString_user(event.getOption("vrchat-user"));
@@ -2071,10 +2112,10 @@ public class ScarletDiscordCommands
             {
                 if (auditEntryId != null)
                 {
-                    sb.append("\n`").append(auditEntryId).append("`");
                     ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
-                    if (auditEntryMeta != null && auditEntryMeta.entry != null && !auditEntryMeta.entryRedacted && !auditEntryMeta.hasParentEvent())
+                    if (this.discord.auditVisibleTo(auditEntryMeta, event.getUser().getId()) && !auditEntryMeta.hasParentEvent())
                     {
+                        sb.append("\n`").append(auditEntryId).append("`");
                         String messageLink = auditEntryMeta.getMessageUrl();
                         sb.append(" <t:").append(Long.toUnsignedString(auditEntryMeta.entry.getCreatedAt().toEpochSecond())).append(":f>: ");
                         if (messageLink == null)
@@ -2097,6 +2138,9 @@ public class ScarletDiscordCommands
             {
                 if (evidenceSubmission != null)
                 {
+                    ScarletData.AuditEntryMetadata evidenceEntry = this.discord.scarlet.data.auditEntryMetadata(evidenceSubmission.auditEntryId);
+                    if (!this.discord.auditVisibleTo(evidenceEntry, event.getUser().getId()))
+                        continue;
                     sb.append("\n[`").append(evidenceSubmission.fileName).append("`](<").append(evidenceSubmission.url).append(">)");
                     sb.append(" [(proxy)](<").append(evidenceSubmission.proxyUrl).append(">)");
                     
@@ -2122,6 +2166,7 @@ public class ScarletDiscordCommands
     @SlashCmd("moderation-log")
     @Desc("Consolidate a VRChat user's moderation history (counts + links) into one post")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
+    @Ephemeral
     public void moderationLog(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("vrchat-user") io.github.vrchatapi.model.User vrchatUser) throws Exception
     {
         String vrcId = VrcIds.getAsString_user(event.getOption("vrchat-user"));
@@ -2148,7 +2193,7 @@ public class ScarletDiscordCommands
             if (auditEntryId == null)
                 continue;
             ScarletData.AuditEntryMetadata m = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
-            if (m == null || m.entry == null || m.entryRedacted || m.hasParentEvent())
+            if (!this.discord.auditVisibleTo(m, event.getUser().getId()) || m.hasParentEvent())
                 continue;
             if (cutoff != null && m.entry.getCreatedAt().isBefore(cutoff))
                 continue;
@@ -2189,8 +2234,10 @@ public class ScarletDiscordCommands
         summary.append("**").append(metas.size()).append("** action(s): ").append(parts.isEmpty() ? "none" : String.join(", ", parts));
         summary.append(lookbackDays > 0 ? " _(past " + lookbackDays + " day(s))_" : " _(all recorded history)_");
         ScarletPendingModActions.TimedBan timedBan = this.discord.scarlet.pendingModActions.getTimedBan(vrcId);
-        if (timedBan != null)
+        if (timedBan != null && timedBan.isActiveFor(this.discord.scarlet.vrc.groupId))
             summary.append("\n:hourglass: Active timed ban — automatic unban <t:").append(Long.toUnsignedString(timedBan.expiresAt / 1000L)).append(":R>");
+        else if (timedBan != null)
+            summary.append("\n:warning: An automatic-unban record needs review; no automatic unban is currently confirmed for this group.");
 
         // One line per action, newest first (masked links render inside embeds)
         int maxListed = 150;
@@ -2222,39 +2269,11 @@ public class ScarletDiscordCommands
             .setDescription(summary.toString())
             .build();
 
-        // Consolidate into a single thread: create it, drop the summary in, then the actions (chunked to fit embeds).
-        try
-        {
-            net.dv8tion.jda.api.entities.channel.concrete.TextChannel textChannel = event.getChannel().asTextChannel();
-            net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel thread = textChannel
-                .createThreadChannel(MiscUtils.maybeEllipsis(100, "Moderation log — " + vrchatUser.getDisplayName()))
-                .setAutoArchiveDuration(net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel.AutoArchiveDuration.TIME_1_WEEK)
-                .complete();
-            thread.sendMessageEmbeds(summaryEmbed).complete();
-            StringBuilder chunk = new StringBuilder();
-            for (String line : actionLines)
-            {
-                if (chunk.length() > 0 && chunk.length() + line.length() + 1 > 4000)
-                {
-                    thread.sendMessageEmbeds(new EmbedBuilder().setDescription(chunk.toString()).build()).complete();
-                    chunk.setLength(0);
-                }
-                if (chunk.length() > 0)
-                    chunk.append('\n');
-                chunk.append(line);
-            }
-            if (chunk.length() > 0)
-                thread.sendMessageEmbeds(new EmbedBuilder().setDescription(chunk.toString()).build()).complete();
-            hook.sendMessageFormat("Created moderation log thread: %s", thread.getAsMention()).setEphemeral(true).queue();
-        }
-        catch (Exception threadFailed)
-        {
-            // Couldn't open a thread here (run inside a thread/forum, or missing permission) — reply inline instead.
-            StringBuilder sb = new StringBuilder("## ").append(label).append('\n').append(summary);
-            for (String line : actionLines)
-                sb.append('\n').append(line);
-            this.discord.interactions.new Pagination(event.getId(), sb).queue(hook);
-        }
+        // Never copy requester-authorized confidential history into a public thread.
+        StringBuilder sb = new StringBuilder("## ").append(label).append('\n').append(summary);
+        for (String line : actionLines)
+            sb.append('\n').append(line);
+        this.discord.interactions.new Pagination(event.getId(), sb).queue(hook);
     }
 
     // vrchat-user-ban
@@ -2276,23 +2295,14 @@ public class ScarletDiscordCommands
             return;
         }
         
-        String vrcActorId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(event.getUser().getId());
-        if (vrcActorId == null)
+        String requestedGroupId = this.discord.scarlet.vrc.groupId, requestedGuildId = this.discord.guildSf;
+        ScarletDiscordJDA.VRChatBanAccess access = this.discord.checkVRChatBanAccess(event.getUser().getId(), null,
+            vrcTargetId, net.sybyline.scarlet.server.discord.DPerms.PermType.SLASH_COMMAND, "vrchat-user-ban");
+        if (!access.allowed())
         {
-            hook.sendMessage(this.discord.linkedIdsReply(event.getUser())).setEphemeral(true).queue();
+            hook.sendMessage(access.message).setEphemeral(true).queue();
             return;
         }
-        
-        if (!this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, event.getMember()))
-        {
-            if (!this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, event.getMember(), false))
-            {
-                hook.sendMessage("You do not have permission to ban users.\n||(Your admin can enable this by giving your associated VRChat user ban management permissions in the group or with the command `/scarlet-discord-permissions type:Other name:groupex-bans-manage value:Allow`)||").setEphemeral(true).queue();
-                return;
-            }
-        }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, hook))
-            return;
         
         GroupMemberStatus status = this.discord.scarlet.vrc.getGroupMembershipStatus(this.discord.scarlet.vrc.groupId, vrcTargetId);
         if (status == GroupMemberStatus.BANNED)
@@ -2301,17 +2311,17 @@ public class ScarletDiscordCommands
         }
         else if (tagImmediately)
         {
-            if (!this.discord.scarlet.pendingModActions.addBanInfo(vrcTargetId, event.getUser().getId()))
-            {
-                hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
-                return;
-            }
-            
             List<ScarletModerationTags.Tag> tags = this.discord.scarlet.moderationTags.getTags();
             
             if (tags == null || tags.isEmpty())
             {
                 hook.sendMessage("No moderation tags!").setEphemeral(true).queue();
+                return;
+            }
+            if (!this.discord.scarlet.pendingModActions.addBanInfo(vrcTargetId, event.getUser().getId(), access.actorId,
+                requestedGroupId, requestedGuildId))
+            {
+                hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
                 return;
             }
             StringSelectMenu.Builder builder = StringSelectMenu
@@ -2345,18 +2355,14 @@ public class ScarletDiscordCommands
                 .setEphemeral(true)
                 .queue();
         }
-        else if (this.discord.scarlet.pendingModActions.addPending(GroupAuditType.USER_BAN, vrcTargetId, vrcActorId) != null)
-        {
-            hook.sendMessage("This VRChat user currently has automated/assisted moderation pending, please retry later").setEphemeral(true).queue();
-        }
-        else if (!this.discord.scarlet.vrc.banFromGroup(vrcTargetId))
-        {
-            this.discord.scarlet.pendingModActions.pollPending(GroupAuditType.USER_BAN, vrcTargetId);
-            hook.sendMessageFormat("Failed to ban %s", vrchatUser.getDisplayName()).setEphemeral(true).queue();
-        }
         else
         {
-            hook.sendMessageFormat("Banned %s", vrchatUser.getDisplayName()).setEphemeral(false).queue();
+            ScarletDiscordJDA.VRChatBanAttempt attempt = this.discord.executeVRChatBan(event.getUser().getId(), access.actorId,
+                vrcTargetId, net.sybyline.scarlet.server.discord.DPerms.PermType.SLASH_COMMAND, "vrchat-user-ban");
+            if (attempt.succeeded())
+                hook.sendMessageFormat("Banned %s", vrchatUser.getDisplayName()).setEphemeral(false).queue();
+            else
+                hook.sendMessage(attempt.message).setEphemeral(true).queue();
         }
         
     }
@@ -2368,23 +2374,13 @@ public class ScarletDiscordCommands
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void vrchatUserBanMulti(SlashCommandInteractionEvent event) throws Exception
     {
-        String vrcActorId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(event.getUser().getId());
-        if (vrcActorId == null)
+        // Opening a modal makes no moderation changes; refresh permissions on submission/execution.
+        if (!this.discord.perms.checkSlash(event.getMember(), "vrchat-user-ban-multi")
+            || this.discord.scarlet.data.globalMetadata_getSnowflakeId(event.getUser().getId()) == null)
         {
-            event.reply(this.discord.linkedIdsReply(event.getUser())).setEphemeral(true).queue();
+            event.reply("This command requires current access and a linked VRChat account.").setEphemeral(true).queue();
             return;
         }
-        
-        if (!this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, event.getMember()))
-        {
-            if (!this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, event.getMember(), false))
-            {
-                event.reply("You do not have permission to ban users.\n||(Your admin can enable this by giving your associated VRChat user ban management permissions in the group or with the command `/scarlet-discord-permissions type:Other name:groupex-bans-manage value:Allow`)||").setEphemeral(true).queue();
-                return;
-            }
-        }
-        if (!this.discord.checkSelfRespondVrcPerms(GroupPermissions.group_bans_manage, event))
-            return;
         
         event.replyModal(Modal.create("vrchat-user-ban-multi", "Ban Multiple VRChat Users")
             .addComponents(Label.of("Target VRChat User IDs", TextInput.create("target-ids", TextInputStyle.PARAGRAPH)
@@ -3030,7 +3026,7 @@ public class ScarletDiscordCommands
                 .setEphemeral(true)
                 .queue();
         }
-        public final SlashOption<String> _vrchatLocation = SlashOption.ofString("vrchat-location", "The instance to close", true, null, VrcIds::resolveLocation, false, null);
+        public final SlashOption<String> _vrchatLocation = SlashOption.ofString("vrchat-location", "Full VRChat instance launch link or worldId:instanceId location", true, null);
         public final SlashOption<Boolean> _closeHard = SlashOption.ofBool("close-hard", "Whether to kick users currently in the instance", false, null);
         public final SlashOption<Integer> _closeInMinutes = SlashOption.ofInt("close-in-minutes", "The number of minutes to wait before closing the instance", false, null).with($->$.setRequiredRange(1L, 600L));
         @SlashCmd("close-instance")
@@ -3047,14 +3043,27 @@ public class ScarletDiscordCommands
                 return;
             }
             
-            Location closeLocationModel = Location.of(vrchatLocation);
+            Location closeLocationModel;
+            try
+            {
+                closeLocationModel = ScarletCloseInstanceInput.parse(vrchatLocation, ScarletDiscordCommands.this.discord.scarlet.vrc.groupId);
+            }
+            catch (IllegalArgumentException ex)
+            {
+                hook.sendMessage(ex.getMessage()).setEphemeral(true).queue();
+                return;
+            }
             OffsetDateTime closeAt = closeInMinutes == null ? null : OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(closeInMinutes.longValue());
             
-            InstancesApi instances = new InstancesApi(ScarletDiscordCommands.this.discord.scarlet.vrc.client);
-            Instance instance = instances.closeInstance(closeLocationModel.world, closeLocationModel.instance, closeHard, closeAt);
-            
-            LOG.info(String.format("%s (%s) closed an instance: %s", vrcActor.getDisplayName(), vrcActor.getId(), instance.getId()));
-            hook.sendMessageFormat("Closed instance `%s`", instance.getId()).setEphemeral(true).queue();
+            ScarletInstanceClose.Result result = ScarletInstanceClose.submit(
+                ScarletDiscordCommands.this.discord.scarlet.vrc.client,
+                closeLocationModel.world, closeLocationModel.instance, closeHard, closeAt);
+            // Correlate with safe request/response diagnostics without logging a launch link or nonce.
+            LOG.info("Instance-close outcome [{}]: {}, requestedHardClose={}, requestedClosedAt={}, effectiveClosedAt={}",
+                result.diagnosticId, result.status,
+                ScarletInstanceClose.hardCloseOption(result.requestedHardClose),
+                ScarletInstanceClose.closeAtOption(result.requestedClosedAt), result.closedAt);
+            hook.sendMessage(result.message()).setEphemeral(true).queue();
         }
         @SlashCmd("add-role")
         @Desc("Adds a VRChat Group Role")
@@ -3107,6 +3116,7 @@ public class ScarletDiscordCommands
     // discord-user-info
 
     @SlashCmd("discord-user-info")
+    @Ephemeral
     @Desc("Lists internal information for a specific Discord user")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void discordUserInfo(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("discord-user") Member discordUser) throws Exception
@@ -3160,6 +3170,7 @@ public class ScarletDiscordCommands
     // query-target-history
 
     @SlashCmd("query-target-history")
+    @Ephemeral
     @Desc("Queries audit events targeting a specific VRChat user")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void queryTargetHistory(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("vrchat-user") io.github.vrchatapi.model.User vrchatUser, @SlashOpt("days-back") int daysBack) throws Exception
@@ -3171,7 +3182,7 @@ public class ScarletDiscordCommands
             return;
         }
         
-        List<GroupAuditLogEntry> entries = this.discord.scarlet.vrc.auditQueryTargeting(vrcId, daysBack);
+        List<GroupAuditLogEntryUnknown> entries = this.discord.scarlet.vrc.auditQueryTargeting(vrcId, daysBack);
         if (entries == null)
         {
             hook.sendMessageFormat("Error querying audit target history for [%s](<%s>) (%s)", vrchatUser.getDisplayName(), VrcWeb.Home.user(vrcId), vrcId).setEphemeral(true).queue();
@@ -3193,30 +3204,13 @@ public class ScarletDiscordCommands
         }
         
         sb.append("\n### Audit target events:");
-        for (GroupAuditLogEntry entry : entries)
+        for (GroupAuditLogEntryUnknown entry : entries)
         {
-            sb.append("\n`").append(entry.getId()).append("`").append(" <t:").append(Long.toUnsignedString(entry.getCreatedAt().toEpochSecond())).append(":f>: ");
             ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(entry.getId());
-            if (this.discord.shouldRedact(entry.getActorId(), event.getMember().getId()))
-            {
-                String entryDescription = entry.getDescription();
-                String actorDisplayName = entry.getActorDisplayName();
-                String selfDisplayName = this.discord.scarlet.vrc.currentUser != null ? this.discord.scarlet.vrc.currentUser.getDisplayName() : "a moderator";
-                if (entryDescription != null && actorDisplayName != null && entryDescription.contains(actorDisplayName))
-                {
-                    entryDescription = entryDescription.replace(actorDisplayName, selfDisplayName);
-                }
-                else
-                {
-                    entryDescription = String.format("User %s was banned by %s.", vrchatUser.getDisplayName(), selfDisplayName);
-                }
-                sb.append(entryDescription);
-            }
-            else if (auditEntryMeta != null && auditEntryMeta.hasMessage())
-                sb.append("[").append(entry.getDescription()).append("](").append(auditEntryMeta.getMessageUrl()).append(")");
-            else
-                sb.append(entry.getDescription());
+            String line = this.discord.auditHistoryLine(entry, auditEntryMeta, event.getMember().getId());
+            if (line != null) sb.append(line);
         }
+        sb.append("\nOnly locally verified events visible to you are included.");
 
         this.discord.interactions.new Pagination(event.getId(), sb).queue(hook);
     }
@@ -3224,6 +3218,7 @@ public class ScarletDiscordCommands
     // query-actor-history
 
     @SlashCmd("query-actor-history")
+    @Ephemeral
     @Desc("Queries audit events actored by a specific VRChat user")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void queryActorHistory(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("vrchat-user") io.github.vrchatapi.model.User vrchatUser, @SlashOpt("days-back") int daysBack) throws Exception
@@ -3235,7 +3230,7 @@ public class ScarletDiscordCommands
             return;
         }
         
-        List<GroupAuditLogEntry> entries = this.discord.scarlet.vrc.auditQueryActored(vrcId, daysBack);
+        List<GroupAuditLogEntryUnknown> entries = this.discord.scarlet.vrc.auditQueryActored(vrcId, daysBack);
         
         if (entries == null)
         {
@@ -3260,15 +3255,13 @@ public class ScarletDiscordCommands
         }
         
         sb.append("\n### Audit actor events:");
-        for (GroupAuditLogEntry entry : entries)
+        for (GroupAuditLogEntryUnknown entry : entries)
         {
-            sb.append("\n`").append(entry.getId()).append("`").append(" <t:").append(Long.toUnsignedString(entry.getCreatedAt().toEpochSecond())).append(":f>: ");
             ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(entry.getId());
-            if (auditEntryMeta != null && auditEntryMeta.hasMessage())
-                sb.append("[").append(entry.getDescription()).append("](").append(auditEntryMeta.getMessageUrl()).append(")");
-            else
-                sb.append(entry.getDescription());
+            String line = this.discord.auditHistoryLine(entry, auditEntryMeta, event.getMember().getId());
+            if (line != null) sb.append(line);
         }
+        sb.append("\nOnly locally verified events visible to you are included.");
 
         this.discord.interactions.new Pagination(event.getId(), sb).queue(hook);
     }
@@ -3276,6 +3269,7 @@ public class ScarletDiscordCommands
     // actor-moderation-summary
 
     @SlashCmd("actor-moderation-summary")
+    @Ephemeral
     @Desc("Generates a summary of certain moderation actions by a specific user")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void actorModerationSummary(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("vrchat-user") io.github.vrchatapi.model.User vrchatUser)
@@ -3319,11 +3313,21 @@ public class ScarletDiscordCommands
     // moderation-summary
 
     @SlashCmd("moderation-summary")
-    @Desc("Generates a summary of moderation actions")
+    @Desc("Summarizes saved local moderation history in the background")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void moderationSummary(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("hours-back") int hoursBack)
     {
-        this.discord.emitModSummary(this.discord.scarlet, OffsetDateTime.now(ZoneOffset.UTC), hoursBack, hook::sendMessageEmbeds);
+        if (hoursBack <= 0)
+        {
+            hook.sendMessage("hours-back must be greater than zero.").queue();
+            return;
+        }
+        ScarletSummaryWorker.Submission result = this.discord.requestModSummary(OffsetDateTime.now(ZoneOffset.UTC),
+            hoursBack, hook::sendMessageEmbeds, text -> hook.sendMessage(text).queue());
+        if (result == ScarletSummaryWorker.Submission.BUSY)
+            hook.sendMessage("A moderation summary is already running. Please wait for it to finish before requesting another.").queue();
+        else if (result == ScarletSummaryWorker.Submission.CLOSED)
+            hook.sendMessage("Scarlet is shutting down; the moderation summary was not started.").queue();
     }
 
     // outstanding-moderation
@@ -3412,9 +3416,10 @@ public class ScarletDiscordCommands
         }
         
         ScarletData.AuditEntryMetadata entryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
-        if (entryMeta == null)
+        String requesterSf = event.getMember() == null ? null : event.getMember().getId();
+        if (requesterSf == null || this.discord.auditThreadProblem(entryMeta, message, requesterSf) != null)
         {
-            event.replyFormat("Failed to find data for entry `%s`", auditEntryId)
+            event.reply("This is not a currently approved Scarlet audit message you may repair. Nothing changed.")
                 .setEphemeral(true)
                 .queue($ -> $.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
             return;
@@ -3425,7 +3430,7 @@ public class ScarletDiscordCommands
         event.replyFormat("Attempting to fix entry `%s`", auditEntryId)
             .setEphemeral(true)
             .queue($ -> $.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
-        this.discord.scarlet.exec.execute(() -> this.discord.emitUserModeration_thread(this.discord.scarlet, entryMeta, actorId, message));
+        this.discord.scarlet.exec.execute(() -> this.discord.emitUserModeration_thread(this.discord.scarlet, entryMeta, actorId, message, requesterSf));
     }
 
     // config-info
@@ -3496,16 +3501,71 @@ public class ScarletDiscordCommands
 
     // settings
 
+    static Modal avatarProviderConsentModal(String settingId)
+    {
+        return Modal.create("settings:" + settingId, net.sybyline.scarlet.ui.AvatarProviderConsentDialog.TITLE)
+            .addComponents(TextDisplay.of(net.sybyline.scarlet.ui.AvatarProviderConsentDialog.DISCLOSURE),
+                Label.of("Permission for selected avatar databases", StringSelectMenu.create(settingId)
+                    .addOption("Keep disabled", "false")
+                    .addOption("I agree to share group/account IDs and Scarlet version", "agree")
+                    .setDefaultValues("false")
+                    .setRequired(true)
+                    .build()))
+            .build();
+    }
+
+    static boolean applyAvatarProviderConsent(ScarletSettings.FileValuedConsentBoolean setting, String value)
+    {
+        if ("false".equals(value))
+            return setting.set(Boolean.FALSE, "discord");
+        return "agree".equals(value) && setting.setWithConsent(Boolean.TRUE, "discord", () -> true);
+    }
+
+    static String settingResult(FileValued<?> setting, boolean accepted)
+    {
+        if (!accepted)
+            return "Invalid or unavailable value for "+setting.name()+". Nothing changed.";
+        Object current = setting.get();
+        return "Set "+setting.name()+" to "+(current instanceof String[] ? Arrays.toString((String[])current) : String.valueOf(current));
+    }
+
+    static StringSelectMenu settingChoiceMenu(String id, SelectOption[] options, String currentValue, boolean required)
+    {
+        StringSelectMenu.Builder menu = StringSelectMenu.create(id).addOptions(options)
+            .setMinValues(required ? 1 : 0).setMaxValues(1).setRequired(required);
+        for (SelectOption option : options)
+            if (option.getValue().equals(currentValue))
+            {
+                menu.setDefaultValues(currentValue);
+                break;
+            }
+        return menu.build();
+    }
+
     @SlashCmd("settings")
     @Desc("Configures settings")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public class Settings
     {
+        void submitSettingModal(SlashCommandInteractionEvent event, FileValued<?> setting, Modal modal,
+            DInteractions.ModalFlowImmediate immediate)
+        {
+            String groupId = ScarletDiscordCommands.this.discord.scarlet.vrc.groupId;
+            ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate,
+                interaction -> Objects.equals(groupId, ScarletDiscordCommands.this.discord.scarlet.vrc.groupId)
+                    && ScarletDiscordCommands.this.discord.scarlet.settings.fileValuedSettings.get(setting.id()) == setting).queue();
+        }
+
         public final SlashOption<ScarletSettings.FileValued<?>> _settingId = SlashOption.ofString("setting-id", "The setting", true, null, ScarletDiscordCommands.this.discord.scarlet.settings.fileValuedSettings::get, false, new SlashOptionsChoicesUnsanitized(() -> ScarletDiscordCommands.this.discord.scarlet.settings.fileValuedSettings.values().stream().map($ -> new Command.Choice($.name(), $.id())).toArray(Command.Choice[]::new), false));
         @SlashCmd("edit")
         @Desc("Configure a setting")
         public void edit(SlashCommandInteractionEvent event, @SlashOpt("setting-id") ScarletSettings.FileValued<?> settingId) throws Exception
         {
+            if (settingId == null)
+            {
+                event.reply("That setting is no longer available. Choose a current setting from the suggestions. Nothing changed.").setEphemeral(true).queue();
+                return;
+            }
             if (settingId.visit(new FileValuedVisitor<Boolean>()
             {
                 @Override
@@ -3516,7 +3576,8 @@ public class ScarletDiscordCommands
                 @Override
                 public Boolean visitBoolean(FileValued<Boolean> fileValued, boolean defaultValue)
                 {
-                    Modal modal = Modal.create("settings:"+fileValued.id(), fileValued.name())
+                    boolean requiresConsent = fileValued instanceof ScarletSettings.FileValuedConsentBoolean;
+                    Modal modal = requiresConsent ? avatarProviderConsentModal(fileValued.id()) : Modal.create("settings:"+fileValued.id(), fileValued.name())
                         .addComponents(Label.of(fileValued.name(), StringSelectMenu.create(fileValued.id())
                             .addOption("True", "true")
                             .addOption("False", "false")
@@ -3533,10 +3594,13 @@ public class ScarletDiscordCommands
                             return;
                         }
                         String value = selected[0];
-                        fileValued.set(Boolean.parseBoolean(value), "discord");
-                        interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                        boolean accepted = requiresConsent
+                            ? applyAvatarProviderConsent((ScarletSettings.FileValuedConsentBoolean)fileValued, value)
+                            : ("true".equals(value) || "false".equals(value))
+                                && fileValued.set(Boolean.parseBoolean(value), "discord");
+                        interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                     };
-                    ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+                    Settings.this.submitSettingModal(event, fileValued, modal, immediate);
                     return Boolean.TRUE;
                 }
                 @Override
@@ -3552,13 +3616,13 @@ public class ScarletDiscordCommands
                         .build();
                     DInteractions.ModalFlowImmediate immediate = interaction ->
                     {
-                        String[] selected = interaction.getValues().stream().map(ModalMapping::getAsStringList).flatMap(List::stream).toArray(String[]::new);
-                        if (selected.length != 1)
+                        ModalMapping submitted = interaction.getValue(fileValued.id());
+                        if (submitted == null)
                         {
-                            interaction.replyFormat("Must select exactly 1 value for %s", fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                            interaction.replyFormat("Missing value for %s", fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                             return;
                         }
-                        String value = selected[0];
+                        String value = submitted.getAsString();
                         int intValue;
                         try
                         {
@@ -3569,10 +3633,10 @@ public class ScarletDiscordCommands
                             interaction.replyFormat("%s must be an integer between %d and %d", fileValued.name, minimum, maximum).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                             return;
                         }
-                        fileValued.set(intValue, "discord");
-                        interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                        boolean accepted = fileValued.set(intValue, "discord");
+                        interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                     };
-                    ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+                    Settings.this.submitSettingModal(event, fileValued, modal, immediate);
                     return Boolean.TRUE;
                 }
                 @Override
@@ -3628,18 +3692,17 @@ public class ScarletDiscordCommands
                                     interaction.replyFormat("Invalid value %s for %s", value, fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                                     return;
                                 }
-                                fileValued.set(enumValue, "discord");
-                                interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                                boolean accepted = enumValue != null && fileValued.set(enumValue, "discord");
+                                interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                             };
                         }
                         else
                         {
                             Modal.Builder builder = Modal.create("settings:"+fileValued.id(), fileValued.name());
-                            DInteractions.Paginator.Selector[] selectors = DInteractions.Paginator.Selector.embeds(options, 25);
-                            final int pages = selectors.length;
+                            final int pages = (options.length + 24) / 25;
                             for (int page = 0; page < pages; page++)
                             {
-                                SelectOption[] pageOptions = selectors[page].applyContent();
+                                SelectOption[] pageOptions = Arrays.copyOfRange(options, page * 25, Math.min(options.length, (page + 1) * 25));
                                 int ordinal = page * 25 + 1;
                                 String currentValue = stringifier.apply(fileValued.get());
                                 StringSelectMenu.Builder pageMenu = StringSelectMenu.create(fileValued.id()+":"+page)
@@ -3653,7 +3716,7 @@ public class ScarletDiscordCommands
                                         pageMenu.setDefaultValues(currentValue);
                                         break;
                                     }
-                                builder.addComponents(Label.of(String.format("%s (%d thru %d)", fileValued.name(), ordinal, ordinal + pageOptions.length), pageMenu.build()));
+                                builder.addComponents(Label.of(String.format("%s (%d thru %d)", fileValued.name(), ordinal, ordinal + pageOptions.length - 1), pageMenu.build()));
                             }
                             modal = builder.build();
                             immediate = interaction ->
@@ -3674,16 +3737,16 @@ public class ScarletDiscordCommands
                                     interaction.replyFormat("Invalid value %s for %s", selected[0], fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                                     return;
                                 }
-                                fileValued.set(enumValue, "discord");
-                                interaction.replyFormat("Set %s to %s", fileValued.name, selected[0]).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                                boolean accepted = enumValue != null && fileValued.set(enumValue, "discord");
+                                interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                             };
                         }
-                        ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+                        Settings.this.submitSettingModal(event, fileValued, modal, immediate);
                     }
                     else
                     {
                         MessageEmbed[] embeds = Stream.of(options).map($ -> new EmbedBuilder().setTitle($.getLabel()).setDescription($.getValue()).build()).toArray(MessageEmbed[]::new);
-                        event.deferReply().queue(hook -> ScarletDiscordCommands.this.discord.interactions.new Pagination(event.getId(), embeds, options, 25, (interaction, value) ->
+                        event.deferReply(true).queue(hook -> ScarletDiscordCommands.this.discord.interactions.new Pagination(event.getId(), embeds, options, 25, (interaction, value) ->
                         {
                             E enumValue;
                             try
@@ -3695,9 +3758,10 @@ public class ScarletDiscordCommands
                                 interaction.replyFormat("Invalid value %s for %s", value, fileValued.name).setEphemeral(true).queue(hook2 -> hook2.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                                 return;
                             }
-                            fileValued.set(enumValue, "discord");
-                            interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook2 -> hook2.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
-                        }).queue(hook));
+                            boolean accepted = enumValue != null && fileValued.set(enumValue, "discord");
+                            interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook2 -> hook2.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                        }).restrictTo(event.getUser().getId(), interaction -> ScarletDiscordCommands.this.discord.perms.checkSlash(
+                            interaction.getGuild() == null ? null : interaction.getGuild().getMemberById(interaction.getUser().getId()), "settings edit")).queue(hook));
                     }
                     return Boolean.TRUE;
                 }
@@ -3706,6 +3770,11 @@ public class ScarletDiscordCommands
                 {
                     String[] values = validValues.get().toArray(new String[0]);
                     SelectOption[] options = Stream.of(values).map($ -> SelectOption.of($, $)).toArray(SelectOption[]::new);
+                    if (values.length == 0)
+                    {
+                        event.replyFormat("No values are currently available for %s. Nothing changed.", fileValued.name()).setEphemeral(true).queue();
+                        return Boolean.TRUE;
+                    }
                     if (values.length <= 125)
                     {
                         Modal modal;
@@ -3713,11 +3782,7 @@ public class ScarletDiscordCommands
                         if (values.length <= 25)
                         {
                             modal = Modal.create("settings:"+fileValued.id(), fileValued.name())
-                                .addComponents(Label.of(fileValued.name(), StringSelectMenu.create(fileValued.id())
-                                    .addOptions(options)
-                                    .setDefaultValues(fileValued.get())
-                                    .setRequired(true)
-                                    .build()))
+                                .addComponents(Label.of(fileValued.name(), settingChoiceMenu(fileValued.id(), options, fileValued.get(), true)))
                                 .build();
                             immediate = interaction ->
                             {
@@ -3728,26 +3793,20 @@ public class ScarletDiscordCommands
                                     return;
                                 }
                                 String value = selected[0];
-                                fileValued.set(value, "discord");
-                                interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                                boolean accepted = fileValued.set(value, "discord");
+                                interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                             };
                         }
                         else
                         {
                             Modal.Builder builder = Modal.create("settings:"+fileValued.id(), fileValued.name());
-                            DInteractions.Paginator.Selector[] selectors = DInteractions.Paginator.Selector.embeds(options, 25);
-                            final int pages = selectors.length;
+                            final int pages = (options.length + 24) / 25;
                             for (int page = 0; page < pages; page++)
                             {
-                                SelectOption[] pageOptions = selectors[page].applyContent();
+                                SelectOption[] pageOptions = Arrays.copyOfRange(options, page * 25, Math.min(options.length, (page + 1) * 25));
                                 int ordinal = page * 25 + 1;
-                                builder.addComponents(Label.of(String.format("%s (%d thru %d)", fileValued.name(), ordinal, ordinal + pageOptions.length), StringSelectMenu.create(fileValued.id()+":"+page)
-                                    .addOptions(options)
-                                    .setDefaultValues(fileValued.get())
-                                    .setMinValues(0)
-                                    .setMaxValues(1)
-                                    .setRequired(false)
-                                    .build()));
+                                builder.addComponents(Label.of(String.format("%s (%d thru %d)", fileValued.name(), ordinal, ordinal + pageOptions.length - 1),
+                                    settingChoiceMenu(fileValued.id()+":"+page, pageOptions, fileValued.get(), false)));
                             }
                             modal = builder.build();
                             immediate = interaction ->
@@ -3758,20 +3817,21 @@ public class ScarletDiscordCommands
                                     interaction.replyFormat("Must select exactly 1 value for %s", fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                                     return;
                                 }
-                                fileValued.set(selected[0], "discord");
-                                interaction.replyFormat("Set %s to %s", fileValued.name, selected[0]).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                                boolean accepted = fileValued.set(selected[0], "discord");
+                                interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                             };
                         }
-                        ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+                        Settings.this.submitSettingModal(event, fileValued, modal, immediate);
                     }
                     else
                     {
                         MessageEmbed[] embeds = Stream.of(values).map($ -> new EmbedBuilder().setTitle($).setDescription($).build()).toArray(MessageEmbed[]::new);
-                        event.deferReply().queue(hook -> ScarletDiscordCommands.this.discord.interactions.new Pagination(event.getId(), embeds, options, 25, (interaction, value) ->
+                        event.deferReply(true).queue(hook -> ScarletDiscordCommands.this.discord.interactions.new Pagination(event.getId(), embeds, options, 25, (interaction, value) ->
                         {
-                            fileValued.set(value, "discord");
-                            interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook2 -> hook2.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
-                        }).queue(hook));
+                            boolean accepted = fileValued.set(value, "discord");
+                            interaction.reply(settingResult(fileValued, accepted)).setEphemeral(true).queue(hook2 -> hook2.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                        }).restrictTo(event.getUser().getId(), interaction -> ScarletDiscordCommands.this.discord.perms.checkSlash(
+                            interaction.getGuild() == null ? null : interaction.getGuild().getMemberById(interaction.getUser().getId()), "settings edit")).queue(hook));
                     }
                     return Boolean.TRUE;
                 }
@@ -3789,14 +3849,14 @@ public class ScarletDiscordCommands
                         String value = interaction.getValue(fileValued.id()).getAsString();
                         if (fileValued.set(value, "discord"))
                         {
-                            interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                            interaction.reply(settingResult(fileValued, true)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                         }
                         else
                         {
                             interaction.replyFormat("Invalid value %s for %s", value, fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                         }
                     };
-                    ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+                    Settings.this.submitSettingModal(event, fileValued, modal, immediate);
                     return Boolean.TRUE;
                 }
                 @Override
@@ -3804,7 +3864,7 @@ public class ScarletDiscordCommands
                 {
                     String[] currentValues = fileValued.get();
                     Modal modal = Modal.create("settings:"+fileValued.id(), fileValued.name())
-                        .addComponents(Label.of(pattern != null ? "Strings of the pattern "+pattern : fileValued.name(), TextInput.create(fileValued.id(), TextInputStyle.SHORT)
+                        .addComponents(Label.of(pattern != null ? "Strings of the pattern "+pattern : fileValued.name(), TextInput.create(fileValued.id(), TextInputStyle.PARAGRAPH)
                             .setValue(String.join("\n", currentValues))
                             .setRequired(true)
                             .build()))
@@ -3814,14 +3874,14 @@ public class ScarletDiscordCommands
                         String value = interaction.getValue(fileValued.id()).getAsString();
                         if (fileValued.set(value.split("\\R"), "discord"))
                         {
-                            interaction.replyFormat("Set %s to %s", fileValued.name, value).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
+                            interaction.reply(settingResult(fileValued, true)).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                         }
                         else
                         {
                             interaction.replyFormat("Invalid value %s for %s", value, fileValued.name).setEphemeral(true).queue(hook -> hook.deleteOriginal().queueAfter(5_000L, TimeUnit.MILLISECONDS));
                         }
                     };
-                    ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+                    Settings.this.submitSettingModal(event, fileValued, modal, immediate);
                     return Boolean.TRUE;
                 }
                 @Override
@@ -3841,6 +3901,20 @@ public class ScarletDiscordCommands
     }
 
     // config-set
+
+    static OffsetDateTime nextSummaryTime(ZoneId zone, LocalTime time, ZonedDateTime now)
+    {
+        ZonedDateTime localNow = now.withZoneSameInstant(zone);
+        ZonedDateTime next = localNow.toLocalDate().atTime(time).atZone(zone);
+        if (next.isBefore(localNow))
+            next = localNow.toLocalDate().plusDays(1L).atTime(time).atZone(zone);
+        return next.toOffsetDateTime().withOffsetSameInstant(ZoneOffset.UTC);
+    }
+
+    static SlashOption<Integer> integerSettingOption(String id, String description, ScarletSettings.FileValuedIntRange setting)
+    {
+        return SlashOption.ofInt(id, description, true, setting.def, setting.min, setting.max);
+    }
 
     @SlashCmd("config-set")
     @Desc("Configures miscellaneous settings")
@@ -3877,7 +3951,7 @@ public class ScarletDiscordCommands
                 catch (Exception zoneEx) { timeZoneId = null; }
             if (timeZoneId == null)
             {
-                event.replyFormat("Invalid time zone/offset `%s`", event.getOption("time-zone-id", OptionMapping::getAsString)).queue();
+                event.replyFormat("Invalid time zone/offset `%s`. Nothing changed.", event.getOption("time-zone-id", OptionMapping::getAsString)).setEphemeral(true).queue();
                 return null;
             }
             LocalTime time;
@@ -3885,17 +3959,12 @@ public class ScarletDiscordCommands
             {
                 time = LocalTime.parse(timeOfDay);
             }
-            catch (DateTimeParseException dtpex)
+            catch (DateTimeParseException | NullPointerException dtpex)
             {
-                event.replyFormat("Invalid time of day `%s`", timeOfDay).queue();
+                event.replyFormat("Invalid time of day `%s`. Nothing changed.", timeOfDay).setEphemeral(true).queue();
                 return null;
             }
-            long es = ZonedDateTime.now(timeZoneId).withHour(0).withMinute(0).withSecond(0).withNano(0).plusSeconds(time.toSecondOfDay()).toEpochSecond();
-            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC),
-                           offset = OffsetDateTime.ofInstant(Instant.ofEpochSecond(es), ZoneOffset.UTC);
-            while (offset.isBefore(now))
-                offset = offset.plusHours(24L);
-            return offset;
+            return nextSummaryTime(timeZoneId, time, ZonedDateTime.now(timeZoneId));
         }
         @SlashCmd("moderation-summary")
         @Desc("Moderation summary settings")
@@ -3906,8 +3975,10 @@ public class ScarletDiscordCommands
             public void modSummaryTimeOfDay(SlashCommandInteractionEvent event, @SlashOpt("time-zone-id") ZoneId timeZoneId, @SlashOpt("time-of-day") String timeOfDay) throws Exception
             {
                 OffsetDateTime offset = nextTimeOfDay(event, timeZoneId, timeOfDay);
+                if (offset == null)
+                    return;
                 ScarletDiscordCommands.this.discord.scarlet.settings.nextModSummary.set(offset);
-                String epochNext = Long.toUnsignedString(offset.plusHours(24L).toEpochSecond());
+                String epochNext = Long.toUnsignedString(offset.toEpochSecond());
                 event.replyFormat("Set mod summary generation time: next summary at <t:%s:f>", epochNext).setEphemeral(true).queue();
             }
         }
@@ -3915,42 +3986,44 @@ public class ScarletDiscordCommands
         @Desc("Suggested moderation settings")
         public class SuggestedMod
         {
-            public final SlashOption<Integer> _kickCount = SlashOption.ofInt("kick-count", "The number of instance kicks to trigger suggested moderation", true, 3).with($->$.setRequiredRange(1L, 1000L));
-            public final SlashOption<Integer> _periodDays = SlashOption.ofInt("period-days", "The number of days of history for which to consider instance kicks", true, 3).with($->$.setRequiredRange(1L, 1000L));
+            public final SlashOption<Integer> _kickCount = integerSettingOption("kick-count", "The number of instance kicks to trigger suggested moderation", ScarletDiscordCommands.this.discord.scarlet.settings.heuristicKickCount);
+            public final SlashOption<Integer> _periodDays = integerSettingOption("period-days", "The number of days of history for which to consider instance kicks", ScarletDiscordCommands.this.discord.scarlet.settings.heuristicPeriodDays);
             @SlashCmd("kick-count")
             @Desc("The kick count")
             public void kickCount(SlashCommandInteractionEvent event, @SlashOpt("kick-count") int kickCount) throws Exception
             {
-                ScarletDiscordCommands.this.discord.scarlet.settings.heuristicKickCount.set(kickCount, "discord");
-                event.replyFormat("Set suggested moderation kick count: %d", kickCount).setEphemeral(true).queue();
+                FileValued<Integer> setting = ScarletDiscordCommands.this.discord.scarlet.settings.heuristicKickCount;
+                event.reply(settingResult(setting, setting.set(kickCount, "discord"))).setEphemeral(true).queue();
             }
             @SlashCmd("period-days")
             @Desc("The period")
             public void periodDays(SlashCommandInteractionEvent event, @SlashOpt("period-days") int periodDays) throws Exception
             {
-                ScarletDiscordCommands.this.discord.scarlet.settings.heuristicPeriodDays.set(periodDays, "discord");
-                event.replyFormat("Set suggested moderation period: %d day%s", periodDays, periodDays==1?"":"s").setEphemeral(true).queue();
+                FileValued<Integer> setting = ScarletDiscordCommands.this.discord.scarlet.settings.heuristicPeriodDays;
+                event.reply(settingResult(setting, setting.set(periodDays, "discord"))).setEphemeral(true).queue();
             }
         }
         @SlashCmd("outstanding-moderation")
         @Desc("Outstanding moderation settings")
         public class OutstandingMod
         {
-            public final SlashOption<Integer> _periodDays = SlashOption.ofInt("period-days", "The number of days of history for which to consider moderation events", true, 3).with($->$.setRequiredRange(1L, 1000L));
+            public final SlashOption<Integer> _periodDays = integerSettingOption("period-days", "The number of days of history for which to consider moderation events", ScarletDiscordCommands.this.discord.scarlet.settings.outstandingPeriodDays);
             @SlashCmd("period-days")
             @Desc("The period")
             public void periodDays(SlashCommandInteractionEvent event, @SlashOpt("period-days") int periodDays) throws Exception
             {
-                ScarletDiscordCommands.this.discord.scarlet.settings.outstandingPeriodDays.set(periodDays, "discord");
-                event.replyFormat("Set outstanding moderation period: %d day%s", periodDays, periodDays==1?"":"s").setEphemeral(true).queue();
+                FileValued<Integer> setting = ScarletDiscordCommands.this.discord.scarlet.settings.outstandingPeriodDays;
+                event.reply(settingResult(setting, setting.set(periodDays, "discord"))).setEphemeral(true).queue();
             }
             @SlashCmd("time-of-day")
             @Desc("Set what time of day to generate a summary of outstanding moderation activity")
             public void modSummaryTimeOfDay(SlashCommandInteractionEvent event, @SlashOpt("time-zone-id") ZoneId timeZoneId, @SlashOpt("time-of-day") String timeOfDay) throws Exception
             {
                 OffsetDateTime offset = nextTimeOfDay(event, timeZoneId, timeOfDay);
+                if (offset == null)
+                    return;
                 ScarletDiscordCommands.this.discord.scarlet.settings.nextOutstandingMod.set(offset);
-                String epochNext = Long.toUnsignedString(offset.plusHours(24L).toEpochSecond());
+                String epochNext = Long.toUnsignedString(offset.toEpochSecond());
                 event.replyFormat("Set outstanding mod summary generation time: next summary at <t:%s:f>", epochNext).setEphemeral(true).queue();
             }
         }
@@ -4150,19 +4223,41 @@ public class ScarletDiscordCommands
 
     // set-audit-channel
 
+    static String textChannelConfigurationProblem(Channel channel, String guildId)
+    {
+        if (channel == null)
+            return null;
+        if (!(channel instanceof TextChannel) || channel.getType() != ChannelType.TEXT)
+            return "Choose a standard Discord text channel. Other channel types are not supported by this log destination. Nothing changed.";
+        TextChannel text = (TextChannel)channel;
+        if (text.getGuild() == null || !Objects.equals(guildId, text.getGuild().getId()))
+            return "The channel must belong to Scarlet's configured Discord server. Nothing changed.";
+        Member bot = text.getGuild().getSelfMember();
+        if (bot == null || !bot.hasPermission(text, Permission.VIEW_CHANNEL, Permission.MESSAGE_SEND, Permission.MESSAGE_EMBED_LINKS))
+            return "Scarlet needs View Channel, Send Messages, and Embed Links in the selected channel. Fix those Discord permissions, then try again. Nothing changed.";
+        return null;
+    }
+
+    boolean checkTextChannelConfiguration(Channel channel, InteractionHook hook)
+    {
+        String problem = textChannelConfigurationProblem(channel, this.discord.guildSf);
+        if (problem == null)
+            return true;
+        hook.sendMessage(problem).setEphemeral(true).queue();
+        return false;
+    }
+
     @SlashCmd("set-audit-channel")
     @Desc("Sets a given text channel as the channel certain audit event types use")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void setAuditChannel(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("audit-event-type") GroupAuditType auditEventType, @SlashOpt("discord-text-channel") Channel textChannel) throws Exception
     {
+        if (!this.checkTextChannelConfiguration(textChannel, hook))
+            return;
         if (textChannel == null)
         {
             this.discord.setAuditChannel(auditEventType, null);
             hook.sendMessageFormat("Unassociating VRChat group audit log event type %s (%s) from any channels", auditEventType.title, auditEventType.id).setEphemeral(true).queue();
-        }
-        else if (!textChannel.getType().isMessage())
-        {
-            hook.sendMessageFormat("The channel %s doesn't support message sending", textChannel.getName()).setEphemeral(true).queue();
         }
         else
         {
@@ -4179,10 +4274,21 @@ public class ScarletDiscordCommands
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void setAuditAuxWebhooks(SlashCommandInteractionEvent event, @SlashOpt("audit-event-type") GroupAuditType auditEventType) throws Exception
     {
+        if (this.discord.scarletAuxWh2webhookUrl.isEmpty())
+        {
+            event.reply("No auxiliary webhooks are configured. Add one with /aux-webhooks add first. Nothing changed.").setEphemeral(true).queue();
+            return;
+        }
+        if (this.discord.scarletAuxWh2webhookUrl.size() > 25
+            || this.discord.scarletAuxWh2webhookUrl.keySet().stream().anyMatch(id -> id == null || id.isEmpty() || id.length() > 100))
+        {
+            event.reply("This selector supports at most 25 configured webhook names, each 1–100 characters. Remove unused or invalid names with /aux-webhooks remove first. No routes were changed.").setEphemeral(true).queue();
+            return;
+        }
         SelectOption[] options = this.discord.scarletAuxWh2webhookUrl
             .keySet()
             .stream()
-            .limit(25L)
+            .sorted()
             .map($ -> SelectOption.of($, $))
             .toArray(SelectOption[]::new);
         UniqueStrings scarletAuxWhs = this.discord.auditType2scarletAuxWh.get(auditEventType.id);
@@ -4195,6 +4301,8 @@ public class ScarletDiscordCommands
         event.replyComponents(ActionRow.of(StringSelectMenu.create("set-audit-aux-webhooks:"+auditEventType.id)
             .addOptions(options)
             .setDefaultValues(defaultOptions)
+            .setMinValues(0)
+            .setMaxValues(options.length)
             .build())).setEphemeral(true).queue();
     }
 
@@ -4208,6 +4316,7 @@ public class ScarletDiscordCommands
     {
         @SlashCmd("list")
         @Desc("Lists all auxiliary webhooks")
+        @Ephemeral
         public void list(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("entries-per-page") int entriesPerPage)
         {
             MessageEmbed[] embeds = ScarletDiscordCommands.this.discord.scarletAuxWh2webhookUrl
@@ -4215,19 +4324,24 @@ public class ScarletDiscordCommands
                 .stream()
                 .map($ -> new EmbedBuilder()
                     .setTitle($.getKey())
-                    .addField("Url", "`"+$.getValue()+"`", false)
+                    .addField("Webhook", ScarletAuditPrivacy.redactedWebhook($.getValue()), false)
                     .build())
                 .toArray(MessageEmbed[]::new)
             ;
             
             ScarletDiscordCommands.this.discord.interactions.new Pagination(event.getId(), embeds, entriesPerPage).queue(hook);
         }
-        public final SlashOption<String> _auxWebhookIdNA = SlashOption.ofString("aux-webhook-id", "The internal id to give the webhook", true, null);
+        public final SlashOption<String> _auxWebhookIdNA = SlashOption.ofString("aux-webhook-id", "The internal id to give the webhook", true, null).with(data -> data.setRequiredLength(1, 100));
         public final SlashOption<String> _auxWebhookUrl = SlashOption.ofString("aux-webhook-url", "The url of the webhook", true, null);
         @SlashCmd("add")
         @Desc("Adds an auxiliary webhook")
         public void add(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("_auxWebhookIdNA") String auxWebhookId, @SlashOpt("aux-webhook-url") String auxWebhookUrl)
         {
+            if (auxWebhookId == null || auxWebhookId.trim().isEmpty() || auxWebhookId.length() > 100)
+            {
+                hook.sendMessage("Webhook names must be 1–100 characters and cannot be blank. Nothing changed.").setEphemeral(true).queue();
+                return;
+            }
             String prevWebhookUrl = ScarletDiscordCommands.this.discord.scarletAuxWh2webhookUrl.get(auxWebhookId);
             if (prevWebhookUrl != null)
             {
@@ -4242,6 +4356,7 @@ public class ScarletDiscordCommands
             }
             
             ScarletDiscordCommands.this.discord.scarletAuxWh2webhookUrl.put(auxWebhookId, auxWebhookUrl);
+            ScarletDiscordCommands.this.discord.save();
             hook.sendMessage("Added auxiliary webhook").setEphemeral(true).queue();
         }
         public final SlashOption<String> _auxWebhookId = SlashOption.ofString("aux-webhook-id", "The internal id of the webhook", true, null, this::_auxWebhookId);
@@ -4259,6 +4374,8 @@ public class ScarletDiscordCommands
                 return;
             }
             
+            ScarletDiscordCommands.this.discord.auditType2scarletAuxWh.values().forEach(names -> names.remove(auxWebhookId));
+            ScarletDiscordCommands.this.discord.save();
             hook.sendMessage("Removed auxiliary webhook").setEphemeral(true).queue();
         }
     }
@@ -4270,14 +4387,12 @@ public class ScarletDiscordCommands
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void setAuditExChannel(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("audit-ex-event-type") GroupAuditTypeEx auditEventTypeEx, @SlashOpt("discord-text-channel") Channel textChannel) throws Exception
     {
+        if (!this.checkTextChannelConfiguration(textChannel, hook))
+            return;
         if (textChannel == null)
         {
             this.discord.setAuditExChannel(auditEventTypeEx, null);
             hook.sendMessageFormat("Unassociating VRChat extended group audit event type %s (%s) from any channels", auditEventTypeEx.title, auditEventTypeEx.id).setEphemeral(true).queue();
-        }
-        else if (!textChannel.getType().isMessage())
-        {
-            hook.sendMessageFormat("The channel %s doesn't support message sending", textChannel.getName()).setEphemeral(true).queue();
         }
         else
         {
@@ -4293,14 +4408,12 @@ public class ScarletDiscordCommands
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public void setAuditSecretChannel(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("audit-event-type") GroupAuditType auditEventType, @SlashOpt("discord-text-channel") Channel textChannel) throws Exception
     {
+        if (!this.checkTextChannelConfiguration(textChannel, hook))
+            return;
         if (textChannel == null)
         {
             this.discord.setAuditSecretChannel(auditEventType, null);
             hook.sendMessageFormat("Unassociating VRChat group audit log event type %s (%s) from any secret channels", auditEventType.title, auditEventType.id).setEphemeral(true).queue();
-        }
-        else if (!textChannel.getType().isMessage())
-        {
-            hook.sendMessageFormat("The channel %s doesn't support message sending", textChannel.getName()).setEphemeral(true).queue();
         }
         else
         {
@@ -4314,16 +4427,21 @@ public class ScarletDiscordCommands
     @SlashCmd("set-audit-secret-ex-channel")
     @Desc("Sets a given text channel as the secret channel certain extended event types use")
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
-    public void setAuditSecretExChannel(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("audit-ex-event-type") GroupAuditTypeEx auditEventTypeEx, @SlashOpt("discord-text-channel") Channel textChannel) throws Exception
+    public void setAuditSecretExChannel(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("_auditSecretExEventType") GroupAuditTypeEx auditEventTypeEx, @SlashOpt("discord-text-channel") Channel textChannel) throws Exception
     {
+        if (auditEventTypeEx == null || (textChannel != null && !auditEventTypeEx.supportsSecretRouting()))
+        {
+            hook.sendMessage("Nothing changed: this event does not support a separate secret destination. "
+                + "Choose Instance Monitor, Action Failure, or Live Player List. "
+                + "To clear an old unsupported assignment, select its legacy entry and omit the channel.").setEphemeral(true).queue();
+            return;
+        }
+        if (!this.checkTextChannelConfiguration(textChannel, hook))
+            return;
         if (textChannel == null)
         {
             this.discord.setAuditExSecretChannel(auditEventTypeEx, null);
             hook.sendMessageFormat("Unassociating VRChat extended group audit event type %s (%s) from any secret channels", auditEventTypeEx.title, auditEventTypeEx.id).setEphemeral(true).queue();
-        }
-        else if (!textChannel.getType().isMessage())
-        {
-            hook.sendMessageFormat("The channel %s doesn't support message sending", textChannel.getName()).setEphemeral(true).queue();
         }
         else
         {
@@ -4455,6 +4573,34 @@ public class ScarletDiscordCommands
     @DefaultPerms(Permission.USE_APPLICATION_COMMANDS)
     public class Schedule
     {
+        static final String UNSAVED = "The schedule was updated in memory, but could not be saved to disk. Retry before restarting Scarlet; the previous saved configuration may otherwise return.";
+
+        boolean saveSchedule(InteractionHook hook)
+        {
+            if (ScarletDiscordCommands.this.discord.scarlet.calendar.save())
+                return true;
+            hook.sendMessage(UNSAVED).setEphemeral(true).queue();
+            return false;
+        }
+
+        boolean saveSchedule(ModalInteractionEvent event)
+        {
+            if (ScarletDiscordCommands.this.discord.scarlet.calendar.save())
+                return true;
+            event.reply(UNSAVED).setEphemeral(true).queue();
+            return false;
+        }
+
+        boolean currentModalSchedule(ModalInteractionEvent event, ScarletCalendar.EventSpec spec, String groupId)
+        {
+            if (Objects.equals(groupId, ScarletDiscordCommands.this.discord.scarlet.vrc.groupId)
+                && spec != null && ScarletDiscordCommands.this.discord.scarlet.calendar.eventSpecs.get(spec.id) == spec)
+                return true;
+            event.reply("The group or schedule changed while this form was open. Reopen the command. No changes were applied.")
+                .setEphemeral(true).queue();
+            return false;
+        }
+
         public final SlashOption<ScarletCalendar.EventSpec> _eventSpec = SlashOption.ofString("scarlet-event-spec", "The scheduled event", true, null, this::_scarletEventSpec, true, this::_scarletEventSpec);
         ScarletCalendar.EventSpec _scarletEventSpec(String id) { return ScarletDiscordCommands.this.discord.scarlet.calendar.eventSpecs.get(id); }
         void _scarletEventSpec(CommandAutoCompleteInteractionEvent event) {
@@ -4518,7 +4664,7 @@ public class ScarletDiscordCommands
             eventSpec.vrcCalendarEventParameters.setAccessType(CalendarEventAccess.PUBLIC);
             eventSpec.vrcCalendarEventParameters.setSendCreationNotification(Boolean.TRUE);
             ScarletDiscordCommands.this.discord.scarlet.calendar.eventSpecs.put(eventId, eventSpec);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Added event schedule").setEphemeral(true).queue();
         }
         @SlashCmd("set-active")
@@ -4533,7 +4679,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.active = eventActive;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule active to "+eventActive).setEphemeral(true).queue();
         }
         @SlashCmd("set-mirror-on-discord")
@@ -4548,7 +4694,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.mirrorOnDiscord = eventMirrorOnDiscord;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule mirror on discord to "+eventMirrorOnDiscord).setEphemeral(true).queue();
         }
         @SlashCmd("set-max-pending")
@@ -4563,7 +4709,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.maxPending = eventMaxPending;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule maximum pending to "+eventMaxPending).setEphemeral(true).queue();
         }
         @SlashCmd("set-title")
@@ -4578,7 +4724,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setTitle(eventTitle);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule title").setEphemeral(true).queue();
         }
         @SlashCmd("set-description")
@@ -4593,8 +4739,8 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setDescription(eventDescription);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
-            hook.sendMessage("Set event schedule title").setEphemeral(true).queue();
+            if (!this.saveSchedule(hook)) return;
+            hook.sendMessage("Set event schedule description").setEphemeral(true).queue();
         }
         @SlashCmd("set-date")
         @Desc("Set an event schedule's date")
@@ -4608,7 +4754,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.date = eventDate;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule date").setEphemeral(true).queue();
         }
         @SlashCmd("set-time")
@@ -4625,7 +4771,7 @@ public class ScarletDiscordCommands
             }
             OffsetTime eventTime = timeOfDay.atOffset(timeZoneId.getRules().getOffset(Instant.now()));
             eventSpec.time = eventTime;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule time").setEphemeral(true).queue();
         }
         @SlashCmd("set-duration")
@@ -4640,7 +4786,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.duration = eventDuration;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule duration").setEphemeral(true).queue();
         }
         @SlashCmd("set-frequency")
@@ -4655,7 +4801,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.frequency = eventFrequency;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule frequency").setEphemeral(true).queue();
         }
         @SlashCmd("set-category")
@@ -4670,7 +4816,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setCategory(eventCategory.value);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule category").setEphemeral(true).queue();
         }
         public final SlashOption<CalendarEventAccess> _eventAccess = SlashOption.ofDOptionEnum(DOptionEnum.of("event-access", "Event Access", CalendarEventAccess.class, CalendarEventAccess::getValue, "Public", "Group"), true);
@@ -4686,7 +4832,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setAccessType(eventAccess);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule access").setEphemeral(true).queue();
         }
         public final SlashOption<Boolean> _eventNotify = SlashOption.ofBool("event-notify", "Event Notification upon creation", true, Boolean.TRUE);
@@ -4702,7 +4848,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setSendCreationNotification(eventNotify);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule notification usage").setEphemeral(true).queue();
         }
         public final SlashOption<String> _eventTag1 = SlashOption.ofString("event-tag-1", "Event tag 1", false, null),
@@ -4733,17 +4879,17 @@ public class ScarletDiscordCommands
             if (eventTagsa.isEmpty())
             {
                 eventSpec.vrcCalendarEventParameters.setTags(null);
-                ScarletDiscordCommands.this.discord.scarlet.calendar.save();
-                event.reply("Cleared event schedule tags").setEphemeral(true).queue();
+                if (!this.saveSchedule(hook)) return;
+                hook.sendMessage("Cleared event schedule tags").setEphemeral(true).queue();
                 return;
             }
             if (eventTagsa.contains(GroupAdminTag.VRC_EVENT_GROUP_FAIR_TAG) && !ScarletDiscordCommands.this.discord.scarlet.vrc.checkGroupHasAdminTag(GroupAdminTag.VRC_EVENT_GROUP_FAIR_ENABLED))
             {
-                event.reply("This group does not have Event Group Fair enabled, so you may not use that tag").setEphemeral(true).queue();
+                hook.sendMessage("This group does not have Event Group Fair enabled, so you may not use that tag").setEphemeral(true).queue();
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setTags(new ArrayList<>(eventTagsa));
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule tags").setEphemeral(true).queue();
         }
         @SlashCmd("set-image")
@@ -4812,7 +4958,7 @@ public class ScarletDiscordCommands
                 if (eventSpec != null)
                 {
                     eventSpec.vrcCalendarEventParameters.setImageId(fileId);
-                    ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+                    if (!this.saveSchedule(hook)) return;
                 }
                 hook.sendMessageEmbeds(new EmbedBuilder().setTitle(fileId).setImage(VrcWeb.file1Data(fileId)).build()).setContent("Set the scheduled event image").setEphemeral(true).queue();
             }).queue(hook);
@@ -4826,6 +4972,7 @@ public class ScarletDiscordCommands
             SetRolesModal(ScarletCalendar.EventSpec eventSpec)
             {
                 this.eventSpec = eventSpec;
+                this.groupId = ScarletDiscordCommands.this.discord.scarlet.vrc.groupId;
                 List<String> roleIds = eventSpec.vrcCalendarEventParameters.getRoleIds();
                 if (roleIds != null && !roleIds.isEmpty())
                 {
@@ -4838,6 +4985,7 @@ public class ScarletDiscordCommands
                 }
             }
             final ScarletCalendar.EventSpec eventSpec;
+            final String groupId;
             @StringSel("event-roles-1-25")
             public GroupRole[] eventRoles_1_25;
             @StringSel("event-roles-26-50")
@@ -4845,17 +4993,18 @@ public class ScarletDiscordCommands
             @Override
             public void handle(ModalInteractionEvent event)
             {
+                if (!Schedule.this.currentModalSchedule(event, this.eventSpec, this.groupId)) return;
                 GroupRole[] eventRoles = MiscUtils.append(this.eventRoles_1_25, this.eventRoles_26_50);
                 if (eventRoles == null || eventRoles.length == 0)
                 {
                     this.eventSpec.vrcCalendarEventParameters.setRoleIds(null);
-                    ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+                    if (!Schedule.this.saveSchedule(event)) return;
                     event.reply("Cleared event roles").setEphemeral(true).queue();
                     return;
                 }
                 
-                this.eventSpec.vrcCalendarEventParameters.setRoleIds(new ArrayList<>(Arrays.stream(eventRoles).filter(Objects::nonNull).map(GroupRole::getId).collect(Collectors.toList())));
-                ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+                this.eventSpec.vrcCalendarEventParameters.setRoleIds(new ArrayList<>(Arrays.stream(eventRoles).filter(Objects::nonNull).map(GroupRole::getId).distinct().collect(Collectors.toList())));
+                if (!Schedule.this.saveSchedule(event)) return;
                 event.reply("Set event roles").setEphemeral(true).queue();
             }
         }
@@ -4878,6 +5027,7 @@ public class ScarletDiscordCommands
             SetPlatformsModal(ScarletCalendar.EventSpec eventSpec)
             {
                 this.eventSpec = eventSpec;
+                this.groupId = ScarletDiscordCommands.this.discord.scarlet.vrc.groupId;
                 List<CalendarEventPlatform> platforms = eventSpec.vrcCalendarEventParameters.getPlatforms();
                 if (platforms != null && !platforms.isEmpty())
                 {
@@ -4887,21 +5037,23 @@ public class ScarletDiscordCommands
                 }
             }
             final ScarletCalendar.EventSpec eventSpec;
+            final String groupId;
             @StringSel("event-platforms")
             public GroupEventPlatform[] eventPlatforms;
             @Override
             public void handle(ModalInteractionEvent event)
             {
+                if (!Schedule.this.currentModalSchedule(event, this.eventSpec, this.groupId)) return;
                 if (this.eventPlatforms == null || this.eventPlatforms.length == 0)
                 {
                     this.eventSpec.vrcCalendarEventParameters.setPlatforms(null);
-                    ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+                    if (!Schedule.this.saveSchedule(event)) return;
                     event.reply("Cleared event platforms").setEphemeral(true).queue();
                     return;
                 }
                 
                 this.eventSpec.vrcCalendarEventParameters.setPlatforms(new ArrayList<>(Arrays.stream(this.eventPlatforms).filter(Objects::nonNull).map(GroupEventPlatform::model).collect(Collectors.toList())));
-                ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+                if (!Schedule.this.saveSchedule(event)) return;
                 event.reply("Set event platforms").setEphemeral(true).queue();
             }
         }
@@ -4950,18 +5102,18 @@ public class ScarletDiscordCommands
             if (eventLanguagesa.isEmpty())
             {
                 eventSpec.vrcCalendarEventParameters.setLanguages(null);
-                ScarletDiscordCommands.this.discord.scarlet.calendar.save();
-                event.reply("Cleared event schedule languages").setEphemeral(true).queue();
+                if (!this.saveSchedule(hook)) return;
+                hook.sendMessage("Cleared event schedule languages").setEphemeral(true).queue();
                 return;
             }
             List<String> eventLanguagesa_invalid = eventLanguagesa.stream().filter($->!ScarletDiscordCommands.this.languages.containsKey($)).collect(Collectors.toList());
             if (!eventLanguagesa_invalid.isEmpty())
             {
-                event.reply("Invalid or unknown languages: "+eventLanguagesa_invalid).setEphemeral(true).queue();
+                hook.sendMessage("Invalid or unknown languages: "+eventLanguagesa_invalid).setEphemeral(true).queue();
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setLanguages(new ArrayList<>(eventLanguagesa));
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule languages").setEphemeral(true).queue();
         }
         public final SlashOption<Integer> _eventHostEarly = SlashOption.ofInt("event-host-early", "Event host early join minutes", false, null).with(data -> data.setRequiredRange(1L, 60L));
@@ -4977,7 +5129,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setHostEarlyJoinMinutes(eventHostEarly);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event host early join minutes").setEphemeral(true).queue();
         }
         public final SlashOption<Integer> _eventGuestEarly = SlashOption.ofInt("event-guest-early", "Event guest early join minutes", false, null).with(data -> data.setRequiredRange(1L, 60L));
@@ -4993,7 +5145,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setGuestEarlyJoinMinutes(eventGuestEarly);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event guest early join minutes").setEphemeral(true).queue();
         }
         public final SlashOption<Integer> _eventCloseAfter = SlashOption.ofInt("event-close-after", "Event close Instance after end minutes", false, null).with(data -> data.setRequiredRange(1L, 60L));
@@ -5009,7 +5161,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setCloseInstanceAfterEndMinutes(eventCloseAfter);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event close Instance after end minutes").setEphemeral(true).queue();
         }
         public final SlashOption<Boolean> _eventOverflow = SlashOption.ofBool("event-overflow", "Event uses Instance Overflow", false, Boolean.TRUE);
@@ -5025,7 +5177,7 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setUsesInstanceOverflow(eventOverflow);;
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
+            if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule overflow usage").setEphemeral(true).queue();
         }
         public final SlashOption<Boolean> _eventFeatured = SlashOption.ofBool("event-featured", "Event has featured", false, null);
@@ -5046,19 +5198,26 @@ public class ScarletDiscordCommands
                 return;
             }
             eventSpec.vrcCalendarEventParameters.setFeatured(eventFeatured);
-            ScarletDiscordCommands.this.discord.scarlet.calendar.save();
-            hook.sendMessage("Set event schedule overflow usage").setEphemeral(true).queue();
+            if (!this.saveSchedule(hook)) return;
+            hook.sendMessage("Set event schedule featured status").setEphemeral(true).queue();
         }
         @SlashCmd("remove")
         @Desc("Removes an event schedule")
         public void remove(SlashCommandInteractionEvent event, InteractionHook hook, @SlashOpt("scarlet-event-spec") ScarletCalendar.EventSpec eventSpec)
         {
-            if (eventSpec == null || !ScarletDiscordCommands.this.discord.scarlet.calendar.eventSpecs.remove(eventSpec.id, eventSpec))
+            try
             {
-                hook.sendMessage("There is no event schedule with that id").setEphemeral(true).queue();
-                return;
+                if (eventSpec == null || !ScarletDiscordCommands.this.discord.scarlet.calendar.removeAndSave(eventSpec))
+                {
+                    hook.sendMessage("There is no event schedule with that id").setEphemeral(true).queue();
+                    return;
+                }
+                hook.sendMessage("Removed event schedule and saved the deletion").setEphemeral(true).queue();
             }
-            hook.sendMessage("Removed event schedule").setEphemeral(true).queue();
+            catch (java.io.IOException ex)
+            {
+                hook.sendMessage("The schedule could not be saved. Deletion was rolled back; the schedule remains configured.").setEphemeral(true).queue();
+            }
         }
     }
 
@@ -5071,6 +5230,8 @@ public class ScarletDiscordCommands
     public void setTrainingChannel(SlashCommandInteractionEvent event, InteractionHook hook,
                                    @SlashOpt("discord-text-channel") Channel channel)
     {
+        if (!this.checkTextChannelConfiguration(channel, hook))
+            return;
         ((ScarletDiscordJDA)this.discord).setTrainingChannel(channel);
         if (channel == null)
         {
@@ -5091,6 +5252,8 @@ public class ScarletDiscordCommands
     public void setOpsAlertChannel(SlashCommandInteractionEvent event, InteractionHook hook,
                                    @SlashOpt("discord-text-channel") Channel channel)
     {
+        if (!this.checkTextChannelConfiguration(channel, hook))
+            return;
         ((ScarletDiscordJDA)this.discord).setOpsAlertChannel(channel);
         if (channel == null)
         {
@@ -5111,6 +5274,8 @@ public class ScarletDiscordCommands
     public void setDiscordActionLogChannel(SlashCommandInteractionEvent event, InteractionHook hook,
                                            @SlashOpt("discord-text-channel") Channel channel)
     {
+        if (!this.checkTextChannelConfiguration(channel, hook))
+            return;
         this.discord.setDiscordActionLogChannel(channel);
         if (channel == null)
         {
@@ -5196,7 +5361,9 @@ public class ScarletDiscordCommands
             this.discord.setTicketToolAgeVerificationMessage(value);
             interaction.replyFormat("Ticket Tool age-verification auto-response message updated:\n\n%s", this.discord.ticketToolAgeVerificationMessage).setEphemeral(true).queue();
         };
-        ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate).queue();
+        String groupId = this.discord.scarlet.vrc.groupId;
+        ScarletDiscordCommands.this.discord.interactions.submitModalFlow(event, modal, immediate,
+            interaction -> Objects.equals(groupId, this.discord.scarlet.vrc.groupId)).queue();
     }
 
     // set-verification-auto-invite
@@ -5669,11 +5836,13 @@ public class ScarletDiscordCommands
             return;
         }
 
-        // Encode reason into button ID (truncated to fit Discord's 100-char limit)
-        String reasonSuffix = (reason != null && !reason.trim().isEmpty())
-            ? ":" + MiscUtils.maybeEllipsis(55, reason.trim())
-            : "";
-        String confirmId = "discord-ban-confirm:" + discordUser.getId() + reasonSuffix;
+        if (!DiscordModerationAuthorization.allowed(event.getMember(), discordUser, Permission.BAN_MEMBERS))
+        {
+            hook.sendMessage("You need Ban Members permission and a role above the target member.").queue();
+            return;
+        }
+        String confirmId = "discord-ban-confirm:" + this.discord.prepareDiscordModeration(
+            event.getUser().getId(), discordUser.getId(), reason, Permission.BAN_MEMBERS);
 
         String reasonLine = reason != null && !reason.trim().isEmpty()
             ? "\n**Reason:** " + MarkdownSanitizer.escape(reason.trim())
@@ -5742,11 +5911,13 @@ public class ScarletDiscordCommands
             return;
         }
 
-        // Encode reason into button ID (truncated to fit Discord's 100-char limit)
-        String reasonSuffix = (reason != null && !reason.trim().isEmpty())
-            ? ":" + MiscUtils.maybeEllipsis(58, reason.trim())
-            : "";
-        String confirmId = "discord-kick-confirm:" + discordUser.getId() + reasonSuffix;
+        if (!DiscordModerationAuthorization.allowed(event.getMember(), discordUser, Permission.KICK_MEMBERS))
+        {
+            hook.sendMessage("You need Kick Members permission and a role above the target member.").queue();
+            return;
+        }
+        String confirmId = "discord-kick-confirm:" + this.discord.prepareDiscordModeration(
+            event.getUser().getId(), discordUser.getId(), reason, Permission.KICK_MEMBERS);
 
         String reasonLine = reason != null && !reason.trim().isEmpty()
             ? "\n**Reason:** " + MarkdownSanitizer.escape(reason.trim())
