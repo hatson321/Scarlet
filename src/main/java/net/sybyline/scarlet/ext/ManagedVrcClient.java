@@ -668,13 +668,13 @@ public final class ManagedVrcClient
             && !process.arguments().isEmpty() && "vrchat.exe".equals(basename(process.arguments().get(0)));
     }
 
-    
+
     private static boolean isWineLoader(String executable)
     {
         return WINE_LOADERS.contains(executable);
     }
 
-private static String basename(String value)
+    private static String basename(String value)
     {
         int last = Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\'));
         return value.substring(last + 1).toLowerCase(Locale.ROOT);
