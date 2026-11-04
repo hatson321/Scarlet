@@ -45,7 +45,7 @@ import net.sybyline.scarlet.util.Platform;
  */
 public final class ManagedVrcClient
 {
-        private static final Set<String> WINE_LOADERS = Set.of("wine", "wine64", "wine-preloader", "wine64-preloader");
+    private static final Set<String> WINE_LOADERS = Set.of("wine", "wine64", "wine-preloader", "wine64-preloader");
 
 
     private ManagedVrcClient() {}
