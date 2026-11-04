@@ -45,6 +45,9 @@ import net.sybyline.scarlet.util.Platform;
  */
 public final class ManagedVrcClient
 {
+        private static final Set<String> WINE_LOADERS = Set.of("wine", "wine64", "wine-preloader", "wine64-preloader");
+
+
     private ManagedVrcClient() {}
 
     public static final class Client
@@ -170,7 +173,7 @@ public final class ManagedVrcClient
             for (ProcessInfo process : snapshot)
                 if (process == null || process.pid() < 0L || !pids.add(process.pid())
                     || process.executable() == null || process.executable().isBlank()
-                    || (basename(process.executable()).startsWith("wine") && process.arguments().isEmpty()))
+                    || (isWineLoader(basename(process.executable())) && process.arguments().isEmpty()))
                     throw new IllegalStateException("Process inventory is incomplete");
             return snapshot;
         }
@@ -661,8 +664,13 @@ public final class ManagedVrcClient
             return true;
         // Proton may expose the Wine loader as the executable. Accept only its first
         // argument naming VRChat.exe, never a loose substring or a later shell argument.
-        return Set.of("wine", "wine64", "wine-preloader", "wine64-preloader").contains(executable)
+        return isWineLoader(executable)
             && !process.arguments().isEmpty() && "vrchat.exe".equals(basename(process.arguments().get(0)));
+    }
+
+    private static boolean isWineLoader(String executable)
+    {
+        return WINE_LOADERS.contains(executable);
     }
 
     private static String basename(String value)
@@ -764,8 +772,24 @@ public final class ManagedVrcClient
             if (!process.isAlive())
                 return null;
             ProcessHandle.Info info = process.info();
+            String executable = info.command().orElse(null);
+            // Proton exposes Windows processes as Wine loaders to Java. Recover
+            // the exact process name from procfs so known helpers do not make
+            // the inventory uncertain; unreadable loaders still fail closed.
+            if (executable != null && "linux".equalsIgnoreCase(System.getProperty("os.name"))
+                && isWineLoader(basename(executable)))
+            {
+                try
+                {
+                    String processName = java.nio.file.Files.readString(
+                        java.nio.file.Path.of("/proc", Long.toString(process.pid()), "comm")).trim();
+                    if (!processName.isEmpty())
+                        executable = processName;
+                }
+                catch (IOException | RuntimeException ignored) {}
+            }
             return new ProcessInfo(process.pid(), info.startInstant().orElse(null), info.user().orElse(null),
-                info.command().orElse(null), info.arguments().map(List::of).orElse(List.of()),
+                executable, info.arguments().map(List::of).orElse(List.of()),
                 process.parent().map(ProcessHandle::pid).orElse(-1L));
         }
 
