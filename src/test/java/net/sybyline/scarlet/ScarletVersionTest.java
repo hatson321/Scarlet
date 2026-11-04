@@ -42,19 +42,13 @@ class ScarletVersionTest
         assertEquals(buildVersion(), Scarlet.VERSION);
     }
 
-    @Test void localVersionFilesMatchAndUpdateMetadataIsCurrent() throws Exception
+    @Test void localUpdateAndLauncherMetadataMatchBuildVersion() throws Exception
     {
         String version = buildVersion();
         JsonObject metadata = JsonParser.parseString(read("meta.json")).getAsJsonObject();
-        String latestRelease = metadata.get("latest_release").getAsString();
-        String latestBuild = metadata.get("latest_build").getAsString();
+        assertEquals(version, metadata.get("latest_release").getAsString());
+        assertEquals(version, metadata.get("latest_build").getAsString());
         assertEquals(version, read("scarlet.version").trim());
-        assertTrue(MiscUtils.isValidVersion(latestRelease));
-        assertTrue(MiscUtils.isValidVersion(latestBuild));
-        // The update feed is shared by released builds and may legitimately
-        // advertise a version newer than the source currently checked out.
-        assertTrue(MiscUtils.compareScarletVersion(latestRelease, version) >= 0);
-        assertTrue(MiscUtils.compareScarletVersion(latestBuild, version) >= 0);
     }
 
     @Test void minorReleaseOrdersAfterPreviousReleaseAndIterations()
@@ -142,7 +136,7 @@ class ScarletVersionTest
         // The feed also supports non-release advisories; do not force those to name a version.
         if (announcement.id.startsWith("release-"))
         {
-            assertReleaseAnnouncement(announcement, metadata.latest_release);
+            assertReleaseAnnouncement(announcement, buildVersion());
         }
     }
 

@@ -2,11 +2,11 @@
   "latest_release": "0.6.1",
   "latest_build": "0.6.1",
   "announcement": {
-    "id": "release-0.6.1-stable-20261103",
-    "severity": "info",
-    "title": "Scarlet 0.6.1 is available",
-    "message": "Scarlet 0.6.1 — stable release\n\nScarlet 0.6.1 is available now. Review the release notes before updating.\n\nBefore updating:\n• Keep an independent backup and close the old Scarlet process.\n• Java 21 is recommended.\n• If login fails temporarily, do not choose to reset your saved data.\n• Review the release notes for requirements and known limitations.\n\nUse Open link for the release notes and downloads.",
-    "url": "https://github.com/hatson321/Scarlet/releases/tag/0.6.1",
-    "expires": "2026-12-03T00:00:00Z"
+    "id": "release-0.6.0-stable-20261018",
+    "severity": "urgent",
+    "title": "URGENT update please update your scarlet build from 0.4.20 to the new release!",
+    "message": "Scarlet 0.6.0 — stable release\n\nScarlet 0.6.0 brings the current fixes into the stable release series.\n\nWhat's improved:\n• Moderation summaries use saved local history and run in the background.\n• Audit delivery retries and API request pacing have been improved.\n• Close-instance commands handle full links and explain outcomes more clearly.\n• Saving and permission checks have stronger protections.\n• Automatic relaunch requires verified client ownership and normal shutdown.\n\nBefore updating:\n• Keep an independent backup and close the old Scarlet process.\n• Java 21 is recommended.\n• If login fails temporarily, do not choose to reset your saved data.\n• Read the release notes for requirements, known issues, and test limits.\n\nUse Open link for the release notes and downloads.",
+    "url": "https://github.com/hatson321/Scarlet/releases/tag/0.6.0",
+    "expires": "2026-11-18T00:00:00Z"
   }
 }

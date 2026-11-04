@@ -859,23 +859,6 @@ public interface MiscUtils
          */
         static boolean browseDirectory(File dir)
         {
-            // Linux: use the desktop's own launcher before AWT. OpenJDK's
-            // Desktop peer may fall back to X11, while xdg-open follows the
-            // current desktop session and opens natively on Wayland.
-            if (Platform.CURRENT.is$nix()) try
-            {
-                new ProcessBuilder("xdg-open", dir.getAbsolutePath())
-                    .inheritIO()
-                    .start();
-                Scarlet.LOG.info("Opened directory via xdg-open: {}", dir);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Scarlet.LOG.warn("xdg-open failed for directory {}: {}", dir, ex.getMessage());
-            }
-
-
             // Attempt 1: AWT Desktop.open() — works for directories on all
             // platforms and correctly invokes the file manager, not a browser.
             if (Desktop.isDesktopSupported()) try
