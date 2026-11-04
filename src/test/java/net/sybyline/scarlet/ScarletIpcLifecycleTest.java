@@ -7,6 +7,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.UUID;
@@ -15,13 +16,13 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
+
 import org.scalasbt.ipcsocket.UnixDomainServerSocket;
 import org.scalasbt.ipcsocket.UnixDomainSocket;
 
 class ScarletIpcLifecycleTest
 {
-    @TempDir Path temp;
+    
 
     interface Connect { Socket open() throws Exception; }
     static final class Endpoint
@@ -29,14 +30,19 @@ class ScarletIpcLifecycleTest
         final ServerSocket server;
         final Connect connect;
         final ScarletIpcLifecycle.WakeAccept wake;
-        Endpoint(ServerSocket server, Connect connect, ScarletIpcLifecycle.WakeAccept wake)
-        { this.server = server; this.connect = connect; this.wake = wake; }
+        final Path unixSocket;
+        Endpoint(ServerSocket server, Connect connect, ScarletIpcLifecycle.WakeAccept wake, Path unixSocket)
+        { this.server = server; this.connect = connect; this.wake = wake; this.unixSocket = unixSocket; }
+        void cleanup() throws IOException
+        {
+            if (this.unixSocket != null) Files.deleteIfExists(this.unixSocket);
+        }
     }
 
     private Endpoint tcp() throws IOException
     {
         ServerSocket server = new ServerSocket(0, 10, InetAddress.getLoopbackAddress());
-        return new Endpoint(server, () -> new Socket(InetAddress.getLoopbackAddress(), server.getLocalPort()), null);
+        return new Endpoint(server, () -> new Socket(InetAddress.getLoopbackAddress(), server.getLocalPort()), null, null);
     }
 
     private Endpoint nativeEndpoint() throws Exception
@@ -49,12 +55,15 @@ class ScarletIpcLifecycleTest
             ServerSocket server = (ServerSocket)serverType.getConstructor(String.class, boolean.class, int.class)
                 .newInstance(pipe, false, security);
             return new Endpoint(server, () -> (Socket)Class.forName("org.scalasbt.ipcsocket.Win32NamedPipeSocket")
-                .getConstructor(String.class, boolean.class).newInstance(pipe, false), null);
+                .getConstructor(String.class, boolean.class).newInstance(pipe, false), null, null);
         }
-        String path = temp.resolve("ipc.sock").toString();
+        // Keep the native test address below the short Unix-domain socket
+        // pathname limit even when the checkout itself is deeply nested.
+        Path socket = Path.of("/tmp", "scarlet-ipc-" + UUID.randomUUID() + ".sock");
+        String path = socket.toString();
         ServerSocket server = new UnixDomainServerSocket(path, false);
         return new Endpoint(server, () -> new UnixDomainSocket(path, false),
-            () -> { try (Socket wake = new UnixDomainSocket(path, false)) { } });
+            () -> { try (Socket wake = new UnixDomainSocket(path, false)) { } }, socket);
     }
 
     @Test void tcpBlockingAcceptStops() throws Exception { blockingAccept(tcp()); }
@@ -86,7 +95,7 @@ class ScarletIpcLifecycleTest
             task.get(3, TimeUnit.SECONDS);
             assertEquals(0, dispatched.get(), "The empty shutdown wake must never become an IPC command");
         }
-        finally { owner.close(); }
+        finally { owner.close(); endpoint.cleanup(); }
     }
 
     private void partialRead(Endpoint endpoint) throws Exception
@@ -121,7 +130,7 @@ class ScarletIpcLifecycleTest
             task.get(3, TimeUnit.SECONDS);
             assertEquals(0, dispatched.get(), "Stopping a partial read must not dispatch the incomplete command");
         }
-        finally { owner.close(); }
+        finally { owner.close(); endpoint.cleanup(); }
     }
 
     private static Socket connectWhenListening(Endpoint endpoint, Thread listener) throws Exception

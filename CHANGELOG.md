@@ -1,18 +1,27 @@
 
 # Changelog
 
-## Release status — November 1, 2026
+## Release status — November 3, 2026
 
-- **Published stable:** [0.6.0](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0).
+- **Published stable:** [0.6.1](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1).
+- **Previous stable:** [0.6.0](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0).
 - **Published preview:** [0.6.1-a11](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11).
 - **Repository `main`:** the published `0.6.0` stable application baseline, with refreshed documentation and the approved Help → Credits cleanup. Preview descriptions below do not imply those changes are in stable `main`.
-- **Separate local release preparation:** `0.6.1-a12`, not a published release or the version on `main`. Plain `0.6.1` remains a draft, not the current stable download.
+- **0.6.1 release source:** the published `0.6.1` tag and its matching source package. It is not the same branch tip as `main`.
 
 The dated summaries below describe published releases. Older entries are retained
 as development history, with historical release-note links repaired: labels such as “unpublished candidate” and older
 client-shutdown policies describe their original preparation stage, not today's
 publication status or the final behavior of later previews. Release dates below
 use UTC.
+
+## 0.6.1 — published stable, November 3, 2026
+
+- The current stable JAR, matching desktop-source package, and checksums are
+  published with this release.
+- The release source is tracked by the `0.6.1` tag. Use that tag or its attached
+  source package when reproducing or auditing this release rather than assuming
+  the default branch has the same application source.
 
 ## 0.6.1-a11 — published preview, October 29, 2026
 
