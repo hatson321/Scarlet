@@ -1,10 +1,9 @@
 
 # Settings
 
-This reference describes the current development source and the features already
-available in the published 0.6.1-a11 preview. As of November 1, 2026, stable is
-0.6.0; plain 0.6.1 is still a draft and development 0.6.1-a12 is not a published
-release. A feature marked as added in a preview is not promised in stable 0.6.0.
+This reference describes the source distributed with this version. Use the source
+archive and release notes matching your JAR when checking older versions; feature
+availability and defaults can differ.
 
 Use Scarlet's settings UI and authorized Discord configuration commands whenever
 possible. Save settings through the UI; do not replace a working configuration
@@ -433,7 +432,7 @@ General settings for Scarlet. Settings below are separate controls, not a single
 
 ### Client shutdown is not instance closure
 
-In the 0.6.1 previews, closed/empty client exit requires a matching closure audit,
+Closed/empty client exit requires a matching closure audit,
 a healthy caught-up local log session, known self with no other players, a full
 30-second grace period and fresh exact-process/session checks. It no longer waits
 for an independent API occupancy count. Delayed closure audits can still delay
@@ -449,18 +448,19 @@ is acceptable. Neither option authorizes a blanket process-name kill.
 
 The idle **server-instance** close setting remains separate and retains its fresh
 API occupancy check. A normal soft close prevents new joins but does not eject
-existing occupants. Stable 0.6.0's older client-exit policy is documented in its own
-release notes; do not apply a preview's changed process eligibility to that build.
+existing occupants. Older versions can have different client-exit policies;
+check their matching release notes.
 
 ### Health alerts and saved-history summaries
 
 Use `/set-ops-alert-channel` to choose the optional operations/health destination.
 It does not configure moderation, vote-to-kick or confidential audit routes. Health
 alerts are best-effort notices, not proof that an event was delivered or that a
-particular permission is missing. A log-stall warning can appear after more than
-five minutes without observed log lines while VRChat is running; the known false
-startup log-stall warning is not fixed by this documentation. Check the local log
-and actual tracking state before resetting credentials or changing permissions.
+particular permission is missing. Log-reader health uses the current client
+session, reader progress and whether instance tracking is expected. A running
+client with no active instance is not automatically a stalled tracker. Malformed
+or dropped records still block automatic actions. Check actual tracking state
+before resetting credentials or changing permissions.
 
 `moderation-summary` reads saved structured audit history on the logger computer,
 not Discord message history or diagnostic text logs. It runs in a dedicated
@@ -845,8 +845,8 @@ Extended audit event information:
 ## Legacy launcher files — not current JAR setup steps
 
 Older launcher distributions used `scarlet.version.target`, `scarlet.home`,
-`scarlet.home.java` and `java.options`. The currently published 0.6.0 and 0.6.1-a11
-assets do not include that launcher. Running the standard JAR does not make those
+`scarlet.home.java` and `java.options`. Current standard JAR releases do not
+include that launcher. Running the standard JAR does not make those
 files a supported way to select a build, Java installation or data profile.
 `scarlet.version` in a source archive is build metadata, not a runtime update switch.
 

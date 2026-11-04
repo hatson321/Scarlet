@@ -2,14 +2,14 @@
 
 [Home and setup guide](README.md) · [Settings](SETTINGS.md) · [Security and network behavior](SECURITY.md) · [Downloads](https://github.com/Hatson321/Scarlet/releases)
 
-This FAQ describes the **0.6.1-a11 public preview** unless a different version is named. As of **November 1, 2026**, **0.6.0** is the published stable release; **0.6.1** is an unpublished candidate and **0.6.1-a12** is local release preparation. Preview features should not be assumed to exist in 0.6.0.
+This FAQ describes the source distributed with this version. For a released JAR, use its matching source archive and release notes; older versions can behave differently.
 
 ## Which file should I download?
 
 Choose the ready-to-run `scarlet-<version>.jar` attached to the release you want:
 
-- [0.6.0 stable](https://github.com/Hatson321/Scarlet/releases/tag/0.6.0)
-- [0.6.1-a11 preview](https://github.com/Hatson321/Scarlet/releases/tag/0.6.1-a11)
+- [Latest stable release](https://github.com/Hatson321/Scarlet/releases/latest)
+- [All releases and published previews](https://github.com/Hatson321/Scarlet/releases)
 
 The attached `scarlet-<version>-source.zip` is for source review or building, not the application installer. The default branch and **Code → Download ZIP** may not match the source used for a published JAR. Prefer the release's frozen source attachment when reproducing that release. An unpublished draft is not a public update.
 
@@ -22,13 +22,7 @@ The published JAR does not bundle Java. It needs **Java 11 or newer; Java 21 is 
 From the folder containing the JAR:
 
 ```text
-java -jar scarlet-0.6.0.jar
-```
-
-For the public preview:
-
-```text
-java -jar scarlet-0.6.1-a11.jar
+java -jar scarlet-0.6.1.jar
 ```
 
 If installing Java did not help, reopen the terminal and run `java -version`. The `java` on your PATH or the JAR's double-click association may still point to an older runtime. Launching with the full path to the desired Java executable removes that ambiguity. JVM options go **before** `-jar`.
@@ -40,7 +34,7 @@ Use **Data Folder** in Scarlet or `explore` in its CLI. Do not assume the active
 A separate directory can be selected with the `SCARLET_HOME` environment variable or case-sensitive JVM property:
 
 ```text
-java "-DSCARLET_HOME=C:\Scarlet-Test-Data" -jar scarlet-0.6.1-a11.jar
+java "-DSCARLET_HOME=C:\Scarlet-Test-Data" -jar scarlet-0.6.1.jar
 ```
 
 A new empty directory gives a separate profile; it does not copy existing settings or watched lists. Keep the same choice on subsequent launches to use that profile. Do not point two running Scarlet processes at the same data folder.
@@ -55,7 +49,7 @@ Before upgrading, close Scarlet and keep an independent backup. Afterward, verif
 
 No. Staff Mode supports local player-list observations and alerts without requiring a group or Discord setup. It still needs the relevant local VRChat output logs and a working speech/output configuration. It does not grant group moderation privileges or create group audit events.
 
-In the a11 preview, local watched-user/group/avatar and vote-to-kick alert eligibility is not restricted to an instance belonging to the configured group. Earlier stable behavior differs; use the exact release notes when comparing reports.
+Local watched-user/group/avatar and vote-to-kick alert eligibility is not restricted to an instance belonging to the configured group. Use the exact release notes when comparing older versions.
 
 If a group-audit permission prompt appears, check which mode and profile were actually started. A group-enabled setup needs the signed-in account's real group permissions. Do not solve a missing group permission by blindly accepting prompts or granting unrelated administrator rights.
 
@@ -84,7 +78,7 @@ After installation, refresh/restart Scarlet as prompted, select an available voi
 
 The client log does not always provide a usable avatar ID. Scarlet may use available API/cache evidence and, if permitted, selected external providers. Private, ambiguous, or unindexed avatars may remain unresolved.
 
-The a11 cache keeps successful provider metadata for up to **24 hours**, and empty results for **five minutes**, across restarts. It stores metadata rather than downloaded avatar images. **Avatar search providers → Manage → Clear saved avatar results** clears that saved lookup state, but does not bypass privacy restrictions or guarantee a new result.
+The cache keeps successful provider metadata for up to **24 hours**, and empty results for **five minutes**, across restarts. It stores metadata rather than downloaded avatar images. **Avatar search providers → Manage → Clear saved avatar results** clears that saved lookup state, but does not bypass privacy restrictions or guarantee a new result.
 
 Provider access requires owner consent. Once enabled, selected providers can be queried automatically, not only when you press Search. Requests include identifying application/group/account information described in [Security](SECURITY.md). Only enable providers you intend to use.
 
@@ -103,7 +97,7 @@ If another moderator's standalone kick is missing, supply the exact build and ap
 
 There are multiple stages: VRChat makes an audit entry available, Scarlet polls/processes it, the Discord embed is submitted, and follow-up thread/details are prepared. Provider/profile work, Discord rate limits, permissions, and network failures can all affect timing.
 
-A “preparing moderation audit” message means work has started, not that Discord acknowledged the final message. The a11 delivery queue can retain unfinished work across restarts, but it is not an instant-delivery guarantee.
+A “preparing moderation audit” message means work has started, not that Discord acknowledged the final message. The delivery queue can retain unfinished work across restarts, but it is not an instant-delivery guarantee.
 
 Report whether the **main embed**, its **thread**, or only **extra details** were delayed. Include both the event time and the eventual message time. Do not assume the same cause for every delay.
 
@@ -117,7 +111,7 @@ For Scarlet interaction overrides, use `/scarlet-discord-permissions list` for t
 
 ## Will Scarlet join an already-open group instance?
 
-With **VRChat Client: Launch on Instance Create / Startup** enabled, a11 checks the configured group's active instances on startup and requests a safe launch into the newest eligible one.
+With **VRChat Client: Launch on Instance Create / Startup** enabled, Scarlet checks the configured group's active instances on startup and requests a safe launch into the newest eligible one.
 
 Eligibility, access, age verification, current lifecycle state, and safe client tracking still apply. “Newest” does not mean a hard-coded preferred instance, nor does it promise that Scarlet will take over an already-running client or switch into every second instance opened later.
 
@@ -125,7 +119,7 @@ If the wrong instance is selected, collect the exact version, relevant launch se
 
 ## Why has VRChat not closed when the player list is empty?
 
-In a11, enable **VRChat Client: Exit when instance is closed and empty** and save the setting. It takes effect without restarting Scarlet. This is separate from auto-launching and from the policy that closes an idle server instance.
+Enable **VRChat Client: Exit when instance is closed and empty** and save the setting. It takes effect without restarting Scarlet. This is separate from auto-launching and from the policy that closes an idle server instance.
 
 Client exit requires all of the following:
 
@@ -134,13 +128,13 @@ Client exit requires all of the following:
 - A full **30-second healthy grace period**.
 - Fresh session, roster, and process checks identifying the sole eligible same-OS-user VRChat client.
 
-The a11 client-exit policy does not wait for separate API player-count confirmation. An instance that is empty but still open does not qualify. Missing self, unread/stale logs, another player, changed session, or ambiguous/multiple clients blocks the close. A historical “left” row in the UI is not itself sufficient authorization.
+The client-exit policy does not wait for separate API player-count confirmation. An instance that is empty but still open does not qualify. Missing self, unread/stale logs, another player, changed session, or ambiguous/multiple clients blocks the close. A historical “left” row in the UI is not itself sufficient authorization.
 
 This policy can include a manually launched sole verified client. Its **separate default-off Windows force-close option** is more disruptive and only applies after a normal close attempt and fresh safety checks. It is not a blanket kill-by-name command. The idle **server-instance** close feature retains separate API occupancy checks.
 
 ## What happens if automatic VRChat startup stalls?
 
-The a11 optional **Recover stalled auto-launch** feature watches verified Scarlet-owned automatic launches. It does not recover arbitrary manually started clients or later gameplay freezes.
+The optional **Recover stalled auto-launch** feature watches verified Scarlet-owned automatic launches. It does not recover arbitrary manually started clients or later gameplay freezes.
 
 Recovery uses bounded attempts and guarded quiet-log or repeated connection-failure evidence. It first attempts normal close, verifies exit, rechecks the target, and obtains fresh join information. A separate default-off Windows force-close option can apply to this startup-recovery path. Scarlet does not deliberately open a second client while the tracked one remains alive.
 
@@ -150,7 +144,7 @@ A join/access failure may come from instance state or account eligibility, not a
 
 No. It means Scarlet created the **pre-import safety backup**. Import may still be running.
 
-In the preview, follow the console's remaining progress and wait for the final success/failure result. Existing-session export/import stops and saves Scarlet before a separate offline tool handles the transfer. Logging is stopped until Scarlet runs again.
+Follow the console's remaining progress and wait for the final success/failure result. Existing-session export/import stops and saves Scarlet before a separate offline tool handles the transfer. Logging is stopped until Scarlet runs again.
 
 Use a Scarlet migration bundle, not an arbitrary ZIP or individual backup file. Keep an independent backup until the restored data and sign-in are verified. Private staging may refuse a filesystem that cannot enforce suitable permissions. A failed or cancelled transfer should not be treated as a successful restore.
 
@@ -162,12 +156,12 @@ Prefer a narrowly scoped redacted Scarlet log excerpt, exact version, relevant s
 
 ## Scarlet has neon or incorrect colors on Windows. What can I try?
 
-In the a11 preview, try **Windows rendering compatibility (restart required)** under Appearance, **Save Settings**, then fully close and reopen Scarlet. It disables Java's Direct3D rendering for Scarlet.
+Try **Windows rendering compatibility (restart required)** under Appearance, **Save Settings**, then fully close and reopen Scarlet. It disables Java's Direct3D rendering for Scarlet.
 
 For an older build or a one-launch check:
 
 ```text
-java -Dsun.java2d.d3d=false -jar scarlet-0.6.0.jar
+java -Dsun.java2d.d3d=false -jar scarlet-0.6.1.jar
 ```
 
 Use the actual JAR filename if different. An explicit JVM rendering option takes precedence over the saved preference. If the workaround only helps when launched from the terminal, a double-click launch may still use a different Java runtime or lack the option. This is a rendering workaround, not a diagnosis of a GPU or Windows failure.
@@ -194,7 +188,7 @@ Not in the current release line. There is no Android companion, QR pairing, or m
 
 ## What does a health or recovery notice prove?
 
-It describes a particular observation or recovery attempt, not overall application health. Quiet output logs can still produce misleading log-stall notices, and starting VRChat after Scarlet has been idle can affect those notices.
+It describes a particular observation or recovery attempt, not overall application health. The log-reader check uses the current client session, reader progress and whether instance tracking is expected. A running client with no active instance does not by itself establish a stall; malformed or dropped log records still block automatic actions. A recovery notice confirms reader health, not that every event was delivered.
 
 **Help → Scarlet: Diagnostics** displays tracked connectivity, rate-limit, and provider information without an extra API probe. The `vrchatapi-test` CLI command is different: it contacts the live API.
 

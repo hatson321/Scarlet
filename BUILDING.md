@@ -69,7 +69,7 @@ system loader to satisfy a version error; use a compatible supported distributio
 > **PowerPC status:** the PowerPC edition remains experimental and is not part
 > of the supported Linux verification gate. Do not treat a successful x86-64
 > or AArch64 package check as PowerPC runtime validation. No PowerPC JAR is attached
-> to the published 0.6.0 or 0.6.1-a11 release; it is an experimental source-build output.
+> to the standard desktop release; it is an experimental source-build output.
 
 ## Install the prerequisites on Linux
 
