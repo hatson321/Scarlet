@@ -97,6 +97,37 @@ class ScarletPlayerListUiTest
         assertFalse(f.status().contains(I18n.tr("ui.statusNoInstance")));
     }
 
+    @Test void workerBurstPublishesOneDetachedSnapshotOnEdtAndClearWinsQueuedWork() throws Exception
+    {
+        Fixture f = new Fixture();
+        java.util.concurrent.CountDownLatch blocked = new java.util.concurrent.CountDownLatch(1), release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger notifications = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicBoolean wrongThread = new java.util.concurrent.atomic.AtomicBoolean();
+        f.table.getModel().addTableModelListener(event -> {
+            if (!SwingUtilities.isEventDispatchThread()) wrongThread.set(true);
+            notifications.incrementAndGet();
+        });
+        SwingUtilities.invokeLater(() -> {
+            blocked.countDown(); try { release.await(); } catch (InterruptedException failure) { Thread.currentThread().interrupt(); }
+        });
+        assertTrue(blocked.await(2, java.util.concurrent.TimeUnit.SECONDS));
+        try
+        {
+            for (int i=0;i<500;i++)
+                f.ui.playerJoin(false, USER + i, "Synthetic " + i, JOINED, null, null, i, false);
+            assertTrue(f.ui.hasActivePlayers(), "Safety tracking updates while rendering is blocked");
+            f.ui.clearInstance(); f.join(false);
+            f.ui.playerEnrich(USER, new User().pronouns("they/them"), "current", Color.GREEN, 2, () -> true);
+        }
+        finally { release.countDown(); }
+        f.status();
+        assertFalse(wrongThread.get()); assertEquals(1, notifications.get()); assertEquals(1, f.table.getRowCount());
+        var displayed = f.table.getEntries().get(0);
+        assertNotSame(f.rows.get(USER), displayed); assertEquals("they/them", displayed.pronouns);
+        f.rows.get(USER).pronouns = "detached change";
+        assertEquals("they/them", displayed.pronouns);
+    }
+
     @Test void detectedWorldIsNotReportedAsMissingWhileWaitingForRows() throws Exception
     {
         Fixture f = new Fixture();
@@ -227,6 +258,7 @@ class ScarletPlayerListUiTest
         f.ui.applyClearInstanceChoice(0);
 
         assertEquals(2, f.rows.size());
+        f.status();
         assertEquals(2, f.table.getRowCount());
         assertSame(present, f.rows.get(USER));
         assertEquals("they/them", present.pronouns);
@@ -248,6 +280,7 @@ class ScarletPlayerListUiTest
         f.ui.playerLeave(false, USER, "Synthetic Player", JOINED.plusMinutes(1));
         f.ui.applyClearInstanceChoice(0);
         assertTrue(f.rows.isEmpty());
+        f.status();
         assertEquals(0, f.table.getRowCount());
         assertFalse(f.ui.hasActivePlayers());
         assertEquals(I18n.tr("ui.statusWaitingForPlayers"), f.status());
@@ -266,6 +299,7 @@ class ScarletPlayerListUiTest
         assertTrue(f.rows.isEmpty());
         f.ui.playerJoin(false, USER, "Synthetic Player", JOINED.plusMinutes(2), null, null, 0, false);
         assertEquals(1, f.rows.size());
+        f.status();
         assertEquals(1, f.table.getRowCount());
         assertNotSame(departed, f.rows.get(USER));
         assertNull(f.rows.get(USER).left);
@@ -285,11 +319,13 @@ class ScarletPlayerListUiTest
         f.ui.applyClearInstanceChoice(0);
         assertEquals(1, f.rows.size());
         assertTrue(f.rows.containsKey(TRAINING_USER));
+        f.status();
         assertEquals(1, f.table.getRowCount());
         assertEquals(2, f.parked.size());
         assertTrue(f.ui.hasActivePlayers());
         f.ui.exitTrainingView();
         assertEquals(2, f.rows.size());
+        f.status();
         assertEquals(2, f.table.getRowCount());
         assertNotNull(f.rows.get(USER + "-departed").left);
     }
@@ -301,6 +337,7 @@ class ScarletPlayerListUiTest
         f.ui.playerLeave(false, USER + "-departed", "Departed", JOINED.plusMinutes(1));
         f.ui.applyClearInstanceChoice(1);
         assertTrue(f.rows.isEmpty());
+        f.status();
         assertEquals(0, f.table.getRowCount());
     }
 
@@ -313,7 +350,8 @@ class ScarletPlayerListUiTest
         {
             f.ui.applyClearInstanceChoice(choice);
             assertEquals(2, f.rows.size());
-            assertEquals(2, f.table.getRowCount());
+            f.status();
+        assertEquals(2, f.table.getRowCount());
             assertTrue(f.ui.hasActivePlayers());
         }
     }

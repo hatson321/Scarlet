@@ -315,6 +315,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
         this.closeVoteKickProfileWorker();
         this.closeClientLaunchWorker();
         this.closeSummaryWorker();
+        synchronized (this) { this.suggestedClosed = true; if (this.suggestedWorker != null) this.suggestedWorker.close(); }
         ScarletAuditFollowupWorker followup;
         synchronized (this)
         {
@@ -1390,7 +1391,10 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     audioManager, audioManager != null ? audioManager.isConnected() : "N/A");
                 return false;
             }
-            List<ByteBuffer> buffersToAdd = new ArrayList<>();
+            final long epoch = this.buffers.epoch();
+            final java.util.function.BooleanSupplier session = ScarletDiscordJDA.this.scarlet.eventListener.currentSpeechSession();
+            final AudioManager selectedManager = this.audioManager;
+            List<ByteBuffer> buffersToAdd;
             try (InputStream fis = new FileInputStream(file))
             {
                 try (AudioInputStream ais = AudioSystem.getAudioInputStream(new BufferedInputStream(fis)))
@@ -1411,29 +1415,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
                             LOG.warn("TTS: Audio format conversion not supported: source={}, target={}", ais.getFormat(), AudioSendHandler.INPUT_FORMAT);
                             return false;
                         }
-                        // FIX 1: Use read() return value instead of available() to detect EOF.
-                        // available() is unreliable on converted AudioInputStreams and can return 0
-                        // even when data remains, causing the entire audio to be silently skipped.
-                        // FIX 2: Track how many bytes were actually read into each buffer so that
-                        // the last (partial) chunk is zero-padded correctly instead of being
-                        // submitted as a full buffer of uninitialized/garbage bytes.
-                        while (true)
-                        {
-                            byte[] buffer = new byte[BYTES_PER_20MS];
-                            int total = 0;
-                            int read;
-                            while (total < BYTES_PER_20MS && (read = ais0.read(buffer, total, BYTES_PER_20MS - total)) != -1)
-                            {
-                                total += read;
-                            }
-                            if (total == 0)
-                                break; // true EOF - no more data
-                            // If total < BYTES_PER_20MS, the buffer is already zero-padded (new byte[])
-                            // so the partial last frame is safe to submit as-is.
-                            buffersToAdd.add(ByteBuffer.wrap(buffer));
-                            if (total < BYTES_PER_20MS)
-                                break; // partial read means EOF was reached
-                        }
+                        buffersToAdd = ScarletPcmQueue.decode(ais0);
                     }
                     finally
                     {
@@ -1455,7 +1437,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
             LOG.info("TTS: Queuing {} audio buffers (~{}ms) from file: {}", buffersToAdd.size(), buffersToAdd.size() * 20, file);
             synchronized (this)
             {
-                this.buffers.addAll(buffersToAdd);
+                if (this.audioManager != selectedManager || !selectedManager.isConnected() || !this.buffers.offer(epoch, buffersToAdd, session)) return false;
             }
             return true;
         }
@@ -1482,8 +1464,9 @@ public class ScarletDiscordJDA implements ScarletDiscord
             this.updateChannel();
         }
 
-        void updateChannel()
+        synchronized void updateChannel()
         {
+            this.buffers.reset();
             String guildSf = ScarletDiscordJDA.this.guildSf,
                    audioChannelSf = ScarletDiscordJDA.this.audioChannelSf;
             Guild guild = ScarletDiscordJDA.this.jda.getGuildById(guildSf);
@@ -1497,7 +1480,7 @@ public class ScarletDiscordJDA implements ScarletDiscord
                 {
                     LOG.info("TTS Audio: Closing audio connection (audioChannelSf is null)");
                     audioManager.closeAudioConnection();
-                    this.buffers.clear();
+                    this.buffers.reset();
                 }
             }
             else
@@ -1511,32 +1494,33 @@ public class ScarletDiscordJDA implements ScarletDiscord
                     {
                         LOG.info("TTS Audio: Opening audio connection to channel {}", audioChannel.getId());
                         audioManager.openAudioConnection(audioChannel);
-                        this.buffers.clear();
+                        this.buffers.reset();
                     }
                     else
                     {
                         LOG.warn("TTS Audio: AudioChannel not found for sf={}, closing connection", audioChannelSf);
                         audioManager.closeAudioConnection();
-                        this.buffers.clear();
+                        this.buffers.reset();
                     }
                 }
             }
         }
 
-        AudioManager audioManager;
-        AudioChannel audioChannel;
-        final Queue<ByteBuffer> buffers = new ConcurrentLinkedQueue<>();
+        volatile AudioManager audioManager;
+        volatile AudioChannel audioChannel;
+        final ScarletPcmQueue buffers = new ScarletPcmQueue();
 
         @Override
         public boolean canProvide()
         {
-            return !this.buffers.isEmpty();
+            if (this.audioManager == null || !this.audioManager.isConnected()) { this.buffers.reset(); return false; }
+            return this.buffers.size() != 0;
         }
 
         @Override
         public ByteBuffer provide20MsAudio()
         {
-            return this.buffers.poll();
+            return this.canProvide() ? this.buffers.poll() : null;
         }
 
         @Override
@@ -3460,16 +3444,24 @@ public class ScarletDiscordJDA implements ScarletDiscord
 
     void captureModerationBanInfo(AuditEntryMetadata metadata)
     {
-        if (!"group.user.ban".equals(metadata.entry.getEventType())
-            || metadata.getAuxData("deliveryBanInfoCaptured", false, e -> e.getAsBoolean())) return;
-        ScarletPendingModActions.BanInfo pending = this.scarlet.pendingModActions.pollBanInfo(metadata.entry.getTargetId());
-        if (pending != null)
+        if (!"group.user.ban".equals(metadata.entry.getEventType())) return;
+        if (!metadata.getAuxData("deliveryBanInfoCaptured", false, e -> e.getAsBoolean()))
         {
-            if (pending.tags != null) metadata.entryTags.addAll(pending.tags);
-            if (pending.description != null && !pending.description.trim().isEmpty()) metadata.entryDescription = pending.description;
+            ScarletPendingModActions.BanInfo pending = this.scarlet.pendingModActions.getBanInfo(metadata.entry.getTargetId());
+            if (pending != null
+                && (pending.vrchatGroupId == null || pending.vrchatGroupId.equals(metadata.entry.getGroupId()))
+                && (pending.discordGuildId == null || pending.discordGuildId.equals(this.guildSf)))
+            {
+                if (pending.tags != null) metadata.entryTags.addAll(pending.tags);
+                if (pending.description != null && !pending.description.trim().isEmpty()) metadata.entryDescription = pending.description;
+                metadata.setAuxData("deliveryBanInfoToken", pending.token);
+            }
+            metadata.setAuxData("deliveryBanInfoCaptured", true);
         }
-        metadata.setAuxData("deliveryBanInfoCaptured", true);
-        this.saveAuditDeliveryProgress(this.scarlet, metadata);
+        // Also persist on retry: a prior failed write may have left the in-memory flag set.
+        new ScarletAuditOutbox(this.scarlet.data.dir).save(metadata);
+        this.scarlet.pendingModActions.acknowledgeBanInfo(metadata.entry.getTargetId(),
+            metadata.getAuxData("deliveryBanInfoToken", null, e -> e.getAsString()));
     }
 
     @Override
@@ -5343,43 +5335,65 @@ public class ScarletDiscordJDA implements ScarletDiscord
         return message;
     }
 
+    private net.sybyline.scarlet.util.BoundedSerialWork suggestedWorker;
+    private volatile boolean suggestedClosed;
+
+    boolean suggestedRouteCurrent(String group, String guild, String route)
+    {
+        return !this.suggestedClosed && this.jda != null && group != null && route != null && !route.trim().isEmpty()
+            && Objects.equals(group, this.scarlet.vrc.groupId) && Objects.equals(guild, this.guildSf)
+            && Objects.equals(route, this.auditExType2channelSf.get(GroupAuditTypeEx.SUGGESTED_MODERATION.id))
+            && this.jda.getGuildById(guild) != null && this.jda.getGuildById(guild).getTextChannelById(route) != null;
+    }
+
     @Override
     public void tryEmitExtendedSuggestedModeration(Scarlet scarlet, User target)
     {
-        int periodDays = this.scarlet.settings.heuristicPeriodDays.get(),
-            kickThreshold = this.scarlet.settings.heuristicKickCount.get();
-        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC),
-                       before = now.minusDays(periodDays);
-        List<GroupAuditLogEntryUnknown> entries = this.scarlet.vrc.auditQuery(before, now, null, "group.instance.kick", target.getId());
-        if (entries == null)
-            return;
-        int kicks = 0;
-        for (GroupAuditLogEntryUnknown entry : entries)
+        String group = this.scarlet.vrc.groupId, guild = this.guildSf;
+        String route = this.auditExType2channelSf.get(GroupAuditTypeEx.SUGGESTED_MODERATION.id);
+        if (target == null || target.getId() == null || !this.suggestedRouteCurrent(group, guild, route)) return;
+        int periodDays = this.scarlet.settings.heuristicPeriodDays.get(), threshold = this.scarlet.settings.heuristicKickCount.get();
+        if (periodDays < 1 || threshold < 1) return;
+        String userId = target.getId(), displayName = target.getDisplayName();
+        net.sybyline.scarlet.util.BoundedSerialWork worker;
+        synchronized (this)
         {
-            ScarletData.AuditEntryMetadata entryMeta = this.scarlet.data.auditEntryMetadata(entry.getId());
-            if (entryMeta == null || !entryMeta.entryRedacted)
-            {
-                kicks++;
-            }
+            if (this.suggestedClosed) return;
+            if (this.suggestedWorker == null) this.suggestedWorker = new net.sybyline.scarlet.util.BoundedSerialWork("Scarlet-SuggestedModeration", 32, 60000L);
+            worker = this.suggestedWorker;
         }
-        if (kicks < kickThreshold)
-            return;
-        int kicks0 = kicks;
-        this.condEmitEx(GroupAuditTypeEx.SUGGESTED_MODERATION, false, false, null, (channelSf, guild, channel) ->
+        worker.submit(group + ":" + userId, current ->
         {
-            return channel.sendMessageEmbeds(new EmbedBuilder()
-                .setTitle(MarkdownSanitizer.escape(target.getDisplayName()), "https://vrchat.com/home/user/"+target.getId())
-                .setDescription(String.format("%s has been kicked from group instances %s time%s in the last %s hours", MarkdownSanitizer.escape(target.getDisplayName()), kicks0, kicks0==1?"":"s", kickThreshold*24))
-                .addField("User ID", "`"+target.getId()+"`", false)
-                .setColor(GroupAuditTypeEx.SUGGESTED_MODERATION.color)
-                .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
-                .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC))
-                .build())
-            .addComponents(ActionRow.of(
-                Button.danger("vrchat-user-ban:"+target.getId(), "Ban user"),
-                Button.success("vrchat-user-unban:"+target.getId(), "Unban user")
-            ))
-            .complete();
+            if (!current.getAsBoolean() || !this.suggestedRouteCurrent(group, guild, route)) return;
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            List<GroupAuditLogEntryUnknown> entries = this.scarlet.vrc.auditQuery(now.minusDays(periodDays), now, null, "group.instance.kick", userId);
+            if (entries == null || !current.getAsBoolean() || !this.suggestedRouteCurrent(group, guild, route)) return;
+            this.condEmitEx(GroupAuditTypeEx.SUGGESTED_MODERATION, false, false, null, (channelSf, selectedGuild, channel) ->
+            {
+                if (!current.getAsBoolean() || !this.suggestedRouteCurrent(group, guild, route)
+                    || !Objects.equals(route, channelSf) || !Objects.equals(guild, selectedGuild.getId())) return null;
+                int kicks = 0;
+                for (GroupAuditLogEntryUnknown entry : entries)
+                {
+                    if (entry != null && Objects.equals(group, entry.getGroupId()) && Objects.equals(userId, entry.getTargetId())
+                        && ScarletAuditPrivacy.historyVisible(entry, this.scarlet.data.auditEntryMetadata(entry.getId()),
+                            this.scarlet.secretStaffList::isSecretStaffId, false)) kicks++;
+                }
+                if (kicks < threshold) return null;
+                return channel.sendMessageEmbeds(new EmbedBuilder()
+                    .setTitle(MarkdownSanitizer.escape(displayName), "https://vrchat.com/home/user/"+userId)
+                    .setDescription(String.format("%s has been kicked from group instances %s time%s in the last %s hours", MarkdownSanitizer.escape(displayName), kicks, kicks==1?"":"s", (long)periodDays*24))
+                    .addField("User ID", "`"+userId+"`", false)
+                    .setColor(GroupAuditTypeEx.SUGGESTED_MODERATION.color)
+                    .setFooter(ScarletDiscord.FOOTER_PREFIX+"Extended event")
+                    .setTimestamp(OffsetDateTime.now(ZoneOffset.UTC)).build())
+                    .addComponents(ActionRow.of(Button.danger("vrchat-user-ban:"+userId, "Ban user"), Button.success("vrchat-user-unban:"+userId, "Unban user")))
+                    .complete();
+            });
+        }).exceptionally(failure -> {
+            if (!(failure instanceof java.util.concurrent.RejectedExecutionException) && !(failure instanceof java.util.concurrent.CancellationException))
+                LOG.warn("Suggested moderation lookup failed ({})", failure.getClass().getSimpleName());
+            return null;
         });
     }
 

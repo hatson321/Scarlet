@@ -86,11 +86,8 @@ public class TtsService implements Closeable
      * Each TTS clip is played to completion before the next one starts,
      * preventing multiple clips from overlapping.
      */
-    private final ExecutorService playbackExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "TTS-Playback");
-        t.setDaemon(true);
-        return t;
-    });
+    private final net.sybyline.scarlet.util.BoundedSerialWork playbackExecutor =
+        new net.sybyline.scarlet.util.BoundedSerialWork("Scarlet-TTSPlayback", 32, 60000L);
 
     /** Returns the list of TTS voices reported by the active provider. */
     public List<String> getInstalledVoices()
@@ -213,6 +210,7 @@ public class TtsService implements Closeable
     public void setPaused(boolean paused)
     {
         this.paused = paused;
+        if (paused) this.playbackExecutor.invalidate();
         Scarlet.LOG.info("TTS: {}", paused ? "paused" : "resumed");
     }
 
@@ -242,63 +240,39 @@ public class TtsService implements Closeable
 
     private CompletableFuture<Void> submitAlertThenSpeak(String marker, File alertWav, String text)
     {
-        if (this.paused)
-        {
-            Scarlet.LOG.debug("TTS({}): Dropped mixed-character alert - TTS is paused", marker);
-            return CompletableFuture.completedFuture(null);
-        }
-        CompletableFuture<Path> speech = this.synthesize(marker, text);
-        return CompletableFuture.runAsync(() ->
-        {
-            this.playPreparedAudio(marker, alertWav);
-            try
-            {
-                Path path = speech.get(35, TimeUnit.SECONDS);
-                if (path == null)
-                {
-                    Scarlet.LOG.warn("TTS({}): Provider returned null path, audio generation may have failed", marker);
-                    return;
-                }
-                this.playPreparedAudio(marker, path.toFile());
-            }
-            catch (InterruptedException ex)
-            {
-                Thread.currentThread().interrupt();
-                Scarlet.LOG.warn("TTS({}): Interrupted while waiting for mixed-character alert speech", marker);
-            }
-            catch (Exception ex)
-            {
-                speech.cancel(false);
-                Scarlet.LOG.warn("TTS({}): Alert speech unavailable; playback queue will continue ({})", marker, ex.getClass().getSimpleName());
-            }
-        }, this.playbackExecutor);
+        return this.enqueueSpeech(marker, text, alertWav);
     }
 
     public CompletableFuture<Void> submit(String marker, String text)
     {
-        if (this.paused)
+        return this.enqueueSpeech(marker, text, null);
+    }
+
+    private CompletableFuture<Void> enqueueSpeech(String marker, String text, File alertWav)
+    {
+        if (this.paused || text == null || text.isEmpty()) return CompletableFuture.completedFuture(null);
+        if (text.length() > 4096)
         {
-            Scarlet.LOG.debug("TTS({}): Dropped — TTS is paused", marker);
+            this.speechDiagnostic("text-too-long");
             return CompletableFuture.completedFuture(null);
         }
-        return this.synthesize(marker, text)
-            .thenAcceptAsync(path ->
+        // Admission happens before synthesis, so rejected bursts never spawn provider work.
+        java.util.function.BooleanSupplier session = this.eventListener.currentSpeechSession();
+        return this.playbackExecutor.submit(java.util.UUID.randomUUID().toString(), current ->
+        {
+            if (!current.getAsBoolean() || !session.getAsBoolean() || this.paused) return;
+            CompletableFuture<Path> speech = this.synthesize(marker, text);
+            try
             {
-                if (path == null)
-                {
-                    Scarlet.LOG.warn("TTS({}): Provider returned null path, audio generation may have failed", marker);
-                    return;
-                }
-                this.playPreparedAudio(marker, path.toFile());
-                // NOTE: The .wav file is intentionally kept on disk so that Discord and other
-                // consumers have time to finish reading/streaming it. Previously, Files.deleteIfExists(path)
-                // was called here immediately after submitAudio(), causing a race condition where the file
-                // was gone before Discord could access it.
-            }, this.playbackExecutor)
-            .exceptionally(ex -> {
-                Scarlet.LOG.error("TTS({}): Exception during TTS processing", marker, ex);
-                return null;
-            });
+                if (alertWav != null && current.getAsBoolean() && session.getAsBoolean() && !this.paused) this.playPreparedAudio(marker, alertWav);
+                Path path = speech.get(35, TimeUnit.SECONDS);
+                if (path != null && current.getAsBoolean() && session.getAsBoolean() && !this.paused) this.playPreparedAudio(marker, path.toFile());
+            }
+            finally { if (!speech.isDone()) speech.cancel(false); }
+        }, alertWav != null || (marker != null && (marker.startsWith("vtk-") || marker.startsWith("wa-")))).exceptionally(failure -> {
+            this.speechDiagnostic("playback-queue");
+            return null;
+        });
     }
 
     private CompletableFuture<Path> synthesize(String marker, String text)
@@ -640,19 +614,9 @@ public class TtsService implements Closeable
     @Override
     public void close()
     {
+        this.playbackExecutor.close();
         this.synthesis.close();
         this.provider.close();
-        this.playbackExecutor.shutdown();
-        try
-        {
-            if (!this.playbackExecutor.awaitTermination(5, TimeUnit.SECONDS))
-                this.playbackExecutor.shutdownNow();
-        }
-        catch (InterruptedException ex)
-        {
-            this.playbackExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
     }
 
 }

@@ -237,6 +237,16 @@ public class PropsTable<E> extends JTable
         this.getPropsDataModel().addEntry(entry);
     }
 
+    /** Publish one immutable row-list snapshot and notify Swing once per batch. */
+    public void replaceEntries(List<E> snapshot)
+    {
+        if (!javax.swing.SwingUtilities.isEventDispatchThread()) throw new IllegalStateException("Table publication requires the EDT");
+        PropsTableModel model = this.getPropsDataModel();
+        model.entries = new CopyOnWriteArrayList<>(snapshot);
+        model.pendingSilentOps = false;
+        model.fireTableDataChanged();
+    }
+
     public synchronized boolean removeEntry(E entry)
     {
         return this.getPropsDataModel().removeEntry(entry);
@@ -736,7 +746,7 @@ public class PropsTable<E> extends JTable
         PropsTableModel()
         {
         }
-        final List<E> entries = new CopyOnWriteArrayList<>();
+        volatile List<E> entries = new CopyOnWriteArrayList<>();
         final List<PropsInfo<?>> props = new CopyOnWriteArrayList<>();
         boolean pendingSilentOps = false;
         void queuePendingSilentOps()

@@ -70,16 +70,23 @@ final class ScarletPrivateFiles
 
     static void protect(Path path) throws IOException
     {
+        requireExactParent(path);
         BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         if ((!attributes.isRegularFile() && !attributes.isDirectory()) || attributes.isSymbolicLink() || attributes.isOther())
             throw new IOException("Private migration storage must be an exact regular file or directory");
+        AclFileAttributeView acl = Files.getFileAttributeView(path, AclFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
         protect(attributes.isDirectory(),
             Files.getFileAttributeView(path, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS),
-            Files.getFileAttributeView(path, AclFileAttributeView.class, LinkOption.NOFOLLOW_LINKS));
+            acl, acl == null ? null : currentWindowsUser(path));
     }
 
     /** Attribute-view seam lets tests verify rejection and read-back without accessing user ACLs. */
     static void protect(boolean directory, PosixFileAttributeView posix, AclFileAttributeView acl) throws IOException
+    {
+        protect(directory, posix, acl, acl == null ? null : acl.getOwner());
+    }
+
+    static void protect(boolean directory, PosixFileAttributeView posix, AclFileAttributeView acl, UserPrincipal reader) throws IOException
     {
         if (posix != null)
         {
@@ -91,7 +98,7 @@ final class ScarletPrivateFiles
         else if (acl != null)
         {
             UserPrincipal owner = acl.getOwner();
-            List<AclEntry> expected = ownerAcl(owner, directory);
+            List<AclEntry> expected = ownerAcl(reader, directory);
             acl.setAcl(expected);
             if (!owner.equals(acl.getOwner()) || !expected.equals(acl.getAcl()))
                 throw new IOException("Owner-only migration ACL failed verification");
@@ -106,13 +113,56 @@ final class ScarletPrivateFiles
             return new FileAttribute<?>[] { PosixFilePermissions.asFileAttribute(permissions(false)) };
         if (Files.getFileAttributeView(destinationParent, AclFileAttributeView.class) != null)
         {
-            final List<AclEntry> value = ownerAcl(Files.getOwner(privateTemplate, LinkOption.NOFOLLOW_LINKS), false);
+            final List<AclEntry> value = ownerAcl(currentWindowsUser(destinationParent), false);
             return new FileAttribute<?>[] { new FileAttribute<List<AclEntry>>() {
                 @Override public String name() { return "acl:acl"; }
                 @Override public List<AclEntry> value() { return value; }
             } };
         }
         throw new IOException("Plaintext exports require a destination that can enforce owner-only permissions");
+    }
+
+    static UserPrincipal currentWindowsUser(Path path) throws IOException
+    {
+        // Windows may assign Administrators as owner of files created elevated.
+        com.sun.security.auth.module.NTSystem identity = new com.sun.security.auth.module.NTSystem();
+        String domain = identity.getDomain();
+        return path.getFileSystem().getUserPrincipalLookupService().lookupPrincipalByName(
+            domain == null || domain.isEmpty() ? identity.getName() : domain + "\\" + identity.getName());
+    }
+
+    static void requireExactParent(Path path) throws IOException
+    {
+        Path parent = path.toAbsolutePath().normalize().getParent();
+        if (parent == null || !parent.equals(parent.toRealPath())) throw new IOException("Private storage parent must not be an alias");
+    }
+
+    static byte[] readSecret(Path path) throws IOException
+    {
+        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Secret must be a regular file");
+        protect(path);
+        try (java.nio.channels.SeekableByteChannel channel = Files.newByteChannel(path,
+            java.util.Set.of(java.nio.file.StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
+             java.io.InputStream input = java.nio.channels.Channels.newInputStream(channel))
+        {
+            byte[] bytes = input.readNBytes(4097);
+            if (bytes.length > 4096) throw new IOException("Secret file exceeds its size limit");
+            return bytes;
+        }
+    }
+
+    static void writeSecret(Path path, byte[] bytes) throws IOException
+    {
+        if (bytes.length > 4096) throw new IOException("Secret file exceeds its size limit");
+        requireExactParent(path);
+        try (java.nio.channels.SeekableByteChannel channel = Files.newByteChannel(path,
+            java.util.Set.of(java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS),
+            fileAttributes(path, path.toAbsolutePath().getParent())))
+        {
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+            while (buffer.hasRemaining()) channel.write(buffer);
+            if (channel instanceof java.nio.channels.FileChannel) ((java.nio.channels.FileChannel)channel).force(true);
+        }
     }
 
     private static Set<PosixFilePermission> permissions(boolean directory)

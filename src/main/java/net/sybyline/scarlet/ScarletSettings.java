@@ -81,7 +81,7 @@ public class ScarletSettings
             Path secretPath = new File(dir, "global-prefs.key").toPath();
             if (Files.isRegularFile(secretPath))
             {
-                String existing = new String(Files.readAllBytes(secretPath), StandardCharsets.UTF_8).trim();
+                String existing = new String(ScarletPrivateFiles.readSecret(secretPath), StandardCharsets.UTF_8).trim();
                 if (!existing.isEmpty())
                     return existing;
             }
@@ -96,7 +96,7 @@ public class ScarletSettings
             }
             catch (FileAlreadyExistsException ignored)
             {
-                String existing = new String(Files.readAllBytes(secretPath), StandardCharsets.UTF_8).trim();
+                String existing = new String(ScarletPrivateFiles.readSecret(secretPath), StandardCharsets.UTF_8).trim();
                 if (!existing.isEmpty())
                     return existing;
                 throw ignored;
@@ -111,20 +111,7 @@ public class ScarletSettings
 
     private static void writeOwnerOnlyNewFile(Path path, byte[] bytes) throws java.io.IOException
     {
-        try
-        {
-            FileAttribute<java.util.Set<PosixFilePermission>> attr = PosixFilePermissions.asFileAttribute(EnumSet.of(
-                PosixFilePermission.OWNER_READ,
-                PosixFilePermission.OWNER_WRITE));
-            try (SeekableByteChannel channel = Files.newByteChannel(path, EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), attr))
-            {
-                channel.write(ByteBuffer.wrap(bytes));
-            }
-        }
-        catch (UnsupportedOperationException ex)
-        {
-            Files.write(path, bytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
-        }
+        ScarletPrivateFiles.writeSecret(path, bytes);
     }
 
     public ScarletSettings(Scarlet scarlet, File settingsFile)
@@ -135,6 +122,7 @@ public class ScarletSettings
     /** JSON-only construction for hermetic validation tests; never opens Preferences. */
     ScarletSettings(Scarlet scarlet, File settingsFile, boolean initializePreferences)
     {
+        this.batchingDefaults = initializePreferences;
         this.scarlet = scarlet;
         this.settingsFile = settingsFile;
         this.settingsFileLastModified = settingsFile.lastModified();
@@ -557,7 +545,7 @@ public class ScarletSettings
             Path key = new File(dir, "global-prefs.key").toPath();
             if (!Files.isRegularFile(key))
                 return null;
-            String value = new String(Files.readAllBytes(key), StandardCharsets.UTF_8).trim();
+            String value = new String(ScarletPrivateFiles.readSecret(key), StandardCharsets.UTF_8).trim();
             return value.isEmpty() ? null : value;
         }
         catch (Exception ex)
@@ -616,16 +604,7 @@ public class ScarletSettings
         {
             Path directory = new File(dataDir, "preference-namespace-backups").toPath();
             Files.createDirectories(directory);
-            try
-            {
-                Files.setPosixFilePermissions(directory, EnumSet.of(
-                    PosixFilePermission.OWNER_READ,
-                    PosixFilePermission.OWNER_WRITE,
-                    PosixFilePermission.OWNER_EXECUTE));
-            }
-            catch (UnsupportedOperationException ignored)
-            {
-            }
+            ScarletPrivateFiles.protect(directory);
             String timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
                 .withZone(ZoneOffset.UTC)
                 .format(java.time.Instant.now());
@@ -789,7 +768,7 @@ public class ScarletSettings
                     cached_ = fallback == null ? null : this.validate.apply(fallback);
                 }
                 if (cached_ != null && !Objects.deepEquals(stored, cached_))
-                    ScarletSettings.this.setObject(this.id, this.type, cached_);
+                    ScarletSettings.this.materializeDefault(this.id, this.type, cached_);
                 this.cached = cached_;
             }
             return cached_;
@@ -1301,6 +1280,7 @@ public class ScarletSettings
         {
             Scarlet.GSON_PRETTY.toJson(json, JsonObject.class, w);
             w.commit();
+            this.defaultsDirty = false;
         }
         catch (Exception ex)
         {
@@ -1308,6 +1288,23 @@ public class ScarletSettings
             throw new java.io.UncheckedIOException("Settings were not saved. In-memory changes remain available for retry; the previous file was not deliberately replaced.",
                 ex instanceof java.io.IOException ? (java.io.IOException) ex : new java.io.IOException(ex));
         }
+    }
+
+    private boolean batchingDefaults, defaultsDirty;
+
+    synchronized void beginDefaultBatch() { this.batchingDefaults = true; }
+
+    synchronized void finishDefaultBatch()
+    {
+        this.batchingDefaults = false;
+        if (this.defaultsDirty) this.saveJson();
+    }
+
+    private synchronized void materializeDefault(String key, Type type, Object value)
+    {
+        if (!this.batchingDefaults) { this.setObject(key, type, value); return; }
+        this.getJson().add(key, Scarlet.GSON_PRETTY.toJsonTree(value, type));
+        this.defaultsDirty = true;
     }
 
     synchronized void clearCachedJson()

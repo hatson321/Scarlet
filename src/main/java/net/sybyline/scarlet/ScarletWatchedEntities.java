@@ -60,6 +60,7 @@ public class ScarletWatchedEntities<E>
     public static class WatchedEntity implements Comparable<WatchedEntity>
     {
         public String id;
+        private transient long revision;
         public Type type = Type.UNKNOWN;
         public static enum Type implements DEnum.DEnumString<Type>
         {
@@ -206,14 +207,14 @@ public class ScarletWatchedEntities<E>
         return this.importWatchedEntities(importedWatchedEntities, overwrite);
     }
 
-    public boolean exportJson(Writer writer) throws IOException
+    public synchronized boolean exportJson(Writer writer) throws IOException
     {
         WatchedEntity[] watchedEntitiesArray = this.watchedEntities.values().toArray(new WatchedEntity[0]);
         Scarlet.GSON_PRETTY.toJson(watchedEntitiesArray, WatchedEntity[].class, writer);
         return true;
     }
 
-    public boolean importWatchedEntities(List<WatchedEntity> importedWatchedEntities, boolean overwrite)
+    public synchronized boolean importWatchedEntities(List<WatchedEntity> importedWatchedEntities, boolean overwrite)
     {
         for (WatchedEntity watchedEntity : importedWatchedEntities)
         {
@@ -221,41 +222,45 @@ public class ScarletWatchedEntities<E>
             {
                 if (overwrite)
                 {
-                    this.watchedEntities.put(watchedEntity.id, watchedEntity);
+                    this.watchedEntities.put(watchedEntity.id, copy(watchedEntity));
                 }
                 else
                 {
-                    this.watchedEntities.putIfAbsent(watchedEntity.id, watchedEntity);
+                    this.watchedEntities.putIfAbsent(watchedEntity.id, copy(watchedEntity));
                 }
             }
         }
-        this.save();
+        this.saveOrThrow();
         return true;
     }
 
-    public WatchedEntity getWatchedEntity(String entityId)
+    public synchronized WatchedEntity getWatchedEntity(String entityId)
     {
-        return this.watchedEntities.get(entityId);
+        WatchedEntity copy = copy(this.watchedEntities.get(entityId));
+        if (copy != null) copy.revision = this.revision;
+        return copy;
     }
 
-    public boolean addWatchedEntity(String entityId, WatchedEntity watchedEntity)
+    public synchronized boolean addWatchedEntity(String entityId, WatchedEntity watchedEntity)
     {
         if (watchedEntity == null)
             return false;
-        this.watchedEntities.put(entityId, watchedEntity);
-        this.save();
+        this.watchedEntities.put(entityId, copy(watchedEntity));
+        this.saveOrThrow();
         return true;
     }
 
-    public boolean removeWatchedEntity(String entityId)
+    public synchronized boolean removeWatchedEntity(String entityId)
     {
         if (this.watchedEntities.remove(entityId) == null)
             return false;
-        this.save();
+        this.saveOrThrow();
         return true;
     }
 
     private boolean loadFailed;
+    private String committed = "[]";
+    private long revision;
 
     public synchronized boolean load()
     {
@@ -286,9 +291,11 @@ public class ScarletWatchedEntities<E>
         if (watchedEntitiesArray != null)
         for (WatchedEntity watchedEntity : watchedEntitiesArray)
             if (watchedEntity != null && watchedEntity.id != null && this.idValid.test(watchedEntity.id))
-                watchedEntities.put(watchedEntity.id, watchedEntity);
+                watchedEntities.put(watchedEntity.id, copy(watchedEntity));
         this.watchedEntities = watchedEntities;
         this.loadFailed = false;
+        this.committed = Scarlet.GSON_PRETTY.toJson(this.watchedEntities.values());
+        this.revision++;
         return true;
     }
 
@@ -297,6 +304,7 @@ public class ScarletWatchedEntities<E>
         if (this.loadFailed)
         {
             LOG.error("Watched entity storage was not loaded; refusing to overwrite the original data");
+            this.restoreCommitted();
             return false;
         }
         WatchedEntity[] watchedEntitiesArray = this.watchedEntities.values().toArray(new WatchedEntity[0]);
@@ -308,9 +316,37 @@ public class ScarletWatchedEntities<E>
         catch (Exception ex)
         {
             LOG.error("Exception saving watched entities", ex);
+            this.restoreCommitted();
             return false;
         }
+        this.committed = Scarlet.GSON_PRETTY.toJson(this.watchedEntities.values());
+        this.revision++;
         return true;
+    }
+
+    private static WatchedEntity copy(WatchedEntity value)
+    {
+        return value == null ? null : Scarlet.GSON_PRETTY.fromJson(Scarlet.GSON_PRETTY.toJson(value), WatchedEntity.class);
+    }
+
+    private void restoreCommitted()
+    {
+        Map<String, WatchedEntity> restored = new ConcurrentHashMap<>();
+        for (WatchedEntity value : Scarlet.GSON_PRETTY.fromJson(this.committed, WatchedEntity[].class)) restored.put(value.id, value);
+        this.watchedEntities = restored;
+    }
+
+    public synchronized void saveOrThrow()
+    {
+        if (!this.save()) { this.restoreCommitted(); throw new IllegalStateException("Could not save watched list; changes were rolled back"); }
+    }
+
+    public synchronized void updateWatchedEntity(WatchedEntity value)
+    {
+        if (value == null || value.revision != this.revision || !this.watchedEntities.containsKey(value.id))
+            throw new IllegalStateException("Watched list changed; reload and retry");
+        this.watchedEntities.put(value.id, copy(value));
+        this.saveOrThrow();
     }
 
     /** Number of watched entities currently showing a translated advisory. */
@@ -331,11 +367,18 @@ public class ScarletWatchedEntities<E>
      */
     public int translateAdvisories(String endpoint, String apiKey, String targetLang) throws java.io.IOException
     {
+        final Map<String, WatchedEntity> candidates = new java.util.HashMap<>();
+        final long expectedRevision;
+        synchronized (this)
+        {
+            expectedRevision = this.revision;
+            this.watchedEntities.forEach((id, value) -> candidates.put(id, copy(value)));
+        }
         int changed = 0;
         java.io.IOException failure = null;
         try
         {
-            for (WatchedEntity e : this.watchedEntities.values())
+            for (WatchedEntity e : candidates.values())
             {
                 boolean any = false;
                 String srcMsg = e.messageOriginal != null ? e.messageOriginal : e.message;
@@ -371,15 +414,19 @@ public class ScarletWatchedEntities<E>
         {
             failure = ex;
         }
-        if (changed > 0)
-            this.save();
+        if (changed > 0) synchronized (this)
+        {
+            if (this.revision != expectedRevision) throw new IOException("Watched list changed during translation; retry");
+            this.watchedEntities = new ConcurrentHashMap<>(candidates);
+            this.saveOrThrow();
+        }
         if (failure != null)
             throw failure;
         return changed;
     }
 
     /** Restores original (pre-translation) advisory text for every watched entity. Returns count restored. */
-    public int restoreAdvisories()
+    public synchronized int restoreAdvisories()
     {
         int restored = 0;
         for (WatchedEntity e : this.watchedEntities.values())
@@ -391,7 +438,7 @@ public class ScarletWatchedEntities<E>
             if (any) restored++;
         }
         if (restored > 0)
-            this.save();
+            this.saveOrThrow();
         return restored;
     }
 

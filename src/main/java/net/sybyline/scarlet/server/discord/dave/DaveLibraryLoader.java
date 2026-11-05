@@ -226,7 +226,7 @@ public class DaveLibraryLoader
     // Dependency handling
     // -------------------------------------------------------------------------
 
-    private static String identifyMissingLibrary(String msg)
+    static String identifyMissingLibrary(String msg)
     {
         if (msg == null)
             return "unknown";
@@ -259,6 +259,15 @@ public class DaveLibraryLoader
             return false;
         }
 
+        if (!canInstallOpus(missingLib))
+        {
+            showDialog("DAVE Native Library Dependency",
+                "The DAVE native library could not load (" + missingLib + ").\n\n"
+                    + "Check the reported dependency and your distribution's compatible runtime packages.\n\nError: " + errorMessage,
+                JOptionPane.ERROR_MESSAGE);
+            return false;
+        }
+
         // Strategy 1: LinuxPackageManagerDetector
         LinuxPackageManagerDetector.PackageManager pm = LinuxPackageManagerDetector.getPrimaryPackageManager();
         if (pm != null)
@@ -281,6 +290,8 @@ public class DaveLibraryLoader
         showManualInstallDialog(missingLib);
         return false;
     }
+
+    static boolean canInstallOpus(String missingLib) { return "libopus".equals(missingLib); }
 
     private static String opusPackageNameFor(String pmName)
     {

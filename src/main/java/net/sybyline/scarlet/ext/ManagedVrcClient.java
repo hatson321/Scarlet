@@ -190,6 +190,7 @@ public final class ManagedVrcClient
     {
         String currentUser();
         List<ProcessInfo> snapshot();
+        default List<ProcessInfo> discoverySnapshot(Set<Long> roots) { return this.snapshot(); }
         default List<ProcessInfo> clientSnapshot() { return this.snapshot(); }
         ProcessInfo find(long pid);
         boolean requestClose(ProcessInfo expected, BooleanSupplier revalidate);
@@ -274,7 +275,14 @@ public final class ManagedVrcClient
         /** Process metadata only. Uncertainty must never be interpreted as an empty machine. */
         private List<ProcessInfo> checkedSnapshot()
         {
-            List<ProcessInfo> snapshot = this.processes.snapshot();
+            Set<Long> roots;
+            synchronized (this)
+            {
+                roots = new HashSet<>(this.unresolvedProcesses.keySet());
+                if (this.attempt != null) roots.addAll(this.attempt.provenance.keySet());
+                if (this.managed != null) roots.add(this.managed.pid);
+            }
+            List<ProcessInfo> snapshot = this.processes.discoverySnapshot(roots);
             if (snapshot == null || snapshot.size() > 100_000) throw new IllegalStateException("Process inventory is unavailable or exceeds its bound");
             Set<Long> pids = new HashSet<>();
             for (ProcessInfo process : snapshot)
@@ -989,15 +997,20 @@ public final class ManagedVrcClient
 
         public List<ProcessInfo> clientSnapshot()
         {
-            return Platform.CURRENT.isNT() ? windowsSnapshot(true) : this.snapshot();
+            return Platform.CURRENT.isNT() ? windowsSnapshot(Set.of()) : this.snapshot();
+        }
+
+        public List<ProcessInfo> discoverySnapshot(Set<Long> roots)
+        {
+            return Platform.CURRENT.isNT() ? windowsSnapshot(roots) : this.snapshot();
         }
 
         private static List<ProcessInfo> windowsSnapshot()
         {
-            return windowsSnapshot(false);
+            return windowsSnapshot(null);
         }
 
-        private static List<ProcessInfo> windowsSnapshot(boolean clientsOnly)
+        private static List<ProcessInfo> windowsSnapshot(Set<Long> roots)
         {
             Instant snapshotStarted = Instant.now();
             HANDLE snapshot = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Tlhelp32.TH32CS_SNAPPROCESS, new DWORD(0));
@@ -1016,26 +1029,16 @@ public final class ManagedVrcClient
                         throw new IllegalStateException("Windows process inventory exceeded its bound");
                     long pid = entry.th32ProcessID.longValue(), parent = entry.th32ParentProcessID.longValue();
                     String name = Native.toString(entry.szExeFile);
-                    // Shutdown needs a complete name inventory, but not the identity of
-                    // unrelated processes. Their normal churn cannot invalidate a client.
-                    boolean readIdentity = !clientsOnly || "vrchat.exe".equalsIgnoreCase(name);
-                    ProcessInfo info = pid <= 0L || !readIdentity ? null : WindowsProcessEvidence.read(pid, parent);
-                    // The Toolhelp parent PID belongs to its captured process. Do not
-                    // attach that parent to a replacement born after capture began.
-                    validateSnapshotCreation(info, snapshotStarted);
-                    // Toolhelp supplies complete executable names even when protected
-                    // OS-process metadata is unavailable. Never use that name alone to
-                    // establish ownership or select a close target.
-                    if (info == null)
-                        result.add(new ProcessInfo(pid, null, null, name, List.of(), parent));
-                    else
-                        result.add(new ProcessInfo(pid, info.startedAt(), info.user(),
-                            info.executable() == null ? name : info.executable(), info.arguments(), parent));
+                    result.add(new ProcessInfo(pid, null, null, name, List.of(), parent));
                 }
                 while (Kernel32.INSTANCE.Process32Next(snapshot, entry));
                 if (Kernel32.INSTANCE.GetLastError() != WinError.ERROR_NO_MORE_FILES)
                     throw new IllegalStateException("Windows process inventory ended unexpectedly");
-                return result;
+                return enrichWindowsSnapshot(result, roots, snapshotStarted, process -> {
+                    if (System.nanoTime() - deadline >= 0L)
+                        throw new IllegalStateException("Windows process identity discovery exceeded its bound");
+                    return WindowsProcessEvidence.read(process.pid(), process.parentPid());
+                });
             }
             finally { Kernel32.INSTANCE.CloseHandle(snapshot); }
         }
@@ -1101,6 +1104,41 @@ public final class ManagedVrcClient
     {
         WindowsMessages INSTANCE = Native.load("user32", WindowsMessages.class);
         boolean PostMessageW(HWND window, int message, WPARAM wParam, LPARAM lParam);
+    }
+
+    /** Names prove presence only; identities are read freshly for clients and launch descendants. */
+    static List<ProcessInfo> enrichWindowsSnapshot(List<ProcessInfo> names, Set<Long> roots, Instant captured,
+        java.util.function.Function<ProcessInfo, ProcessInfo> readIdentity)
+    {
+        if (names == null || names.size() > 100_000) throw new IllegalStateException("Invalid process inventory");
+        Map<Long, List<Long>> children = new HashMap<>();
+        Set<Long> seen = new HashSet<>();
+        for (ProcessInfo process : names)
+        {
+            if (process == null || process.pid() < 0 || !seen.add(process.pid())
+                || process.executable() == null || process.executable().isBlank())
+                throw new IllegalStateException("Incomplete process inventory");
+            children.computeIfAbsent(process.parentPid(), ignored -> new ArrayList<>()).add(process.pid());
+        }
+        Set<Long> candidates = roots == null ? seen : new HashSet<>(roots);
+        if (roots != null)
+        {
+            java.util.ArrayDeque<Long> pending = new java.util.ArrayDeque<>(candidates);
+            while (!pending.isEmpty())
+                for (long child : children.getOrDefault(pending.remove(), List.of()))
+                    if (candidates.add(child)) pending.add(child);
+        }
+        List<ProcessInfo> result = new ArrayList<>(names.size());
+        for (ProcessInfo process : names)
+        {
+            ProcessInfo identity = process.pid() > 0 && (candidates.contains(process.pid()) || isClient(process))
+                ? readIdentity.apply(process) : null;
+            validateSnapshotCreation(identity, captured);
+            if (identity != null && identity.pid() != process.pid()) throw new IllegalStateException("Process identity changed");
+            result.add(identity == null ? process : new ProcessInfo(process.pid(), identity.startedAt(), identity.user(),
+                identity.executable() == null ? process.executable() : identity.executable(), identity.arguments(), process.parentPid()));
+        }
+        return result;
     }
 
     static void validateSnapshotCreation(ProcessInfo info, Instant snapshotStarted)

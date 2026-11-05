@@ -45,9 +45,25 @@ public class DAVEManager implements AutoCloseable {
         this.channelId = channelId;
         this.callbacks = callbacks;
         this.daveSession = factory.createSession("", "", this::mlsFailureCallback);
-        this.selfEncryptor = factory.createEncryptor();
-        this.selfEncryptor.setPassthroughMode(true);
-        this.maxProtocolVersion = factory.maxSupportedProtocolVersion();
+        Encryptor encryptor = null;
+        try {
+            encryptor = factory.createEncryptor();
+            encryptor.setPassthroughMode(true);
+            this.maxProtocolVersion = factory.maxSupportedProtocolVersion();
+        } catch (RuntimeException | Error failure) {
+            closeAfterConstructionFailure(encryptor, failure);
+            closeAfterConstructionFailure(this.daveSession, failure);
+            throw failure;
+        }
+        this.selfEncryptor = encryptor;
+    }
+
+    private static void closeAfterConstructionFailure(AutoCloseable resource, Throwable failure) {
+        if (resource == null) return;
+        try { resource.close(); }
+        catch (Throwable cleanup) {
+            if (cleanup != failure) failure.addSuppressed(cleanup);
+        }
     }
 
     public int getMaxDAVEProtocolVersion() {

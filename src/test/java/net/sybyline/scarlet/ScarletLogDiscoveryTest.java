@@ -68,6 +68,22 @@ class ScarletLogDiscoveryTest
         }
     }
 
+    @Test void directoryPollingFindsNewAndRemovedSessionsAmongUnrelatedFiles() throws Exception
+    {
+        for (int index = 0; index < 400; index++) Files.createFile(directory.resolve("unrelated-" + index + ".txt"));
+        Path older = Files.createFile(directory.resolve("output_log_2026-11-04_12-00-00.txt"));
+        try (ScarletVRChatLogs logs = new ScarletVRChatLogs(listener((name, args) -> {})) {
+            @Override File logDirectory() { return directory.toFile(); }
+        })
+        {
+            assertEquals(older.toFile(), logs.locateTarget());
+            Path newer = Files.createFile(directory.resolve("output_log_2026-11-04_13-00-00.txt"));
+            assertEquals(newer.toFile(), logs.locateTarget());
+            Files.delete(newer); assertEquals(older.toFile(), logs.locateTarget());
+            Files.delete(older); assertNull(logs.locateTarget());
+        }
+    }
+
     @Test void failedInitialisationDoesNotReplaySameFileInTightLoop() throws Exception
     {
         Files.writeString(directory.resolve("output_log_2026-11-04_12-00-00.txt"), "synthetic\n");

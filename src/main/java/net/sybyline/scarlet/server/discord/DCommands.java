@@ -86,6 +86,10 @@ try (Resource prevCommand = DCommandsUtil.command.push(current.getFullCommandNam
             return neq("name", current.getName(), data.getName());
         if (!equals_set(data.getContexts(), current.getContexts()))
             return neq("contexts", current.getContexts(), data.getContexts());
+        if (!equals_set(data.getIntegrationTypes(), current.getIntegrationTypes()))
+            return neq("integrationTypes", current.getIntegrationTypes(), data.getIntegrationTypes());
+        if (!Objects.equals(data.getDefaultPermissions().getPermissionsRaw(), current.getDefaultPermissions().getPermissionsRaw()))
+            return neq("defaultPermissions", current.getDefaultPermissions().getPermissionsRaw(), data.getDefaultPermissions().getPermissionsRaw());
         if (data.isNSFW() != current.isNSFW())
             return neq("NSFW", current.isNSFW(), data.isNSFW());
         if (!equals_locale(data.getNameLocalizations(), current.getNameLocalizations()))
@@ -95,8 +99,6 @@ try (Resource prevCommand = DCommandsUtil.command.push(current.getFullCommandNam
             SlashCommandData slash = (SlashCommandData)data;
             if (!Objects.equals(slash.getDescription(), current.getDescription()))
                 return neq("description", current.getDescription(), slash.getDescription());
-            if (!Objects.equals(slash.getDefaultPermissions().getPermissionsRaw(), current.getDefaultPermissions().getPermissionsRaw()))
-                return neq("defaultPermissions", current.getDefaultPermissions().getPermissionsRaw(), slash.getDefaultPermissions().getPermissionsRaw());
             if (!equals_locale(slash.getDescriptionLocalizations(), current.getDescriptionLocalizations()))
                 return neq("descriptionLocalizations", current.getDescriptionLocalizations().toMap(), slash.getDescriptionLocalizations().toMap());
             if (current.getType() == Command.Type.SLASH)
@@ -152,6 +154,12 @@ try (Resource prevCommand = DCommandsUtil.command.push(current.getFullCommandNam
             return neq("name", current.getName(), data.getName());
         if (!Objects.equals(data.getDescription(), current.getDescription()))
             return neq("description", current.getDescription(), data.getDescription());
+        if (data.isRequired() != current.isRequired())
+            return neq("required", current.isRequired(), data.isRequired());
+        if (data.isAutoComplete() != current.isAutoComplete())
+            return neq("autocomplete", current.isAutoComplete(), data.isAutoComplete());
+        if (!equals_set(data.getChannelTypes(), current.getChannelTypes()))
+            return neq("channelTypes", current.getChannelTypes(), data.getChannelTypes());
         if (!equals_num(data.getType(), data.getMinValue(), current.getMinValue()))
             return neq("minValue", current.getMinValue(), data.getMinValue());
         if (!equals_num(data.getType(), data.getMaxValue(), current.getMaxValue()))
@@ -176,6 +184,8 @@ try (Resource prevCommand = DCommandsUtil.option.push("/ "+current.getName()+' '
             return neq("type", current.getType(), data.getType());
         if (!Objects.equals(data.getName(), current.getName()))
             return neq("name", current.getName(), data.getName());
+        if (!equals_locale(data.getNameLocalizations(), current.getNameLocalizations()))
+            return neq("nameLocalizations", current.getNameLocalizations(), data.getNameLocalizations());
         if (OptionType.NUMBER == data.getType() && current.getAsDouble() != data.getAsDouble())
             return neq("value.double", current.getAsDouble(), data.getAsDouble());
         else if (OptionType.INTEGER == data.getType() && current.getAsLong() != data.getAsLong())
@@ -188,6 +198,8 @@ try (Resource prevCommand = DCommandsUtil.option.push("/ "+current.getName()+' '
     {
         if ((data == null || data.toMap().isEmpty()) && (current == null || current.toMap().isEmpty()))
             return true;
+        if (data == null || current == null)
+            return false;
         for (DiscordLocale locale : DiscordLocale.values())
             if (!Objects.equals(data.get(locale), current.get(locale)))
                 return false;

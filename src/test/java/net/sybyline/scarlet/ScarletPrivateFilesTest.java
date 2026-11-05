@@ -101,9 +101,42 @@ class ScarletPrivateFilesTest
             assertNotNull(acl, "Plaintext storage must support enforceable permissions");
             List<AclEntry> entries = acl.getAcl();
             assertEquals(1, entries.size(), "No other principal may receive an allow entry");
-            assertEquals(acl.getOwner(), entries.get(0).principal());
+            assertEquals(ScarletPrivateFiles.currentWindowsUser(path), entries.get(0).principal());
             assertEquals(AclEntryType.ALLOW, entries.get(0).type());
         }
+    }
+
+    @Test void persistentSecretsAreExclusivePrivateAndSurvivePermissionRepair() throws Exception
+    {
+        Path secret = directory.resolve("synthetic.key");
+        ScarletPrivateFiles.writeSecret(secret, "synthetic-secret".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertPrivate(secret);
+        assertThrows(java.nio.file.FileAlreadyExistsException.class,
+            () -> ScarletPrivateFiles.writeSecret(secret, new byte[]{1}));
+        var posix = Files.getFileAttributeView(secret, PosixFileAttributeView.class);
+        if (posix != null) posix.setPermissions(EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OTHERS_READ));
+        else
+        {
+            var acl = Files.getFileAttributeView(secret, AclFileAttributeView.class);
+            var entries = new ArrayList<>(acl.getAcl());
+            entries.add(AclEntry.newBuilder().setType(AclEntryType.ALLOW)
+                .setPrincipal(secret.getFileSystem().getUserPrincipalLookupService().lookupPrincipalByName("Everyone"))
+                .setPermissions(AclEntryPermission.READ_DATA).build());
+            acl.setAcl(entries);
+        }
+        assertEquals("synthetic-secret", new String(ScarletPrivateFiles.readSecret(secret), java.nio.charset.StandardCharsets.UTF_8));
+        assertPrivate(secret);
+        assertThrows(IOException.class, () -> ScarletPrivateFiles.readSecret(directory));
+    }
+
+    @Test void administratorOwnershipDoesNotLockOutTheIntendedReader() throws Exception
+    {
+        MemoryAcl acl = new MemoryAcl();
+        acl.owner = () -> "Administrators";
+        UserPrincipal user = () -> "synthetic-user";
+        ScarletPrivateFiles.protect(false, null, acl, user);
+        assertEquals("Administrators", acl.owner.getName());
+        assertEquals(user, acl.entries.get(0).principal());
     }
 
     private static final class MemoryAcl implements AclFileAttributeView

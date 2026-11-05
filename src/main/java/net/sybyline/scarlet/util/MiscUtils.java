@@ -914,11 +914,17 @@ public interface MiscUtils
                 {
                     try
                     {
-                        new ProcessBuilder(cmd, dir.getAbsolutePath())
+                        Process opener = new ProcessBuilder(cmd, dir.getAbsolutePath())
                             .inheritIO()
                             .start();
+                        if (!openerAccepted(opener)) continue;
                         Scarlet.LOG.info("Opened directory via {}: {}", cmd, dir);
                         return true;
+                    }
+                    catch (InterruptedException interrupted)
+                    {
+                        Thread.currentThread().interrupt();
+                        return false;
                     }
                     catch (IOException ex)
                     {
@@ -934,6 +940,12 @@ public interface MiscUtils
             // Last resort: open as a file:// URI in whatever handles it
             Scarlet.LOG.warn("No file manager found; falling back to browser for directory: {}", dir);
             return browse(dir.toURI());
+        }
+
+        static boolean openerAccepted(Process process) throws InterruptedException
+        {
+            // A resident file manager is successful; a quickly failing launcher is not.
+            return !process.waitFor(750L, java.util.concurrent.TimeUnit.MILLISECONDS) || process.exitValue() == 0;
         }
     }
 

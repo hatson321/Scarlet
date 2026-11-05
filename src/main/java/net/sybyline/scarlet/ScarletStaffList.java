@@ -36,6 +36,8 @@ public class ScarletStaffList
     final File staffListFile;
     final Set<String> staffUserIds;
     final Map<String, String> staffNames;
+    private final Map<String, Long> nameRefreshedAt = new ConcurrentHashMap<>();
+    long nameCacheNow() { return System.currentTimeMillis(); }
     private boolean loadFailed;
 
     public String[] getStaffIds()
@@ -48,12 +50,24 @@ public class ScarletStaffList
         if (!this.isStaffId(userId))
             return null;
         String name = this.staffNames.get(userId);
-        if (name == null && vrc != null)
+        long now = this.nameCacheNow();
+        Long refreshed = this.nameRefreshedAt.get(userId);
+        if (vrc != null && (name == null || refreshed == null || now < refreshed || now - refreshed >= 3_600_000L))
         {
             User user = vrc.getUser(userId);
             if (user != null)
             {
-                name = user.getDisplayName();
+                String fetched = user.getDisplayName();
+                synchronized (this)
+                {
+                    if (!this.isStaffId(userId)) return null;
+                    if (fetched != null && !fetched.trim().isEmpty())
+                    {
+                        name = fetched;
+                        this.staffNames.put(userId, name);
+                        this.nameRefreshedAt.put(userId, now);
+                    }
+                }
             }
         }
         if (name == null)
@@ -86,19 +100,20 @@ public class ScarletStaffList
         return userId != null && this.staffUserIds.contains(userId);
     }
 
-    public boolean addStaffId(String userId)
+    public synchronized boolean addStaffId(String userId)
     {
         if (userId == null || !this.staffUserIds.add(userId))
             return false;
-        this.save();
+        if (!this.save()) { this.staffUserIds.remove(userId); throw new IllegalStateException("Could not save staff addition"); }
         return true;
     }
 
-    public boolean removeStaffId(String userId)
+    public synchronized boolean removeStaffId(String userId)
     {
         if (userId == null || !this.staffUserIds.remove(userId))
             return false;
-        this.save();
+        if (!this.save()) { this.staffUserIds.add(userId); throw new IllegalStateException("Could not save staff removal"); }
+        this.staffNames.remove(userId); this.nameRefreshedAt.remove(userId);
         return true;
     }
 
@@ -131,6 +146,8 @@ public class ScarletStaffList
         ids.removeIf(Objects::isNull);
         this.staffUserIds.clear();
         this.staffUserIds.addAll(ids);
+        this.staffNames.keySet().retainAll(this.staffUserIds);
+        this.nameRefreshedAt.keySet().retainAll(this.staffUserIds);
         this.loadFailed = false;
         return true;
     }

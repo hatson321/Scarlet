@@ -76,6 +76,7 @@ class ScarletModerationSummaryFailureTest
             put(this.scarlet, "data", this.data);
             put(this.staff, "staffUserIds", new HashSet<String>());
             put(this.staff, "staffNames", new HashMap<String, String>());
+            put(this.staff, "nameRefreshedAt", new HashMap<String, Long>());
             put(this.scarlet, "staffList", this.staff);
             put(this.secrets, "secretStaffUserIds", new HashSet<String>());
             put(this.scarlet, "secretStaffList", this.secrets);

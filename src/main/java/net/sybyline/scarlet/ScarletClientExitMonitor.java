@@ -24,7 +24,7 @@ final class ScarletClientExitMonitor
     // Production client shutdown explicitly selects LIVE_LOG_ROSTER. Retain the
     // stricter policy for regression coverage without silently querying as a fallback.
     enum EvidenceMode { API_CONFIRMED, LIVE_LOG_ROSTER }
-    private final EvidenceMode evidenceMode;
+    private final ConfirmationPolicy confirmation;
     interface Processes
     {
         ManagedVrcClient.Client current();
@@ -122,13 +122,76 @@ final class ScarletClientExitMonitor
         Supplier<Instant> clock, LongSupplier nanos, Consumer<String> diagnostics, Runnable awaitTracking,
         Supplier<String> trackingFailure, EvidenceMode evidenceMode)
     {
-        this.evidenceMode = Objects.requireNonNull(evidenceMode);
+        this.confirmation = Objects.requireNonNull(evidenceMode) == EvidenceMode.API_CONFIRMED
+            ? new ApiConfirmation() : new LogConfirmation();
         this.enabled = enabled; this.group = group; this.healthy = healthy;
         this.processes = processes; this.instances = instances; this.results = results;
         this.clock = clock; this.nanos = nanos;
         this.diagnostics = diagnostics;
         this.awaitTracking = awaitTracking;
         this.trackingFailure = trackingFailure;
+    }
+
+    private abstract class ConfirmationPolicy
+    {
+        final boolean allowsOverride;
+        final String proof, trackingLost, stale, forceCancelled, guardStale;
+        ConfirmationPolicy(boolean allowsOverride, String proof, String trackingLost, String stale, String forceCancelled, String guardStale)
+        {
+            this.allowsOverride = allowsOverride; this.proof = proof; this.trackingLost = trackingLost;
+            this.stale = stale; this.forceCancelled = forceCancelled; this.guardStale = guardStale;
+        }
+        abstract void beginCheck(long now);
+        abstract boolean approve(ScarletClosedInstanceExit.Attempt attempt, ManagedVrcClient.Client client, Override override, long queryStarted);
+        abstract Instance forceResponse(ScarletClosedInstanceExit.Attempt attempt);
+        abstract boolean approveForce(Instance response, ScarletClosedInstanceExit.Attempt attempt);
+        void beforeCommit() { }
+    }
+
+    /** Active shutdown policy: closure audit, healthy log roster and final process guards. */
+    private final class LogConfirmation extends ConfirmationPolicy
+    {
+        LogConfirmation() { super(false, "log-proof", "log-tracking-lost-during-final-check", "log-observation-stale-or-session-changed",
+            "force-fallback-cancelled-fresh-tracking-check", "close-guard-log-observation-stale"); }
+        void beginCheck(long now) { }
+        boolean approve(ScarletClosedInstanceExit.Attempt attempt, ManagedVrcClient.Client client, Override override, long queryStarted) { return true; }
+        Instance forceResponse(ScarletClosedInstanceExit.Attempt attempt) { return null; }
+        boolean approveForce(Instance response, ScarletClosedInstanceExit.Attempt attempt) { return true; }
+        void beforeCommit() { diagnostic("exit-evidence-live-output-log-roster-no-server-occupancy-query"); }
+    }
+
+    /** Legacy server-confirmed policy; never an implicit fallback for the log policy. */
+    private final class ApiConfirmation extends ConfirmationPolicy
+    {
+        ApiConfirmation() { super(true, "server-proof", "log-tracking-lost-during-server-check", "server-response-stale-or-session-changed",
+            "force-fallback-cancelled-fresh-server-or-tracking-check", "close-guard-server-proof-stale"); }
+        void beginCheck(long now) { retryAfter = now + TimeUnit.SECONDS.toNanos(60); }
+        boolean approve(ScarletClosedInstanceExit.Attempt attempt, ManagedVrcClient.Client client, Override override, long queryStarted)
+        {
+            Instance current;
+            try { current = ScarletClientExitMonitor.this.instances.apply(attempt.location); }
+            catch (RuntimeException ex)
+            {
+                ScarletClientExitMonitor.this.scheduleServerRetry(attempt, java.util.Collections.emptySet(), queryStarted);
+                throw ex;
+            }
+            Instant checkedAt = ScarletClientExitMonitor.this.clock.get();
+            if (!confirmedClosed(current, attempt.location, attempt.selfUserId, attempt.sessionStartedAt, checkedAt))
+            {
+                ScarletClientExitMonitor.this.diagnostic(current == null ? "server-instance-response-unavailable" : "server-closure-location-time-or-occupancy-unconfirmed");
+                Set<String> failures = ScarletClientExitMonitor.this.explainServerRejection(current, attempt, checkedAt);
+                if (override == null || !occupancyOnly(failures) || !closedIdentity(current, attempt, checkedAt))
+                {
+                    ScarletClientExitMonitor.this.scheduleServerRetry(attempt, failures, queryStarted);
+                    if (override == null && occupancyOnly(failures)) ScarletClientExitMonitor.this.offerOperatorNotice(attempt, client, current, queryStarted);
+                    return false;
+                }
+            }
+            return true;
+        }
+        Instance forceResponse(ScarletClosedInstanceExit.Attempt attempt) { return instances.apply(attempt.location); }
+        boolean approveForce(Instance response, ScarletClosedInstanceExit.Attempt attempt)
+        { return confirmedClosed(response, attempt.location, attempt.selfUserId, attempt.sessionStartedAt, clock.get()); }
     }
 
     /** Fixed reason codes only: never log a location, account ID or access key. */
@@ -283,7 +346,7 @@ final class ScarletClientExitMonitor
 
     private void tick(Override override)
     {
-        if (override != null && this.evidenceMode == EvidenceMode.LIVE_LOG_ROSTER)
+        if (override != null && !this.confirmation.allowsOverride)
         {
             override.result = "No manual override applied: automatic client exit uses the live output-log roster; server occupancy is not a prerequisite.";
             return;
@@ -365,32 +428,10 @@ final class ScarletClientExitMonitor
                 if (override == null && this.retryAfter != 0L && now - this.retryAfter < 0L) { this.diagnostic("server-check-retry-backoff"); return; }
                 attempt = this.policy.poll(now);
                 if (attempt == null) { this.diagnostic(this.policy.waitingReason()); return; }
-                if (this.evidenceMode == EvidenceMode.API_CONFIRMED)
-                    this.retryAfter = now + TimeUnit.SECONDS.toNanos(60);
+                this.confirmation.beginCheck(now);
             }
             long queryStarted = this.nanos.getAsLong();
-            if (this.evidenceMode == EvidenceMode.API_CONFIRMED)
-            {
-                Instance current;
-                try { current = this.instances.apply(attempt.location); }
-                catch (RuntimeException ex)
-                {
-                    this.scheduleServerRetry(attempt, java.util.Collections.emptySet(), queryStarted);
-                    throw ex;
-                }
-                Instant checkedAt = this.clock.get();
-                if (!confirmedClosed(current, attempt.location, attempt.selfUserId, attempt.sessionStartedAt, checkedAt))
-                {
-                    this.diagnostic(current == null ? "server-instance-response-unavailable" : "server-closure-location-time-or-occupancy-unconfirmed");
-                    Set<String> failures = this.explainServerRejection(current, attempt, checkedAt);
-                    if (override == null || !occupancyOnly(failures) || !closedIdentity(current, attempt, checkedAt))
-                    {
-                        this.scheduleServerRetry(attempt, failures, queryStarted);
-                        if (override == null && occupancyOnly(failures)) this.offerOperatorNotice(attempt, client, current, queryStarted);
-                        return;
-                    }
-                }
-            }
+            if (!this.confirmation.approve(attempt, client, override, queryStarted)) return;
             // A second permission fetch must not hold the roster lock or starve
             // player observations. Its time counts against server-proof freshness.
             if (override != null) override.refreshAuthorization.run();
@@ -404,18 +445,15 @@ final class ScarletClientExitMonitor
                 if (!this.healthy.getAsBoolean())
                 {
                     this.policy.suspendCountdown();
-                    this.diagnostic(this.evidenceMode == EvidenceMode.API_CONFIRMED
-                        ? "log-tracking-lost-during-server-check" : "log-tracking-lost-during-final-check");
+                    this.diagnostic(this.confirmation.trackingLost);
                     this.explainTrackingFailure();
                     return;
                 }
                 if (elapsed < 0L || elapsed > TimeUnit.SECONDS.toNanos(10) || !this.matchesSession(client))
-                { this.diagnostic(this.evidenceMode == EvidenceMode.API_CONFIRMED
-                    ? "server-response-stale-or-session-changed" : "log-observation-stale-or-session-changed"); return; }
+                { this.diagnostic(this.confirmation.stale); return; }
                 boolean committed = this.policy.commit(attempt, this.nanos.getAsLong(), () ->
                 {
-                    if (this.evidenceMode == EvidenceMode.LIVE_LOG_ROSTER)
-                        this.diagnostic("exit-evidence-live-output-log-roster-no-server-occupancy-query");
+                    this.confirmation.beforeCommit();
                     // Terminal until a typed, definitely-unsent result explicitly rearms it.
                     // Exceptions or a lost result cannot silently grant a retry.
                     this.closeTerminal = true;
@@ -431,7 +469,7 @@ final class ScarletClientExitMonitor
                             ++this.closeRetries;
                             this.closeTerminal = false; this.retryAfter = 0L;
                             this.diagnostic("close-retry-" + this.closeRetries + "-of-2-requires-fresh-grace-and-"
-                                + (this.evidenceMode == EvidenceMode.API_CONFIRMED ? "server-proof" : "log-proof"));
+                                + this.confirmation.proof);
                         }
                         else this.diagnostic("close-retry-budget-exhausted-or-observation-changed");
                     }
@@ -491,16 +529,14 @@ final class ScarletClientExitMonitor
                 if (current != pending.client || !this.forceGuard(pending, queryStarted))
                 { this.diagnostic("force-fallback-cancelled-process-or-observation-changed"); return true; }
             }
-            Instance response = this.evidenceMode == EvidenceMode.API_CONFIRMED ? this.instances.apply(pending.attempt.location) : null;
+            Instance response = this.confirmation.forceResponse(pending.attempt);
             this.awaitTracking.run();
             synchronized (this)
             {
                 this.refresh();
-                if ((this.evidenceMode == EvidenceMode.API_CONFIRMED
-                        && !confirmedClosed(response, pending.attempt.location, pending.attempt.selfUserId, pending.attempt.sessionStartedAt, this.clock.get()))
+                if (!this.confirmation.approveForce(response, pending.attempt)
                     || !this.forceGuard(pending, queryStarted))
-                { this.diagnostic(this.evidenceMode == EvidenceMode.API_CONFIRMED
-                    ? "force-fallback-cancelled-fresh-server-or-tracking-check" : "force-fallback-cancelled-fresh-tracking-check"); return true; }
+                { this.diagnostic(this.confirmation.forceCancelled); return true; }
                 ManagedVrcClient.ForceResult result = this.processes.force(pending.client, () -> this.forceGuard(pending, queryStarted));
                 this.diagnostic("force-fallback-result-" + (result == null ? "uncertain" : result.name().toLowerCase(java.util.Locale.ROOT).replace('_', '-')));
             }
@@ -516,8 +552,7 @@ final class ScarletClientExitMonitor
             : !Objects.equals(attempt.groupId, this.group.get()) ? "close-guard-group-changed"
             : !this.matchesSession(client) ? "close-guard-session-changed"
             : override != null && !this.overrideValid(override, client) ? "close-guard-operator-authorization-changed"
-            : age < 0L || age > TimeUnit.SECONDS.toNanos(10) ? (this.evidenceMode == EvidenceMode.API_CONFIRMED
-                ? "close-guard-server-proof-stale" : "close-guard-log-observation-stale")
+            : age < 0L || age > TimeUnit.SECONDS.toNanos(10) ? this.confirmation.guardStale
             : !this.healthy.getAsBoolean() ? "close-guard-log-tracking-not-healthy"
             : !this.policy.committedObservation(attempt, this.nanos.getAsLong()) ? "close-guard-roster-or-closure-observation-changed" : null;
         if (failure == null) return true;

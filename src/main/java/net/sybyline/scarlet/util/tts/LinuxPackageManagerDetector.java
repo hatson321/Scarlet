@@ -210,7 +210,7 @@ public class LinuxPackageManagerDetector {
             "flatpak install -y flathub {pkg}", "flatpak search {pkg}", "", "false"
         });
         PACKAGE_MANAGER_DEFINITIONS.put("snap", new String[]{
-            "snap install {pkg}", "snap find {pkg}", "mimic --beta", "true"
+            "snap install {pkg}", "snap find {pkg}", "", "true"
         });
         
         // Homebrew Linux
@@ -227,8 +227,6 @@ public class LinuxPackageManagerDetector {
         String[][] debianLike = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("festival", "Festival", "text2wave", "festival", "Classic Festival/text2wave voices"),
-            opt("mimic", "Mimic", "mimic", "mimic", "Mycroft's Flite-derived voices with better English output"),
             opt("pico2wave", "Pico TTS", "pico2wave", "libttspico-utils", "SVOX Pico voices via pico2wave"),
             opt("espeak", "Legacy eSpeak", "espeak", "espeak", "Older eSpeak package for compatibility")
         };
@@ -238,8 +236,6 @@ public class LinuxPackageManagerDetector {
         String[][] fedoraLike = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("festival", "Festival", "text2wave", "festival", "Classic Festival/text2wave voices"),
-            opt("mimic", "Mimic", "mimic", "mimic", "Mycroft's Flite-derived voices with better English output")
         };
         TTS_PACKAGE_OPTIONS.put("dnf", fedoraLike);
         TTS_PACKAGE_OPTIONS.put("yum", fedoraLike);
@@ -247,13 +243,10 @@ public class LinuxPackageManagerDetector {
         String[][] archOfficial = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("festival", "Festival", "text2wave", "festival festival-english", "Classic Festival/text2wave voices")
         };
         String[][] archAur = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("festival", "Festival", "text2wave", "festival festival-english", "Classic Festival/text2wave voices"),
-            opt("mimic", "Mimic", "mimic", "mimic", "Mycroft's Flite-derived voices with better English output")
         };
         TTS_PACKAGE_OPTIONS.put("pacman", archOfficial);
         TTS_PACKAGE_OPTIONS.put("yay", archAur);
@@ -263,15 +256,12 @@ public class LinuxPackageManagerDetector {
         String[][] suseLike = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("festival", "Festival", "text2wave", "festival", "Classic Festival/text2wave voices")
         };
         TTS_PACKAGE_OPTIONS.put("zypper", suseLike);
 
         String[][] alpineLike = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("festival", "Festival", "text2wave", "festival", "Classic Festival/text2wave voices"),
-            opt("mimic", "Mimic", "mimic", "mimic", "Mycroft's Flite-derived voices with better English output"),
             opt("pico2wave", "Pico TTS", "pico2wave", "svox-pico", "SVOX Pico voices via pico2wave")
         };
         TTS_PACKAGE_OPTIONS.put("apk", alpineLike);
@@ -279,7 +269,6 @@ public class LinuxPackageManagerDetector {
         String[][] voidLike = new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
             opt("flite", "Flite", "flite", "flite", "Lightweight CMU voices that are often clearer than eSpeak"),
-            opt("mimic", "Mimic", "mimic", "mimic", "Mycroft's Flite-derived voices with better English output")
         };
         TTS_PACKAGE_OPTIONS.put("xbps-install", voidLike);
 
@@ -304,7 +293,6 @@ public class LinuxPackageManagerDetector {
             opt("espeak", "eSpeak NG", "espeak-ng", "nixpkgs#espeak", "Nixpkgs eSpeak NG alias")
         });
         TTS_PACKAGE_OPTIONS.put("snap", new String[][]{
-            opt("mimic", "Mimic", "mimic", "mimic --beta", "Mycroft's Flite-derived voices with better English output")
         });
         TTS_PACKAGE_OPTIONS.put("brew", new String[][]{
             opt("espeak-ng", "eSpeak NG", "espeak-ng", "espeak-ng", "Broad language support and the default Linux fallback"),
@@ -408,12 +396,16 @@ public class LinuxPackageManagerDetector {
      * Results are cached for subsequent calls.
      */
     public static List<PackageManager> detectAllPackageManagers() {
+        return detectAllPackageManagers(LinuxPackageManagerDetector::checkCommand);
+    }
+
+    static synchronized List<PackageManager> detectAllPackageManagers(java.util.function.Predicate<String> probe) {
         if (detectedManagers != null) {
             return detectedManagers;
         }
 
         LOG.info("Detecting available package managers...");
-        detectedManagers = new ArrayList<>();
+        List<PackageManager> found = new ArrayList<>();
 
         for (Map.Entry<String, String[]> entry : PACKAGE_MANAGER_DEFINITIONS.entrySet()) {
             String name = entry.getKey();
@@ -426,7 +418,7 @@ public class LinuxPackageManagerDetector {
             }
 
             // Check if binary exists
-            boolean binaryExists = checkCommand(detectionCmds[0]);
+            boolean binaryExists = probe.test(detectionCmds[0]);
             if (!binaryExists) {
                 LOG.debug("Package manager binary not found: {}", name);
                 continue;
@@ -435,7 +427,7 @@ public class LinuxPackageManagerDetector {
             // Additional distro-specific check if available
             boolean distroMatch = true;
             if (detectionCmds.length > 1 && detectionCmds[1] != null) {
-                distroMatch = checkCommand(detectionCmds[1]);
+                distroMatch = probe.test(detectionCmds[1]);
             }
 
             String detectionMethod = distroMatch ? "full match" : "binary only";
@@ -452,12 +444,12 @@ public class LinuxPackageManagerDetector {
                 packageName, requiresSudo, true, detectionMethod
             );
 
-            detectedManagers.add(pm);
+            found.add(pm);
             LOG.info("Detected package manager: {} ({})", name, detectionMethod);
         }
 
         // Sort by priority
-        detectedManagers.sort((a, b) -> {
+        found.sort((a, b) -> {
             int priorityA = PRIORITY_ORDER.getOrDefault(a.name, 999);
             int priorityB = PRIORITY_ORDER.getOrDefault(b.name, 999);
             // Prefer distro-specific matches over binary-only
@@ -470,17 +462,18 @@ public class LinuxPackageManagerDetector {
             return Integer.compare(priorityA, priorityB);
         });
 
-        if (detectedManagers.isEmpty()) {
+        if (found.isEmpty()) {
             LOG.warn("No package managers detected on this system!");
         }
 
+        detectedManagers = Collections.unmodifiableList(found);
         return detectedManagers;
     }
 
     /**
      * Get the primary (best) package manager for this system.
      */
-    public static PackageManager getPrimaryPackageManager() {
+    public static synchronized PackageManager getPrimaryPackageManager() {
         if (primaryManager != null) {
             return primaryManager;
         }
@@ -881,8 +874,7 @@ public class LinuxPackageManagerDetector {
         alternatives.put("paru", "espeak-ng");
         alternatives.put("pamac", "espeak-ng");
         
-        // Snap currently has Mimic as the usable command-line TTS option.
-        alternatives.put("snap", "mimic --beta");
+        // No Snap fallback: the active provider cannot use its advertised engines.
         
         return alternatives;
     }
@@ -890,7 +882,7 @@ public class LinuxPackageManagerDetector {
     /**
      * Clear the detection cache (useful for testing).
      */
-    public static void clearCache() {
+    public static synchronized void clearCache() {
         detectedManagers = null;
         primaryManager = null;
     }

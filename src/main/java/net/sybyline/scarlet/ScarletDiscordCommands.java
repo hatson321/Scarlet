@@ -813,30 +813,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            if (critical)
-            {
-                if (watchedGroup.critical)
-                {
-                    hook.sendMessage("That group is already flagged as critical").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Flagged group as critical").setEphemeral(true).queue();
-            }
-            else
-            {
-                if (!watchedGroup.critical)
-                {
-                    hook.sendMessage("That group is already not flagged as critical").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Unflagged group as critical").setEphemeral(true).queue();
-            }
             watchedGroup.critical = critical;
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("set-silent")
         @Desc("Sets a group's silent status")
@@ -845,30 +833,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            if (silent)
-            {
-                if (watchedGroup.silent)
-                {
-                    hook.sendMessage("That group is already flagged as silent").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Flagged group as silent").setEphemeral(true).queue();
-            }
-            else
-            {
-                if (!watchedGroup.silent)
-                {
-                    hook.sendMessage("That group is already not flagged as silent").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Unflagged group as silent").setEphemeral(true).queue();
-            }
             watchedGroup.silent = silent;
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("set-type")
         @Desc("Sets a group's watch type")
@@ -877,18 +853,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            if (watchedGroup.type == groupType)
+            watchedGroup.type = groupType;
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
             {
-                hook.sendMessage("That group is already marked as "+groupType).setEphemeral(true).queue();
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
                 return;
             }
-            watchedGroup.type = groupType;
-            hook.sendMessage("Marking group as "+groupType).setEphemeral(true).queue();
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("set-priority")
         @Desc("Sets a group's priority")
@@ -897,13 +873,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
             watchedGroup.priority = groupPriority;
-            hook.sendMessage("Setting group priority to "+groupPriority).setEphemeral(true).queue();
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("set-message")
         @Desc("Sets a group's TTS announcement message")
@@ -912,36 +893,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            if (message == null)
-            {
-                if (watchedGroup.message == null)
-                {
-                    hook.sendMessage("That group already has no message").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Removing group's message (was `%s`)", watchedGroup.message).setEphemeral(true).queue();
-                }
-            }
-            else
-            {
-                if (message.equals(watchedGroup.message))
-                {
-                    hook.sendMessage("That group's message is already exactly that").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Setting group TTS announcement to `%s` (was `%s`)", message, watchedGroup.message).setEphemeral(true).queue();
-                }
-            }
             watchedGroup.message = message;
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("set-notes")
         @Desc("Sets a group's notes")
@@ -969,45 +932,19 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            if (groupTags == null)
+            watchedGroup.tags.clear();
+            if (groupTags != null) watchedGroup.tags.addAll(Arrays.stream(groupTags.split("[,;/]")).map(String::trim).filter(t -> !t.isEmpty()).distinct().toArray(String[]::new));
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
             {
-                if (watchedGroup.tags.isEmpty())
-                {
-                    hook.sendMessage("That group already has no tags").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Removing group's tags (was `%s`)",
-                            watchedGroup.tags.strings().stream().filter(Objects::nonNull).collect(Collectors.joining("`, `")))
-                        .setEphemeral(true)
-                        .queue();
-                    watchedGroup.tags.clear();
-                }
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
             }
-            else
-            {
-                String[] newTags = Arrays.stream(groupTags.split("[,;/]")).map(String::trim).distinct().toArray(String[]::new);
-                if (watchedGroup.tags.strings().equals(new HashSet<>(Arrays.asList(newTags))))
-                {
-                    hook.sendMessage("That group already has those exact tags").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Setting group tags to `%s` (was `%s`)",
-                            Arrays.stream(newTags).filter(Objects::nonNull).collect(Collectors.joining("`, `")),
-                            watchedGroup.tags.strings().stream().filter(Objects::nonNull).collect(Collectors.joining("`, `")))
-                        .setEphemeral(true)
-                        .queue();
-                    watchedGroup.tags.clear().addAll(newTags);
-                }
-            }
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("add-tag")
         @Desc("Adds a tag for a group")
@@ -1016,29 +953,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            String groupTag0 = groupTag.trim();
-            if (watchedGroup.tags.isEmpty())
+            watchedGroup.tags.add(groupTag.trim());
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
             {
-                watchedGroup.tags.add(groupTag0);
-                hook.sendMessageFormat("Added tag `%s` (was empty)", groupTag0).setEphemeral(true).queue();
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
             }
-            else if (watchedGroup.tags.add(groupTag0))
-            {
-                hook.sendMessageFormat("Added tag `%s` (was `%s`)",
-                        groupTag0,
-                        watchedGroup.tags.strings().stream().filter(Objects::nonNull).collect(Collectors.joining("`, `")))
-                    .setEphemeral(true)
-                    .queue();
-            }
-            else
-            {
-                hook.sendMessage("That group already has that").setEphemeral(true).queue();
-            }
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
         @SlashCmd("remove-tag")
         @Desc("Removes a tag from a group")
@@ -1047,25 +973,18 @@ public class ScarletDiscordCommands
             ScarletWatchedGroups.WatchedGroup watchedGroup = ScarletDiscordCommands.this.discord.scarlet.watchedGroups.getWatchedGroup(groupId);
             if (watchedGroup == null)
             {
-                hook.sendMessage("That group is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatGroup(event, groupId);
-            if (watchedGroup.tags.isEmpty())
+            watchedGroup.tags.remove(groupTag);
+            try { ScarletDiscordCommands.this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+            catch (IllegalStateException failure)
             {
-                hook.sendMessage("That group already has no tags").setEphemeral(true).queue();
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
                 return;
             }
-            if (watchedGroup.tags.remove(groupTag))
-            {
-                hook.sendMessageFormat("Removed group tag `%s`)", groupTag).setEphemeral(true).queue();
-            }
-            else
-            {
-                hook.sendMessage("That group doesn't have that tag").setEphemeral(true).queue();
-                return;
-            }
-            ScarletDiscordCommands.this.discord.scarlet.watchedGroups.save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
     }
 
@@ -1388,30 +1307,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            if (critical)
-            {
-                if (watchedEntity.critical)
-                {
-                    hook.sendMessage("That "+this._singular()+" is already flagged as critical").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Flagged "+this._singular()+" as critical").setEphemeral(true).queue();
-            }
-            else
-            {
-                if (!watchedEntity.critical)
-                {
-                    hook.sendMessage("That "+this._singular()+" is already not flagged as critical").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Unflagged "+this._singular()+" as critical").setEphemeral(true).queue();
-            }
             watchedEntity.critical = critical;
-            this._watchedEntities().save();
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //        @SlashCmd("set-silent")
 //        @Desc("Sets a group's silent status")
@@ -1420,30 +1327,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            if (silent)
-            {
-                if (watchedEntity.silent)
-                {
-                    hook.sendMessage("That "+this._singular()+" is already flagged as silent").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Flagged "+this._singular()+" as silent").setEphemeral(true).queue();
-            }
-            else
-            {
-                if (!watchedEntity.silent)
-                {
-                    hook.sendMessage("That "+this._singular()+" is already not flagged as silent").setEphemeral(true).queue();
-                    return;
-                }
-                hook.sendMessage("Unflagged "+this._singular()+" as silent").setEphemeral(true).queue();
-            }
             watchedEntity.silent = silent;
-            this._watchedEntities().save();
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //        @SlashCmd("set-type")
 //        @Desc("Sets a group's watch type")
@@ -1452,18 +1347,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            if (watchedEntity.type == entityType)
+            watchedEntity.type = entityType;
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
             {
-                hook.sendMessage("That "+this._singular()+" is already marked as "+entityType).setEphemeral(true).queue();
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
                 return;
             }
-            watchedEntity.type = entityType;
-            hook.sendMessage("Marking "+this._singular()+" as "+entityType).setEphemeral(true).queue();
-            this._watchedEntities().save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //        @SlashCmd("set-priority")
 //        @Desc("Sets a group's priority")
@@ -1472,13 +1367,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
             watchedEntity.priority = entityPriority;
-            hook.sendMessage("Setting "+this._singular()+" priority to "+entityPriority).setEphemeral(true).queue();
-            this._watchedEntities().save();
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //        @SlashCmd("set-message")
 //        @Desc("Sets a group's TTS announcement message")
@@ -1487,36 +1387,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            if (message == null)
-            {
-                if (watchedEntity.message == null)
-                {
-                    hook.sendMessage("That "+this._singular()+" already has no message").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Removing "+this._singular()+"'s message (was `%s`)", watchedEntity.message).setEphemeral(true).queue();
-                }
-            }
-            else
-            {
-                if (message.equals(watchedEntity.message))
-                {
-                    hook.sendMessage("That "+this._singular()+"'s message is already exactly that").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Setting "+this._singular()+" TTS announcement to `%s` (was `%s`)", message, watchedEntity.message).setEphemeral(true).queue();
-                }
-            }
             watchedEntity.message = message;
-            this._watchedEntities().save();
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
+            {
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
+            }
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //      @SlashCmd("set-notes")
 //      @Desc("Sets a group's notes")
@@ -1545,9 +1427,11 @@ public class ScarletDiscordCommands
               event.reply("That "+this._singular()+" is not watched").setEphemeral(true).queue();
               return;
           }
-          event.reply("Set notes for "+this._singular()).setEphemeral(true).queue();
           watchedEntity.notes = event.getValue("notes").getAsString();
-          this._watchedEntities().save();
+          try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+          catch (IllegalStateException failure)
+          { event.reply("Could not save notes. Reload the entry and retry.").setEphemeral(true).queue(); return; }
+          event.reply("Saved notes.").setEphemeral(true).queue();
       }
 //        @SlashCmd("set-tags")
 //        @Desc("Sets a group's tags")
@@ -1556,45 +1440,19 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            if (entityTags == null)
+            watchedEntity.tags.clear();
+            if (entityTags != null) watchedEntity.tags.addAll(Arrays.stream(entityTags.split("[,;/]")).map(String::trim).filter(t -> !t.isEmpty()).distinct().toArray(String[]::new));
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
             {
-                if (watchedEntity.tags.isEmpty())
-                {
-                    hook.sendMessage("That "+this._singular()+" already has no tags").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Removing "+this._singular()+"'s tags (was `%s`)",
-                            watchedEntity.tags.strings().stream().filter(Objects::nonNull).collect(Collectors.joining("`, `")))
-                        .setEphemeral(true)
-                        .queue();
-                    watchedEntity.tags.clear();
-                }
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
             }
-            else
-            {
-                String[] newTags = Arrays.stream(entityTags.split("[,;/]")).map(String::trim).distinct().toArray(String[]::new);
-                if (watchedEntity.tags.strings().equals(new HashSet<>(Arrays.asList(newTags))))
-                {
-                    hook.sendMessage("That "+this._singular()+" already has those exact tags").setEphemeral(true).queue();
-                    return;
-                }
-                else
-                {
-                    hook.sendMessageFormat("Setting "+this._singular()+" tags to `%s` (was `%s`)",
-                            Arrays.stream(newTags).filter(Objects::nonNull).collect(Collectors.joining("`, `")),
-                            watchedEntity.tags.strings().stream().filter(Objects::nonNull).collect(Collectors.joining("`, `")))
-                        .setEphemeral(true)
-                        .queue();
-                    watchedEntity.tags.clear().addAll(newTags);
-                }
-            }
-            this._watchedEntities().save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //        @SlashCmd("add-tag")
 //        @Desc("Adds a tag for a group")
@@ -1603,29 +1461,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            String entityTag0 = entityTag.trim();
-            if (watchedEntity.tags.isEmpty())
+            watchedEntity.tags.add(entityTag.trim());
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
             {
-                watchedEntity.tags.add(entityTag0);
-                hook.sendMessageFormat("Added tag `%s` (was empty)", entityTag0).setEphemeral(true).queue();
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
+                return;
             }
-            else if (watchedEntity.tags.add(entityTag0))
-            {
-                hook.sendMessageFormat("Added tag `%s` (was `%s`)",
-                        entityTag0,
-                        watchedEntity.tags.strings().stream().filter(Objects::nonNull).collect(Collectors.joining("`, `")))
-                    .setEphemeral(true)
-                    .queue();
-            }
-            else
-            {
-                hook.sendMessage("That "+this._singular()+" already has that tag").setEphemeral(true).queue();
-            }
-            this._watchedEntities().save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
 //        @SlashCmd("remove-tag")
 //        @Desc("Removes a tag from a group")
@@ -1634,25 +1481,18 @@ public class ScarletDiscordCommands
             ScarletWatchedEntities.WatchedEntity watchedEntity = this._watchedEntities().getWatchedEntity(entityId);
             if (watchedEntity == null)
             {
-                hook.sendMessage("That "+this._singular()+" is not watched").setEphemeral(true).queue();
+                hook.sendMessage("That entry is not watched").setEphemeral(true).queue();
                 return;
             }
             this.vrchatEntity(event, entityId);
-            if (watchedEntity.tags.isEmpty())
+            watchedEntity.tags.remove(entityTag);
+            try { this._watchedEntities().updateWatchedEntity(watchedEntity); }
+            catch (IllegalStateException failure)
             {
-                hook.sendMessage("That "+this._singular()+" already has no tags").setEphemeral(true).queue();
+                hook.sendMessage("Could not save the watched entry. Reload it and retry.").setEphemeral(true).queue();
                 return;
             }
-            if (watchedEntity.tags.remove(entityTag))
-            {
-                hook.sendMessageFormat("Removed "+this._singular()+" tag `%s`)", entityTag).setEphemeral(true).queue();
-            }
-            else
-            {
-                hook.sendMessage("That "+this._singular()+" doesn't have that tag").setEphemeral(true).queue();
-                return;
-            }
-            this._watchedEntities().save();
+            hook.sendMessage("Saved watched entry.").setEphemeral(true).queue();
         }
     }
 
@@ -4649,13 +4489,14 @@ public class ScarletDiscordCommands
                 hook.sendMessage("An event schedule with that id already exists").setEphemeral(true).queue();
                 return;
             }
-            OffsetTime eventTime = timeOfDay.atOffset(timeZoneId.getRules().getOffset(Instant.now()));
+            OffsetTime eventTime = timeOfDay.atOffset(timeZoneId.getRules().getOffset(eventDate.atTime(timeOfDay)));
             ScarletCalendar.EventSpec eventSpec = new ScarletCalendar.EventSpec();
             eventSpec.id = eventId;
             eventSpec.vrcCalendarEventParameters.setTitle(eventTitle);
             eventSpec.vrcCalendarEventParameters.setDescription(eventDescription);
             eventSpec.date = eventDate;
             eventSpec.time = eventTime;
+            eventSpec.timeZoneId = timeZoneId.getId();
             eventSpec.duration = eventDuration;
             eventSpec.frequency = eventFrequency;
             eventSpec.vrcCalendarEventParameters.setCategory(eventCategory.value);
@@ -4767,8 +4608,9 @@ public class ScarletDiscordCommands
                 hook.sendMessage("There is no event schedule with that id").setEphemeral(true).queue();
                 return;
             }
-            OffsetTime eventTime = timeOfDay.atOffset(timeZoneId.getRules().getOffset(Instant.now()));
+            OffsetTime eventTime = timeOfDay.atOffset(timeZoneId.getRules().getOffset(eventSpec.date.atTime(timeOfDay)));
             eventSpec.time = eventTime;
+            eventSpec.timeZoneId = timeZoneId.getId();
             if (!this.saveSchedule(hook)) return;
             hook.sendMessage("Set event schedule time").setEphemeral(true).queue();
         }

@@ -45,26 +45,23 @@ final class ScarletTimedBanProcessor
             TimedBan timer = entry.getValue();
             if (timer.groupId == null || !timer.groupId.equals(groupId)) continue;
             if (timer.state != TimedBanState.RETIRED && (!timer.isActiveFor(groupId) || timer.expiresAt > now || timer.nextVerificationAt > now)) continue;
+            if (!pending.claimTimer(timer.recordId)) continue;
             try
             {
-                // Serializes the claim and submission with newer ban reservations,
-                // timer removal, and concurrent expiry sweeps for this store.
-                synchronized (pending)
-                {
-                    if (!groupId.equals(currentGroup.get())) return;
-                    TimedBan actual = pending.getTimedBan(userId);
-                    if (actual == null || !java.util.Objects.equals(timer.recordId, actual.recordId)) continue;
-                    if (actual.state == TimedBanState.RETIRED)
-                        pending.removeTimedBan(userId, actual);
-                    else if (actual.isActiveFor(groupId))
-                        processOne(pending, currentGroup, membership, continuity, unban, groupId, userId, actual);
-                }
+                if (!groupId.equals(currentGroup.get())) return;
+                TimedBan actual = pending.getTimedBan(userId);
+                if (actual == null || !java.util.Objects.equals(timer.recordId, actual.recordId)) continue;
+                if (actual.state == TimedBanState.RETIRED)
+                    pending.removeTimedBan(userId, actual);
+                else if (actual.isActiveFor(groupId))
+                    processOne(pending, currentGroup, membership, continuity, unban, groupId, userId, actual);
             }
             catch (RuntimeException ex)
             {
                 // A failed save/lookup must not terminate the scheduled executor's future sweeps.
                 LOG.warn("Timed-ban processing failed for {}; its durable state requires retry or operator review", userId, ex);
             }
+            finally { pending.releaseTimer(timer.recordId); }
         }
     }
 
@@ -97,6 +94,10 @@ final class ScarletTimedBanProcessor
         }
 
         ScarletTimedBanContinuity.Proof proof = continuity.check(groupId, userId, timer);
+        PendingReservation reservation;
+        // Only local validation and write-ahead state hold the store monitor.
+        synchronized (pending)
+        {
         TimedBan fresh = pending.getTimedBan(userId);
         if (!groupId.equals(currentGroup.get()) || fresh == null || !fresh.isActiveFor(groupId)
             || !java.util.Objects.equals(timer.recordId, fresh.recordId)) return;
@@ -114,13 +115,14 @@ final class ScarletTimedBanProcessor
             return;
         }
 
-        PendingReservation reservation = pending.reservePending(GroupAuditType.USER_UNBAN, userId, timer.actorUserId, groupId);
+        reservation = pending.reservePending(GroupAuditType.USER_UNBAN, userId, timer.actorUserId, groupId);
         if (reservation == null) return;
         if (!groupId.equals(currentGroup.get()) || !pending.beginTimedUnban(userId, timer))
         {
             pending.releasePending(reservation);
             LOG.warn("Cannot safely persist or authorize the timed unban for {}; no unban was sent", userId);
             return;
+        }
         }
 
         GroupModerationResult result;

@@ -23,8 +23,8 @@ import net.sybyline.scarlet.log.ScarletLogger;
  * <ul>
  *   <li>The Scarlet log file written by the current session is never deleted.</li>
  *   <li>The VRChat output_log file currently being tailed is never deleted.</li>
- *   <li>If Scarlet appears to be actively in use (a VRChat log is being tailed
- *       or an instance is loaded) when files are due, a dismissible popup is
+ *   <li>If a VRChat client is running, log entries arrived recently, or client
+ *       state cannot be verified when files are due, a dismissible popup is
  *       shown and the actual deletion is deferred until the next idle check
  *       rather than proceeding immediately.</li>
  *   <li>Cleanup runs at startup (after login) and then every 6 hours on the
@@ -224,23 +224,20 @@ public class ScarletCacheCleanup
      * Returns true if Scarlet is actively doing something that makes it unsafe
      * to delete files mid-operation.
      *
-     * "Active" means any of:
-     *   - A VRChat output log file is currently being tailed (VRChat is running
-     *     and Scarlet is processing log lines from it)
-     *   - At least one player is currently shown in the instance table
-     *     (an active instance session is in progress)
+     * Live clients, recent log activity and unknown process state defer cleanup.
+     * A remembered log filename or a historical roster alone does not.
      */
     private boolean isActivelyInUse()
     {
-        // VRChat log is being actively tailed
-        if (this.scarlet.logs.currentTarget() != null)
-            return true;
+        return activeForCleanup(System.currentTimeMillis(), this.scarlet.logs.lastEntryMillis(),
+            ScarletTailerHealth.captureClients(ScarletUI.findVRChatPids()));
+    }
 
-        // At least one player is present in the instance table
-        if (this.scarlet.ui.hasActivePlayers())
-            return true;
-
-        return false;
+    static boolean activeForCleanup(long now, long lastEntry, ScarletTailerHealth.Clients clients)
+    {
+        // Unknown process state defers deletion. A remembered file or roster is not activity.
+        return clients == null || !clients.identities.isEmpty()
+            || (lastEntry > 0L && (now < lastEntry || now - lastEntry < TimeUnit.MINUTES.toMillis(5)));
     }
 
     /**

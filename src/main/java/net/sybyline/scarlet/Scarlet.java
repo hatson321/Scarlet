@@ -1053,6 +1053,7 @@ public class Scarlet implements Closeable
 
     public Scarlet() throws IOException
     {
+        this.settings.finishDefaultBatch();
     }
 
     {
@@ -2172,7 +2173,9 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         try
         {
             ServerSocket ipcServer = createIpcServer();
-            ScarletIpcLifecycle.WakeAccept wake = Platform.CURRENT.isNT() ? null : () -> {
+            ScarletIpcLifecycle.WakeAccept wake = Platform.CURRENT.isNT() ? () -> {
+                try (Socket emptyWake = new org.scalasbt.ipcsocket.Win32NamedPipeSocket("\\\\.\\pipe\\ScarletIPC-"+this.vrc.groupId, false)) { }
+            } : () -> {
                 try (Socket emptyWake = new UnixDomainSocket("/tmp/ScarletIPC-"+this.vrc.groupId+".sock", false)) { }
             };
             if (!this.ipcLifecycle.publishServer(ipcServer, wake)) return;
@@ -2186,8 +2189,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
                     Socket socket = null;
                     try
                     {
-                        socket = ipcServer.accept();
-                        if (!this.ipcLifecycle.publishClient(socket)) break;
+                        socket = this.ipcLifecycle.accept(ipcServer);
                         if (!this.running) break;
                         byte[] commandBytes = this.ipcLifecycle.readCommandBytes(socket, 65536);
                         if (commandBytes == null || !this.running) break;
@@ -2337,7 +2339,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
         {
             if (Files.isRegularFile(tokenPath))
             {
-                return new String(Files.readAllBytes(tokenPath), StandardCharsets.UTF_8).trim();
+                return new String(ScarletPrivateFiles.readSecret(tokenPath), StandardCharsets.UTF_8).trim();
             }
             byte[] bytes = new byte[24];
             new java.security.SecureRandom().nextBytes(bytes);
@@ -2348,7 +2350,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             }
             catch (FileAlreadyExistsException ignored)
             {
-                return new String(Files.readAllBytes(tokenPath), StandardCharsets.UTF_8).trim();
+                return new String(ScarletPrivateFiles.readSecret(tokenPath), StandardCharsets.UTF_8).trim();
             }
             return token;
         }
@@ -2360,20 +2362,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
 
     private static void writeOwnerOnlyNewFile(Path path, byte[] bytes) throws IOException
     {
-        try
-        {
-            FileAttribute<Set<PosixFilePermission>> attr = PosixFilePermissions.asFileAttribute(EnumSet.of(
-                PosixFilePermission.OWNER_READ,
-                PosixFilePermission.OWNER_WRITE));
-            try (SeekableByteChannel channel = Files.newByteChannel(path, EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), attr))
-            {
-                channel.write(ByteBuffer.wrap(bytes));
-            }
-        }
-        catch (UnsupportedOperationException ex)
-        {
-            Files.write(path, bytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
-        }
+        ScarletPrivateFiles.writeSecret(path, bytes);
     }
 
     void rawCommandFromIpc(String line)
@@ -3404,13 +3393,7 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             return;
         }
         String botLocation = this.eventListener == null ? null : this.eventListener.clientLocation;
-        String newInstance = null;
-        for (String loc : current)
-        {
-            if (this.knownGroupInstanceLocations.contains(loc) || loc.equals(botLocation))
-                continue;
-            newInstance = loc; // act on one new instance per cycle
-        }
+        String newInstance = selectNewInstance(current, this.knownGroupInstanceLocations, botLocation);
         // Record everything currently open (so each fires at most once) and prune closed ones.
         this.knownGroupInstanceLocations.addAll(current);
         this.knownGroupInstanceLocations.retainAll(current);
@@ -3421,6 +3404,13 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
             // Nudge the audit poll so the Discord instance embed/thread still posts promptly.
             this.pollAuditSoon();
         }
+    }
+
+    static String selectNewInstance(java.util.Set<String> current, java.util.Set<String> known, String botLocation)
+    {
+        // This poll has no creation timestamps. Use a stable tie-break without extra API calls.
+        return current.stream().filter(location -> !known.contains(location) && !location.equals(botLocation))
+            .min(String::compareTo).orElse(null);
     }
 
     void maybeCheckInstances()

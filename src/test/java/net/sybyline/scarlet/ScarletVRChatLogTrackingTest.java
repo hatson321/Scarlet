@@ -794,6 +794,7 @@ class ScarletVRChatLogTrackingTest
                 tail.on_eof();
                 assertFalse(tail.trackingValid);
             }
+            assertTrue(net.sybyline.scarlet.log.ScarletLogger.awaitConsoleIdle(2000), "Drain the asynchronous diagnostic before inspecting captured output");
         }
         finally
         {

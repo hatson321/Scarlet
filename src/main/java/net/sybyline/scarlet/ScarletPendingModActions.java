@@ -53,6 +53,10 @@ public class ScarletPendingModActions
     // Only this process knows a confirmed remote result after its following save failed.
     // After a restart the durable PREPARING/UNBAN_SUBMITTED record stays quarantined.
     private final Map<String, TimedBan> timedBanWriteRetries;
+    private final java.util.Set<String> processingTimers = new java.util.HashSet<>();
+
+    synchronized boolean claimTimer(String recordId) { return recordId != null && this.processingTimers.add(recordId); }
+    synchronized void releaseTimer(String recordId) { this.processingTimers.remove(recordId); }
 
     public static class DataSpec
     {
@@ -136,6 +140,7 @@ public class ScarletPendingModActions
         public String discordGuildId;
         public String description;
         public String[] tags;
+        public String token;
     }
 
     public synchronized boolean hasPending(GroupAuditType type, String targetUserId)
@@ -313,19 +318,25 @@ public class ScarletPendingModActions
         String vrchatGroupId, String discordGuildId)
     {
         BanInfo info = new BanInfo();
+        info.token = UUID.randomUUID().toString();
         info.ownerSnowflake = ownerSnowflake;
         info.actorUserId = actorUserId;
         info.vrchatGroupId = vrchatGroupId;
         info.discordGuildId = discordGuildId;
         if (this.pendingBanInfo.putIfAbsent(targetUserId, info) != null)
             return false;
-        this.save();
+        if (!this.save())
+        {
+            this.pendingBanInfo.remove(targetUserId, info);
+            throw new IllegalStateException("Could not save pending ban; no changes were retained");
+        }
         return true;
     }
 
     /** Snapshot the original requester/context without exposing mutable pending state. */
     public synchronized BanInfo getBanInfo(String targetUserId)
     {
+        if (this.loadFailed) throw new IllegalStateException("Pending ban storage is unavailable");
         BanInfo info = this.pendingBanInfo.get(targetUserId);
         if (info == null) return null;
         BanInfo copy = new BanInfo();
@@ -335,6 +346,7 @@ public class ScarletPendingModActions
         copy.discordGuildId = info.discordGuildId;
         copy.description = info.description;
         copy.tags = info.tags == null ? null : info.tags.clone();
+        copy.token = info.token;
         return copy;
     }
 
@@ -351,8 +363,15 @@ public class ScarletPendingModActions
         BanInfo info = this.pendingBanInfo.get(targetUserId);
         if (info == null)
             return false;
-        info.tags = tags;
-        this.save();
+        String[] previous = info.tags;
+        String token = info.token;
+        info.tags = tags == null ? null : tags.clone();
+        info.token = UUID.randomUUID().toString();
+        if (!this.save())
+        {
+            info.tags = previous; info.token = token;
+            throw new IllegalStateException("Could not save pending ban tags; no changes were retained");
+        }
         return true;
     }
 
@@ -361,17 +380,36 @@ public class ScarletPendingModActions
         BanInfo info = this.pendingBanInfo.get(targetUserId);
         if (info == null)
             return false;
+        String previous = info.description, token = info.token;
         info.description = description;
-        this.save();
+        info.token = UUID.randomUUID().toString();
+        if (!this.save())
+        {
+            info.description = previous; info.token = token;
+            throw new IllegalStateException("Could not save pending ban description; no changes were retained");
+        }
         return true;
     }
 
     public synchronized BanInfo pollBanInfo(String targetUserId)
     {
-        BanInfo info = this.pendingBanInfo.remove(targetUserId);
-        if (info != null)
-            this.save();
+        BanInfo info = this.getBanInfo(targetUserId);
+        if (info != null) this.acknowledgeBanInfo(targetUserId, info.token);
         return info;
+    }
+
+    /** Remove only the exact revision already owned by a durable audit receipt. */
+    public synchronized boolean acknowledgeBanInfo(String targetUserId, String token)
+    {
+        BanInfo info = this.pendingBanInfo.get(targetUserId);
+        if (info == null || token == null || !token.equals(info.token)) return false;
+        this.pendingBanInfo.remove(targetUserId);
+        if (!this.save())
+        {
+            this.pendingBanInfo.put(targetUserId, info);
+            throw new IllegalStateException("Could not save pending ban acknowledgement; retained for retry");
+        }
+        return true;
     }
 
     /** Compatibility import only. Unbound legacy timers are retained for operator review. */
@@ -676,6 +714,14 @@ public class ScarletPendingModActions
         if (spec != null && spec.pendingBanInfo != null && !spec.pendingBanInfo.isEmpty())
         {
             this.pendingBanInfo.putAll(spec.pendingBanInfo);
+            for (BanInfo info : this.pendingBanInfo.values())
+            {
+                if (info.token == null || info.token.isEmpty())
+                {
+                    info.token = UUID.randomUUID().toString();
+                    migrated = true;
+                }
+            }
         }
         this.timedBans.clear();
         this.timedBanWriteRetries.clear();

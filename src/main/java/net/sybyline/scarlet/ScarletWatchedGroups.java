@@ -45,10 +45,13 @@ public class ScarletWatchedGroups
     final File watchedGroupsFile;
     Map<String, WatchedGroup> watchedGroups;
     private boolean loadFailed;
+    private String committed = "[]";
+    private long revision;
 
     public static class WatchedGroup implements Comparable<WatchedGroup>
     {
         public String id;
+        private transient long revision;
         public Type type = Type.UNKNOWN;
         public static enum Type implements DEnum.DEnumString<Type>
         {
@@ -200,14 +203,14 @@ public class ScarletWatchedGroups
         return this.importWatchedGroups(importedWatchedGroups, overwrite);
     }
 
-    public boolean exportJson(Writer writer) throws IOException
+    public synchronized boolean exportJson(Writer writer) throws IOException
     {
         WatchedGroup[] watchedGroupsArray = this.watchedGroups.values().toArray(new WatchedGroup[0]);
         Scarlet.GSON_PRETTY.toJson(watchedGroupsArray, WatchedGroup[].class, writer);
         return true;
     }
 
-    public boolean importWatchedGroups(List<WatchedGroup> importedWatchedGroups, boolean overwrite)
+    public synchronized boolean importWatchedGroups(List<WatchedGroup> importedWatchedGroups, boolean overwrite)
     {
         for (WatchedGroup watchedGroup : importedWatchedGroups)
         {
@@ -215,37 +218,39 @@ public class ScarletWatchedGroups
             {
                 if (overwrite)
                 {
-                    this.watchedGroups.put(watchedGroup.id, watchedGroup);
+                    this.watchedGroups.put(watchedGroup.id, copy(watchedGroup));
                 }
                 else
                 {
-                    this.watchedGroups.putIfAbsent(watchedGroup.id, watchedGroup);
+                    this.watchedGroups.putIfAbsent(watchedGroup.id, copy(watchedGroup));
                 }
             }
         }
-        this.save();
+        this.saveOrThrow();
         return true;
     }
 
-    public WatchedGroup getWatchedGroup(String groupId)
+    public synchronized WatchedGroup getWatchedGroup(String groupId)
     {
-        return this.watchedGroups.get(groupId);
+        WatchedGroup copy = copy(this.watchedGroups.get(groupId));
+        if (copy != null) copy.revision = this.revision;
+        return copy;
     }
 
-    public boolean addWatchedGroup(String groupId, WatchedGroup watchedGroup)
+    public synchronized boolean addWatchedGroup(String groupId, WatchedGroup watchedGroup)
     {
         if (watchedGroup == null)
             return false;
-        this.watchedGroups.put(groupId, watchedGroup);
-        this.save();
+        this.watchedGroups.put(groupId, copy(watchedGroup));
+        this.saveOrThrow();
         return true;
     }
 
-    public boolean removeWatchedGroup(String groupId)
+    public synchronized boolean removeWatchedGroup(String groupId)
     {
         if (this.watchedGroups.remove(groupId) == null)
             return false;
-        this.save();
+        this.saveOrThrow();
         return true;
     }
 
@@ -278,9 +283,11 @@ public class ScarletWatchedGroups
         if (watchedGroupsArray != null)
         for (WatchedGroup watchedGroup : watchedGroupsArray)
             if (watchedGroup != null && watchedGroup.id != null && watchedGroup.id.startsWith("grp_"))
-                watchedGroups.put(watchedGroup.id, watchedGroup);
+                watchedGroups.put(watchedGroup.id, copy(watchedGroup));
         this.watchedGroups = watchedGroups;
         this.loadFailed = false;
+        this.committed = Scarlet.GSON_PRETTY.toJson(this.watchedGroups.values());
+        this.revision++;
         return true;
     }
 
@@ -289,6 +296,7 @@ public class ScarletWatchedGroups
         if (this.loadFailed)
         {
             LOG.error("Watched groups storage was not loaded; refusing to overwrite the original data");
+            this.restoreCommitted();
             return false;
         }
         WatchedGroup[] watchedGroupsArray = this.watchedGroups.values().toArray(new WatchedGroup[0]);
@@ -300,9 +308,37 @@ public class ScarletWatchedGroups
         catch (Exception ex)
         {
             LOG.error("Exception saving watched groups", ex);
+            this.restoreCommitted();
             return false;
         }
+        this.committed = Scarlet.GSON_PRETTY.toJson(this.watchedGroups.values());
+        this.revision++;
         return true;
+    }
+
+    private static WatchedGroup copy(WatchedGroup value)
+    {
+        return value == null ? null : Scarlet.GSON_PRETTY.fromJson(Scarlet.GSON_PRETTY.toJson(value), WatchedGroup.class);
+    }
+
+    private void restoreCommitted()
+    {
+        Map<String, WatchedGroup> restored = new ConcurrentHashMap<>();
+        for (WatchedGroup value : Scarlet.GSON_PRETTY.fromJson(this.committed, WatchedGroup[].class)) restored.put(value.id, value);
+        this.watchedGroups = restored;
+    }
+
+    public synchronized void saveOrThrow()
+    {
+        if (!this.save()) { this.restoreCommitted(); throw new IllegalStateException("Could not save watched list; changes were rolled back"); }
+    }
+
+    public synchronized void updateWatchedGroup(WatchedGroup value)
+    {
+        if (value == null || value.revision != this.revision || !this.watchedGroups.containsKey(value.id))
+            throw new IllegalStateException("Watched list changed; reload and retry");
+        this.watchedGroups.put(value.id, copy(value));
+        this.saveOrThrow();
     }
 
     /** Number of watched groups whose advisory is currently showing a translation. */
@@ -326,11 +362,18 @@ public class ScarletWatchedGroups
      */
     public int translateAdvisories(String endpoint, String apiKey, String targetLang) throws IOException
     {
+        final Map<String, WatchedGroup> candidates = new java.util.HashMap<>();
+        final long expectedRevision;
+        synchronized (this)
+        {
+            expectedRevision = this.revision;
+            this.watchedGroups.forEach((id, value) -> candidates.put(id, copy(value)));
+        }
         int changed = 0;
         IOException failure = null;
         try
         {
-            for (WatchedGroup g : this.watchedGroups.values())
+            for (WatchedGroup g : candidates.values())
             {
                 boolean any = false;
                 String srcMsg = g.messageOriginal != null ? g.messageOriginal : g.message;
@@ -366,8 +409,12 @@ public class ScarletWatchedGroups
         {
             failure = ex;
         }
-        if (changed > 0)
-            this.save();
+        if (changed > 0) synchronized (this)
+        {
+            if (this.revision != expectedRevision) throw new IOException("Watched list changed during translation; retry");
+            this.watchedGroups = new ConcurrentHashMap<>(candidates);
+            this.saveOrThrow();
+        }
         if (failure != null)
             throw failure;
         return changed;
@@ -377,7 +424,7 @@ public class ScarletWatchedGroups
      * Restores the original (pre-translation) advisory text for every watched group, dropping the
      * translation. Saves once if anything changed. Returns the number of groups restored.
      */
-    public int restoreAdvisories()
+    public synchronized int restoreAdvisories()
     {
         int restored = 0;
         for (WatchedGroup g : this.watchedGroups.values())
@@ -389,7 +436,7 @@ public class ScarletWatchedGroups
             if (any) restored++;
         }
         if (restored > 0)
-            this.save();
+            this.saveOrThrow();
         return restored;
     }
 

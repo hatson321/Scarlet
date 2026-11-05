@@ -13,6 +13,40 @@ class FileBackupsTest
 {
     @TempDir Path directory;
 
+    @Test void identicalClockValuesKeepDistinctBackupsAndPruneOldest() throws Exception
+    {
+        Path file = directory.resolve("rapid.json");
+        java.time.LocalDateTime fixed = java.time.LocalDateTime.of(2026, 1, 1, 12, 0);
+        for (int i = 0; i < 15; i++)
+        {
+            Files.writeString(file, "version-" + i);
+            FileBackups.backup(file.toFile(), 10, fixed);
+            // Coarse filesystem clocks must not make a reused, pruned suffix look older.
+            for (java.io.File saved : FileBackups.backupsNewestFirst(file.toFile()))
+                Files.setLastModifiedTime(saved.toPath(), java.nio.file.attribute.FileTime.fromMillis(1));
+        }
+        java.io.File[] backups = FileBackups.backupsNewestFirst(file.toFile());
+        assertEquals(10, backups.length);
+        for (int i = 0; i < 10; i++) assertEquals("version-" + (14 - i), Files.readString(backups[i].toPath()));
+        assertEquals("version-14", Files.readString(file));
+    }
+
+    @Test void concurrentSameClockBackupCreationNeverOverwrites() throws Exception
+    {
+        Path file = directory.resolve("shared.json"); Files.writeString(file, "preserved");
+        java.time.LocalDateTime fixed = java.time.LocalDateTime.of(2026, 1, 1, 12, 0);
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(4);
+        try
+        {
+            java.util.List<java.util.concurrent.Future<?>> work = new java.util.ArrayList<>();
+            for (int i = 0; i < 12; i++) work.add(executor.submit(() -> FileBackups.backup(file.toFile(), 20, fixed)));
+            for (java.util.concurrent.Future<?> item : work) item.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(12, FileBackups.backupsNewestFirst(file.toFile()).length);
+            for (java.io.File saved : FileBackups.backupsNewestFirst(file.toFile())) assertEquals("preserved", Files.readString(saved.toPath()));
+        }
+        finally { executor.shutdownNow(); }
+    }
+
     @Test void serializationFailurePreservesPreviousContent() throws Exception
     {
         Path file = directory.resolve("settings.json");

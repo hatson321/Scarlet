@@ -65,9 +65,9 @@ public class ScarletUISplash implements IScarletUISplash
 
     final Scarlet scarlet;
 
-    JWindow splash        = new JWindow();
-    JLabel  splashText    = new JLabel(net.sybyline.scarlet.util.I18n.tr("splash.loading"), SwingConstants.CENTER);
-    JLabel  splashSubtext = new JLabel("",           SwingConstants.CENTER);
+    JWindow splash;
+    JLabel splashText;
+    JLabel splashSubtext;
     Timer   dotTimer;
 
     // ── Feedback popup ─────────────────────────────────────────────────────────
@@ -75,6 +75,11 @@ public class ScarletUISplash implements IScarletUISplash
     public void queueFeedbackPopup(Component component, long durationMillis,
                                    String text, String subtext,
                                    Color textcolor, Color subtextcolor)
+    {
+        SwingUtilities.invokeLater(() -> this.showFeedbackPopup(component, durationMillis, text, subtext, textcolor, subtextcolor));
+    }
+
+    private void showFeedbackPopup(Component component, long durationMillis, String text, String subtext, Color textcolor, Color subtextcolor)
     {
         if (component == null)
         {
@@ -144,11 +149,8 @@ public class ScarletUISplash implements IScarletUISplash
         root.add(textPanel, BorderLayout.CENTER);
 
         JWindow feedback = new JWindow();
-        this.scarlet.exec.schedule(() ->
-        {
-            feedback.setVisible(false);
-            feedback.dispose();
-        }, durationMillis, TimeUnit.MILLISECONDS);
+        Timer dismiss = new Timer((int)durationMillis, event -> { feedback.setVisible(false); feedback.dispose(); });
+        dismiss.setRepeats(false); dismiss.start();
 
         feedback.setBackground(new Color(0, 0, 0, 0));
         feedback.setContentPane(root);
@@ -163,6 +165,9 @@ public class ScarletUISplash implements IScarletUISplash
 
     private void buildSplash()
     {
+        this.splash = new JWindow();
+        this.splashText = new JLabel(net.sybyline.scarlet.util.I18n.tr("splash.loading"), SwingConstants.CENTER);
+        this.splashSubtext = new JLabel("", SwingConstants.CENTER);
         // Logo is 1024×1024 — display it square so it is never stretched
         final int LOGO_SIZE = 300;  // px — fits comfortably in a 420-wide window
         final int W         = 420;
@@ -331,7 +336,12 @@ public class ScarletUISplash implements IScarletUISplash
     // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     @Override
-    public synchronized void close()
+    public void close()
+    {
+        Swing.invokeWait(this::closeOnEdt);
+    }
+
+    private void closeOnEdt()
     {
         JWindow s = this.splash;
         if (s == null)

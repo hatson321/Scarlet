@@ -162,13 +162,14 @@ public class VersionedFile
         
         OTHER(),
         ;
-        static final Pattern filename = Pattern.compile("(?<topic>\\S+(?:\\s+\\S+))\\Q - \\E(?<name>\\S+(?:\\s+\\S+))\\Q - \\E(?<type>\\S+(?:\\s+\\S+))\\Q - \\E(?<unity>(?<version>\\d+\\Q.\\E\\d\\\\Q.\\E\\d+\\Qf)\\E\\d\\Q_\\E\\d\\Q_\\E(?<platform>\\w+)\\Q_\\E(?<build>\\w+))");
+        static final Pattern filename = Pattern.compile("(?<topic>World|Prop|Avatar) - (?<name>.+?) - (?<type>Asset bundle|Image) - (?<unity>(?<version>\\d+\\.\\d+\\.\\d+f\\d+)_\\d+_\\d+_(?<platform>\\w+)_(?<build>\\w+))");
         public static Kind of(ModelFile file)
         {
-            String ext = file.getExtension(),
-                   name = file.getName();
+            if (file == null) return OTHER;
+            String ext = file.getExtension() == null ? "" : file.getExtension(),
+                   name = file.getName() == null ? "" : file.getName();
             MIMEType mime = file.getMimeType();
-            List<String> tags = file.getTags();
+            List<String> tags = file.getTags() == null ? java.util.Collections.emptyList() : file.getTags();
             switch (ext)
             {
             case ".vrcw": return WORLD;
@@ -176,7 +177,7 @@ public class VersionedFile
             case ".vrca": return AVATAR;
             default: break; // fall through
             }
-            switch (mime)
+            if (mime != null) switch (mime)
             {
             case APPLICATION_X_WORLD: return WORLD;
             case APPLICATION_X_PROP: return PROP;

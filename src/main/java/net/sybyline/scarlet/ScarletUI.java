@@ -169,13 +169,13 @@ public class ScarletUI implements IScarletUI
 
     public void jframe(Consumer<JFrame> edit)
     {
-        edit.accept(this.jframe);
+        Swing.invokeWait(() -> edit.accept(this.jframe));
     }
 
     @Override
     public void showMainWindow()
     {
-        this.jframe.setVisible(true);
+        Swing.invokeLater(() -> this.jframe.setVisible(true));
     }
     @Override
     public java.awt.Component getParentComponent()
@@ -244,7 +244,7 @@ public class ScarletUI implements IScarletUI
             this.updatePending(id, player);
             if (visible && !initialPreamble)
             {
-                this.propstable.updateEntry(player);
+                this.updateStatusBar();
             }
         }
         else
@@ -267,19 +267,11 @@ public class ScarletUI implements IScarletUI
             map.put(id, player);
             if (visible)
             {
-                if (initialPreamble)
-                {
-                    this.propstable.addEntrySilently(player);
-                }
-                else
-                {
-                    this.propstable.addEntry(player);
-                }
+                this.updateStatusBar();
             }
         }
         if (visible && !initialPreamble)
         {
-            this.fireSort();
             this.updateStatusBar();
         }
     }
@@ -304,8 +296,7 @@ public class ScarletUI implements IScarletUI
         player.setBaseAdvisory(advisory, textColor, priority);
         if (map == this.connectedPlayers)
         {
-            this.propstable.updateEntry(player);
-            this.fireSort();
+            this.updateStatusBar();
         }
     }
 
@@ -325,11 +316,7 @@ public class ScarletUI implements IScarletUI
         update.invoke(player);
         if (visible)
         {
-            this.propstable.updateEntry(player);
-            if (!initialPreamble)
-            {
-                this.fireSort();
-            }
+            this.updateStatusBar();
         }
     }
 
@@ -345,7 +332,7 @@ public class ScarletUI implements IScarletUI
             this.updatePending(id, player);
             if (visible && !initialPreamble)
             {
-                this.propstable.updateEntry(player);
+                this.updateStatusBar();
             }
         }
         else
@@ -358,19 +345,11 @@ public class ScarletUI implements IScarletUI
             map.put(id, player);
             if (visible)
             {
-                if (initialPreamble)
-                {
-                    this.propstable.addEntrySilently(player);
-                }
-                else
-                {
-                    this.propstable.addEntry(player);
-                }
+                this.updateStatusBar();
             }
         }
         if (visible && !initialPreamble)
         {
-            this.fireSort();
             this.updateStatusBar();
         }
     }
@@ -402,7 +381,6 @@ public class ScarletUI implements IScarletUI
             this.pendingUpdates.keySet().removeIf(ScarletUI::isTrainingId);
         else
             this.pendingUpdates.clear();
-        this.propstable.clearEntries();
         this.updateStatusBar();
     }
 
@@ -413,7 +391,7 @@ public class ScarletUI implements IScarletUI
             if (player.left == null)
                 return false;
             this.pendingUpdates.remove(player.id);
-            this.propstable.removeEntrySilently(player);
+
             return true;
         });
         this.fireSort();
@@ -438,7 +416,6 @@ public class ScarletUI implements IScarletUI
 
     public synchronized void fireSort()
     {
-        this.propstable.sortEntries(COMPARE);
         this.updateStatusBar();
     }
 
@@ -477,21 +454,36 @@ public class ScarletUI implements IScarletUI
         return location == null ? "ui.statusNoInstance" : "ui.statusWaitingForPlayers";
     }
 
-    private void updateStatusBar()
+    private boolean rosterRefreshQueued;
+    private boolean uiClosed;
+
+    private synchronized void updateStatusBar()
     {
-        long present = this.connectedPlayers.values().stream().filter(p -> p.left == null).count();
-        long total   = this.connectedPlayers.size();
-        boolean training = this.trainingView;
-        String emptyStatus = emptyPlayerListStatusKey(this.observedInstanceLocation);
-        Swing.invokeLater(() ->
+        if (this.rosterRefreshQueued || this.uiClosed) return;
+        this.rosterRefreshQueued = true;
+        SwingUtilities.invokeLater(this::refreshRoster);
+    }
+
+    private synchronized void refreshRoster()
+    {
+        this.rosterRefreshQueued = false;
+        if (this.uiClosed) return;
+        // Read current state at dispatch, so queued work cannot restore a cleared session.
+        List<ConnectedPlayer> snapshot = new ArrayList<>(this.connectedPlayers.size());
+        long present = 0;
+        for (ConnectedPlayer player : this.connectedPlayers.values())
         {
-            String text = total == 0
-                ? " " + I18n.tr(training ? "ui.statusNoPlayers" : emptyStatus)
-                : I18n.tr("ui.statusBar", present, total - present, total);
-            if (training)
-                text = " " + I18n.tr("sim.statusTag") + text;
-            this.jlabel_status.setText(text);
-        });
+            snapshot.add(player.snapshot());
+            if (player.left == null) present++;
+        }
+        snapshot.sort(COMPARE);
+        this.propstable.replaceEntries(snapshot);
+        long total = snapshot.size();
+        String text = total == 0
+            ? " " + I18n.tr(this.trainingView ? "ui.statusNoPlayers" : emptyPlayerListStatusKey(this.observedInstanceLocation))
+            : I18n.tr("ui.statusBar", present, total - present, total);
+        if (this.trainingView) text = " " + I18n.tr("sim.statusTag") + text;
+        this.jlabel_status.setText(text);
     }
 
     static String joinAdvisoryParts(String first, String second)
@@ -548,7 +540,7 @@ public class ScarletUI implements IScarletUI
         this.parkedPlayers.clear();
         this.parkedPlayers.putAll(this.connectedPlayers);
         this.connectedPlayers.clear();
-        this.propstable.clearEntries();
+        this.updateStatusBar();
         this.trainingView = true;
         this.updateStatusBar();
     }
@@ -560,11 +552,10 @@ public class ScarletUI implements IScarletUI
             return;
         this.trainingView = false;
         this.connectedPlayers.clear();
-        this.propstable.clearEntries();
+        this.updateStatusBar();
         this.connectedPlayers.putAll(this.parkedPlayers);
         this.parkedPlayers.clear();
-        for (ConnectedPlayer player : this.connectedPlayers.values())
-            this.propstable.addEntry(player);
+
         this.fireSort();
         this.updateStatusBar();
     }
@@ -694,6 +685,33 @@ public class ScarletUI implements IScarletUI
         TrustRank trustRank;
         String pronouns;
         boolean pronounsFlagged;
+
+        ConnectedPlayer snapshot()
+        {
+            ConnectedPlayer copy = new ConnectedPlayer();
+            copy.name = this.name;
+            copy.id = this.id;
+            copy.avatarName = this.avatarName;
+            copy.avatarInfo = this.avatarInfo;
+            copy.avatarInfoNote = this.avatarInfoNote;
+            copy.acctdays = this.acctdays;
+            copy.joined = this.joined;
+            copy.left = this.left;
+            copy.advisory = this.advisory;
+            copy.baseAdvisory = this.baseAdvisory;
+            copy.avatarAdvisory = this.avatarAdvisory;
+            copy.text_color = this.text_color;
+            copy.baseTextColor = this.baseTextColor;
+            copy.avatarTextColor = this.avatarTextColor;
+            copy.priority = this.priority;
+            copy.basePriority = this.basePriority;
+            copy.avatarPriority = this.avatarPriority;
+            copy.ageVerificationStatus = this.ageVerificationStatus;
+            copy.trustRank = this.trustRank;
+            copy.pronouns = this.pronouns;
+            copy.pronounsFlagged = this.pronounsFlagged;
+            return copy;
+        }
 
         void setBaseAdvisory(String advisory, Color textColor, int priority)
         {
@@ -3505,7 +3523,8 @@ public class ScarletUI implements IScarletUI
         {
             LOG.info("Skipping UI settings save after migration bundle import");
         }
-        this.jframe.dispose();
+        synchronized (this) { this.uiClosed = true; }
+        Swing.invokeLater(this.jframe::dispose);
     }
 
     /** IDs that belong to each settings section, in display order. */

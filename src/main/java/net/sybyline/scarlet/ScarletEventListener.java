@@ -204,6 +204,12 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
             && visit == this.playerVisits.get(userId) && this.isPlayerPresent(userId);
     }
 
+    public BooleanSupplier currentSpeechSession()
+    {
+        long session = this.lookupSession.get();
+        return () -> session == this.lookupSession.get();
+    }
+
     private BooleanSupplier currentAvatar(String name, String userId, String avatarName)
     {
         BooleanSupplier visit = this.currentVisit(userId);

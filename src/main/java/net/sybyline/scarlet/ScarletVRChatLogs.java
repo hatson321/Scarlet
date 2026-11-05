@@ -485,24 +485,21 @@ public class ScarletVRChatLogs implements Closeable
 
     private static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("uuuu-MM-dd_HH-mm-ss")
         .withResolverStyle(java.time.format.ResolverStyle.STRICT);
+    private static final Pattern LOG_FILE_NAME = Pattern.compile("output_log_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}\\.txt");
     File logDirectory() { return VrcAppData.DIR; }
     File locateTarget()
     {
-        File[] files = this.logDirectory().listFiles();
+        File[] files = this.logDirectory().listFiles((directory, name) -> LOG_FILE_NAME.matcher(name).matches());
         if (files == null) throw new IllegalStateException("VRChat log directory cannot be enumerated");
-        File newest = null;
-        LocalDateTime latest = null;
+        // Canonical fixed-width timestamps sort chronologically. Parse/stat only the
+        // newest candidates; retain polling so missed notifications cannot hide a new log.
+        java.util.Arrays.sort(files, java.util.Comparator.comparing(File::getName).reversed());
         for (File file : files)
         {
-            if (!file.isFile()) continue;
             LocalDateTime timestamp = startupFileTime(file);
-            if (timestamp != null && (latest == null || timestamp.isAfter(latest)))
-            {
-                newest = file;
-                latest = timestamp;
-            }
+            if (timestamp != null && file.isFile()) return file;
         }
-        return newest;
+        return null;
     }
 
     static final Pattern entry = Pattern.compile("\\A(?<ldt>\\d{4}\\.\\d{2}\\.\\d{2}\\s\\d{2}:\\d{2}:\\d{2})\\s(?<lvl>\\w+)\\s+-\\s\\s(?<txt>.+)\\z");
@@ -511,7 +508,7 @@ public class ScarletVRChatLogs implements Closeable
     static LocalDateTime startupFileTime(File file)
     {
         String name = file.getName();
-        if (!name.matches("output_log_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}\\.txt")) return null;
+        if (!LOG_FILE_NAME.matcher(name).matches()) return null;
         try { return LocalDateTime.parse(name.substring(11, 30), dtf); }
         catch (java.time.DateTimeException invalid) { return null; }
     }

@@ -721,6 +721,7 @@ public class ScarletVRChat implements Closeable
 
     private void login(boolean isRefresh)
     {
+        this.clearNegativeCaches();
         // Keep cached account state for the existing recovery scheduler, but do not
         // identify avatar queries with a prior account while re-authenticating.
         long headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
@@ -910,11 +911,12 @@ try
                     this.totpsecret.set(secret);
                     this.scarlet.settings.getJson().remove("vrc_secret");
                 }
+                boolean authed = false;
                 if (secret != null && (secret = secret.replaceAll("[^A-Za-z2-7=]", "")).length() == 32)
                 {
-                    boolean authed = false;
-                    for (int tries = 2; !authed && tries --> 0; MiscUtils.sleep(3_000L)) try
+                    for (int tries = 0; !authed && this.scarlet.running && tries < 2; tries++) try
                     {
+                        if (tries > 0) MiscUtils.sleep(3_000L);
                         // use VRChatAPI time to work around potential local system time drift
                         long now = new MiscellaneousApi(this.client).getSystemTime().toInstant().toEpochMilli();
                         String code = TimeBasedOneTimePasswordUtil.generateNumberString(secret, now, TimeBasedOneTimePasswordUtil.DEFAULT_TIME_STEP_SECONDS, TimeBasedOneTimePasswordUtil.DEFAULT_OTP_LENGTH);
@@ -930,7 +932,7 @@ try
                     }
                 }
                 
-                for (boolean needsTotp = true; needsTotp && this.scarlet.running;) try
+                for (boolean needsTotp = !authed; needsTotp && this.scarlet.running;) try
                 {
                     if (needsTotp = !auth.verify2FA(new TwoFactorAuthCode().code(this.scarlet.settings.requireInput("Totp code", true))).getVerified().booleanValue())
                         LOG.error("Invalid totp code");
@@ -990,6 +992,7 @@ finally
     class AltCred extends ScarletVRChatCookieJar.AltCredContext
     {
         final boolean isNew;
+        String credentialUserId;
         ScarletSettings.RegistryStringEncrypted altUsername, altPassword, altSecret;
         public AltCred(String altUserId)
         {
@@ -1001,8 +1004,9 @@ finally
         {
             if (altUserId == null)
                 return false;
-            if (!this.isNew)
+            if (this.credentialUserId != null && !this.credentialUserId.equals(altUserId))
                 return false;
+            this.credentialUserId = altUserId;
             if (this.altUsername == null)
                 this.altUsername = ScarletVRChat.this.scarlet.settings.new RegistryStringEncrypted("alt:"+altUserId+":username", true);
             if (this.altPassword == null)
@@ -1015,8 +1019,8 @@ finally
         {
             if (!this.init(altUserId))
                 return;
-            this.altUsername.set(username);
-            this.altPassword.set(password);
+            if (username != null) this.altUsername.set(username);
+            if (password != null) this.altPassword.set(password);
         }
         void updateS(String altUserId, String totpsecret)
         {
@@ -1166,11 +1170,12 @@ finally
                 if (twoFactorMethods.contains("totp"))
                 {
                     String secret = alt.altSecret == null ? null : alt.altSecret.getOrNull();
+                    boolean authed = false;
                     if (secret != null && (secret = secret.replaceAll("[^A-Za-z2-7=]", "")).length() == 32)
                     {
-                        boolean authed = false;
-                        for (int tries = 2; !authed && tries --> 0; MiscUtils.sleep(3_000L)) try
+                        for (int tries = 0; !authed && this.scarlet.running && tries < 2; tries++) try
                         {
+                            if (tries > 0) MiscUtils.sleep(3_000L);
                             // use VRChatAPI time to work around potential local system time drift
                             long now = new MiscellaneousApi(this.client).getSystemTime().toInstant().toEpochMilli();
                             code = TimeBasedOneTimePasswordUtil.generateNumberString(secret, now, TimeBasedOneTimePasswordUtil.DEFAULT_TIME_STEP_SECONDS, TimeBasedOneTimePasswordUtil.DEFAULT_OTP_LENGTH);
@@ -1186,7 +1191,7 @@ finally
                         }
                     }
                     
-                    for (boolean needsTotp = true; needsTotp && this.scarlet.running;) try
+                    for (boolean needsTotp = !authed; needsTotp && this.scarlet.running;) try
                     {
                         if (needsTotp = !auth.verify2FA(new TwoFactorAuthCode().code(code = this.scarlet.settings.requireInput("Totp code", true))).getVerified().booleanValue())
                             LOG.error("Invalid totp code; alt: "+context);
@@ -1493,6 +1498,34 @@ finally
         return JSON.getGson().fromJson(json, CurrentUser.class);
     }
 
+    private volatile net.sybyline.scarlet.util.FetchCoalescer fetchCoalescer;
+    private net.sybyline.scarlet.util.FetchCoalescer coalescedFetches()
+    {
+        net.sybyline.scarlet.util.FetchCoalescer result = this.fetchCoalescer;
+        if (result == null) synchronized (this)
+        {
+            result = this.fetchCoalescer;
+            if (result == null) this.fetchCoalescer = result = new net.sybyline.scarlet.util.FetchCoalescer();
+        }
+        return result;
+    }
+
+    private void clearNegativeCaches()
+    {
+        this.coalescedFetches().invalidate();
+        if (this.cachedUsers != null) this.cachedUsers.clear404s();
+        if (this.cachedWorlds != null) this.cachedWorlds.clear404s();
+        if (this.cachedGroups != null) this.cachedGroups.clear404s();
+        if (this.cachedUserGroups != null) this.cachedUserGroups.clear404s();
+        if (this.cachedAvatars != null) this.cachedAvatars.clear404s();
+        if (this.cachedPrints != null) this.cachedPrints.clear404s();
+        if (this.cachedProps != null) this.cachedProps.clear404s();
+        if (this.cachedInventoryItems != null) this.cachedInventoryItems.clear404s();
+        if (this.cachedModelFiles != null) this.cachedModelFiles.clear404s();
+        if (this.cachedFileAnalyses != null) this.cachedFileAnalyses.clear404s();
+        if (this.cachedPublicProfiles != null) this.cachedPublicProfiles.clear404s();
+    }
+
     public boolean logout()
     {
         return this.logout(false);
@@ -1500,6 +1533,7 @@ finally
 
     private boolean logout(boolean isRefresh)
     {
+        this.clearNegativeCaches();
         long headerGeneration = ExtendedUserAgent.beginPrimaryAuthentication();
         try
         {
@@ -1782,10 +1816,15 @@ finally
     }
     public User getUser(String userId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getUser", this.client, this.currentUserId, userId, minEpoch),
+            () -> this.getUserUnshared(userId, minEpoch));
+    }
+    private User getUserUnshared(String userId, long minEpoch)
+    {
         User user = this.cachedUsers.get(userId, minEpoch);
         if (user != null)
             return user;
-        if (this.cachedUsers.is404(userId))
+        if (this.cachedUsers.is404(userId, minEpoch))
             return null;
         UsersApi users = new UsersApi(this.client);
         try
@@ -1843,12 +1882,17 @@ finally
      */
     public io.github.vrchatapi.model.PublicProfile getPublicProfile(String userId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getPublicProfile", this.client, this.currentUserId, userId, minEpoch),
+            () -> this.getPublicProfileUnshared(userId, minEpoch));
+    }
+    private io.github.vrchatapi.model.PublicProfile getPublicProfileUnshared(String userId, long minEpoch)
+    {
         if (userId == null)
             return null;
         io.github.vrchatapi.model.PublicProfile profile = this.cachedPublicProfiles.get(userId, minEpoch);
         if (profile != null)
             return profile;
-        if (this.cachedPublicProfiles.is404(userId))
+        if (this.cachedPublicProfiles.is404(userId, minEpoch))
             return null;
         UsersApi users = new UsersApi(this.client);
         try
@@ -1919,10 +1963,15 @@ finally
     }
     public World getWorld(String worldId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getWorld", this.client, this.currentUserId, worldId, minEpoch),
+            () -> this.getWorldUnshared(worldId, minEpoch));
+    }
+    private World getWorldUnshared(String worldId, long minEpoch)
+    {
         World world = this.cachedWorlds.get(worldId, minEpoch);
         if (world != null)
             return world;
-        if (this.cachedWorlds.is404(worldId))
+        if (this.cachedWorlds.is404(worldId, minEpoch))
             return null;
         WorldsApi worlds = new WorldsApi(this.client);
         try
@@ -2265,10 +2314,15 @@ finally
     }
     public Group getGroup(String groupId, Boolean includeRoles, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getGroup", this.client, this.currentUserId, groupId, includeRoles, minEpoch),
+            () -> this.getGroupUnshared(groupId, includeRoles, minEpoch));
+    }
+    private Group getGroupUnshared(String groupId, Boolean includeRoles, long minEpoch)
+    {
         Group group = this.cachedGroups.get(groupId, minEpoch);
         if (group != null)
             return group;
-        if (this.cachedGroups.is404(groupId))
+        if (this.cachedGroups.is404(groupId, minEpoch))
             return null;
         GroupsApi groups = new GroupsApi(this.client);
         try
@@ -2503,10 +2557,15 @@ finally
     }
     public List<LimitedUserGroups> getUserGroups(String userId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getUserGroups", this.client, this.currentUserId, userId, minEpoch),
+            () -> this.getUserGroupsUnshared(userId, minEpoch));
+    }
+    private List<LimitedUserGroups> getUserGroupsUnshared(String userId, long minEpoch)
+    {
         List<LimitedUserGroups> userGroups = this.cachedUserGroups.get(userId, minEpoch);
         if (userGroups != null)
             return userGroups;
-        if (this.cachedUserGroups.is404(userId))
+        if (this.cachedUserGroups.is404(userId, minEpoch))
             return null;
         UsersApi users = new UsersApi(this.client);
         try
@@ -3390,10 +3449,15 @@ finally
     }
     public Avatar getAvatar(String avatarId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getAvatar", this.client, this.currentUserId, avatarId, minEpoch),
+            () -> this.getAvatarUnshared(avatarId, minEpoch));
+    }
+    private Avatar getAvatarUnshared(String avatarId, long minEpoch)
+    {
         Avatar avatar = this.cachedAvatars.get(avatarId, minEpoch);
         if (avatar != null)
             return avatar;
-        if (this.cachedAvatars.is404(avatarId))
+        if (this.cachedAvatars.is404(avatarId, minEpoch))
             return null;
         AvatarsApi avatars = new AvatarsApi(this.client);
         try
@@ -3419,10 +3483,15 @@ finally
     }
     public Print getPrint(String printId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getPrint", this.client, this.currentUserId, printId, minEpoch),
+            () -> this.getPrintUnshared(printId, minEpoch));
+    }
+    private Print getPrintUnshared(String printId, long minEpoch)
+    {
         Print print = this.cachedPrints.get(printId, minEpoch);
         if (print != null)
             return print;
-        if (this.cachedPrints.is404(printId))
+        if (this.cachedPrints.is404(printId, minEpoch))
             return null;
         PrintsApi prints = new PrintsApi(this.client);
         try
@@ -3448,10 +3517,15 @@ finally
     }
     public Prop getProp(String propId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getProp", this.client, this.currentUserId, propId, minEpoch),
+            () -> this.getPropUnshared(propId, minEpoch));
+    }
+    private Prop getPropUnshared(String propId, long minEpoch)
+    {
         Prop prop = this.cachedProps.get(propId, minEpoch);
         if (prop != null)
             return prop;
-        if (this.cachedProps.is404(propId))
+        if (this.cachedProps.is404(propId, minEpoch))
             return null;
         PropsApi props = new PropsApi(this.client);
         try
@@ -3477,10 +3551,15 @@ finally
     }
     public InventoryItem getInventoryItem(String userId, String invId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getInventoryItem", this.client, this.currentUserId, userId, invId, minEpoch),
+            () -> this.getInventoryItemUnshared(userId, invId, minEpoch));
+    }
+    private InventoryItem getInventoryItemUnshared(String userId, String invId, long minEpoch)
+    {
         InventoryItem item = this.cachedInventoryItems.get(invId, minEpoch);
         if (item != null)
             return item;
-        if (this.cachedInventoryItems.is404(invId))
+        if (this.cachedInventoryItems.is404(invId, minEpoch))
             return null;
 //        InventoryApi inventory = new InventoryApi(this.client);
         try
@@ -3516,10 +3595,15 @@ finally
     }
     public ModelFile getModelFile(String fileId, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getModelFile", this.client, this.currentUserId, fileId, minEpoch),
+            () -> this.getModelFileUnshared(fileId, minEpoch));
+    }
+    private ModelFile getModelFileUnshared(String fileId, long minEpoch)
+    {
         ModelFile file = this.cachedModelFiles.get(fileId, minEpoch);
         if (file != null)
             return file;
-        if (this.cachedModelFiles.is404(fileId))
+        if (this.cachedModelFiles.is404(fileId, minEpoch))
             return null;
         FilesApi files = new FilesApi(this.client);
         try
@@ -3545,11 +3629,16 @@ finally
     }
     public FileAnalysis getFileAnalysis(VersionedFile versionedFile, long minEpoch)
     {
+        return this.coalescedFetches().fetch(java.util.Arrays.asList("getFileAnalysis", this.client, this.currentUserId, versionedFile.toString('#'), minEpoch),
+            () -> this.getFileAnalysisUnshared(versionedFile, minEpoch));
+    }
+    private FileAnalysis getFileAnalysisUnshared(VersionedFile versionedFile, long minEpoch)
+    {
         String stringified = versionedFile.toString('#'); // avoid ':' and '/' for file path semantic reasons
         FileAnalysis analysis = this.cachedFileAnalyses.get(stringified, minEpoch);
         if (analysis != null)
             return analysis;
-        if (this.cachedFileAnalyses.is404(stringified))
+        if (this.cachedFileAnalyses.is404(stringified, minEpoch))
         {
             LOG.warn("file 404: "+versionedFile);
             return null;

@@ -30,6 +30,7 @@ public class ScarletLogger extends LegacyAbstractLogger
     private static final java.util.concurrent.atomic.AtomicLong errors = new java.util.concurrent.atomic.AtomicLong();
 
     public static long errorCount() { return errors.get(); }
+    public static boolean awaitConsoleIdle(long timeoutMillis) { return ConsoleOutput.sink.awaitIdle(timeoutMillis); }
 
     public static void setConsoleOnly(boolean value)
     {
@@ -45,7 +46,7 @@ public class ScarletLogger extends LegacyAbstractLogger
     /** Returns the active file, or null while offline/startup logging is console-only. */
     public static File getActiveLogFile()
     {
-        return consoleOnly ? null : ThreadLogEntry.logFile;
+        return consoleOnly ? null : FileOutput.logFile;
     }
     public static final Level level = level0();
     private static final boolean is_error = level.compareTo(Level.ERROR) >= 0,
@@ -123,136 +124,65 @@ public class ScarletLogger extends LegacyAbstractLogger
         PrintStream stream = level == Level.ERROR ? System.err : System.out;
         String name = marker == null ? this.name : (this.name + "/" + marker.getName());
         String logMessage = String.format("%1$tF %1$tT [%2$s] [%3$s] %4$s%n", now, level, name, result.getMessage());
-        
-//        stream.print(logMessage);
-//        if (throwable != null)
-//            throwable.printStackTrace(stream);
-        if (throwable != null && MavenDepsLoader.jarPath() != null)
+
+        if (throwable != null)
         {
-            StringWriter sw = new StringWriter();
-            throwable.printStackTrace(new PrintWriter(sw));
-            logMessage = Arrays.stream(sw.getBuffer().toString().split("\\R"))
-                .map($ ->
-                {
-                    Matcher m = errpkg.matcher($);
-                    if (m.find())
-                    {
-                        String ws = m.group("ws"),
-                               pkg = m.group("pkg"),
-                               cls = m.group("cls"),
-                               mth = m.group("mth"),
-                               file = m.group("file"),
-                               line = m.group("line");
-//                        $ = ws + pkg + "." + cls + "." + mth + "(" + file + ":" + line + ")";
-                        $ = ws + pkg + "." + cls + "." + mth + "([" + file + ":" + line + "](" + Scarlet.GITHUB_URL + "/tree/" + Scarlet.VERSION + "/src/main/java/" + pkg.replace('.', '/') + "/" + file + "#L" + line + "))";
-                    }
-                    return $;
-                })
-                .collect(Collectors.joining(linesep, logMessage, linesep));
-            throwable = null;
+            LimitedWriter stack = new LimitedWriter();
+            try { throwable.printStackTrace(new PrintWriter(stack)); }
+            catch (StackLimit reached) { stack.text.append("\n[stack trace truncated]\n"); }
+            String trace = stack.text.toString();
+            if (MavenDepsLoader.jarPath() != null)
+                trace = Arrays.stream(trace.split("\\R")).map(line -> {
+                    Matcher match = errpkg.matcher(line);
+                    if (!match.find()) return line;
+                    return match.group("ws") + match.group("pkg") + "." + match.group("cls") + "." + match.group("mth")
+                        + "([" + match.group("file") + ":" + match.group("line") + "](" + Scarlet.GITHUB_URL + "/tree/" + Scarlet.VERSION
+                        + "/src/main/java/" + match.group("pkg").replace('.', '/') + "/" + match.group("file") + "#L" + match.group("line") + "))";
+                }).collect(Collectors.joining(linesep));
+            logMessage += trace + linesep;
         }
-        if (consoleOnly)
-        {
-            stream.print(logMessage);
-            if (throwable != null) throwable.printStackTrace(stream);
-        }
-        else ThreadLogEntry.logEntry(stream, logMessage, throwable);
+        boolean important = level == Level.ERROR || level == Level.WARN;
+        ConsoleOutput.sink.offer(logMessage, important, level == Level.ERROR, stream);
+        if (!consoleOnly) FileOutput.sink.offer(logMessage, important, level == Level.ERROR);
     }
 
-    static class ThreadLogEntry
+    static final class StackLimit extends RuntimeException { private static final long serialVersionUID = 1L; }
+    static final class LimitedWriter extends java.io.Writer
     {
-
-        static void logEntry(PrintStream stream, String logMessage, Throwable throwable)
+        final StringBuilder text = new StringBuilder();
+        @Override public void write(char[] chars, int offset, int length)
         {
-            entries.add(new ThreadLogEntry(stream, logMessage, throwable));
+            int remaining = BoundedLogSink.MAX_ENTRY - this.text.length();
+            this.text.append(chars, offset, Math.min(remaining, length));
+            if (length > remaining) throw new StackLimit();
         }
-
-        private ThreadLogEntry(PrintStream stream, String logMessage, Throwable throwable)
-        {
-            this.stream = stream;
-            this.logMessage = logMessage;
-            this.throwable = throwable;
-        }
-        private final PrintStream stream;
-        private final String logMessage;
-        private final Throwable throwable;
-
-        private static final Thread printer_thread = new Thread(ThreadLogEntry::thread),
-                                    shutdown_thread = new Thread(ThreadLogEntry::shutdown);
-        private static final BlockingQueue<ThreadLogEntry> entries = new LinkedBlockingQueue<>();
-        private static final File logFile = new File(Scarlet.dir, "logs/scarlet_log_"+DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss").format(LocalDateTime.now())+".txt");
-        private static final PrintStream logFileStream;
-
-        static
-        {
-            printer_thread.setDaemon(true);
-            printer_thread.setName("Hatson321/Scarlet Logger Logging Thread");
-            printer_thread.start();
-            
-            shutdown_thread.setDaemon(true);
-            shutdown_thread.setName("Hatson321/Scarlet Logger Logging Shutdown Hook");
-            Runtime.getRuntime().addShutdownHook(shutdown_thread);
-            
-            File logDir = logFile.getParentFile();
-            if (!logDir.isDirectory())
-                logDir.mkdirs();
-            
-            try
-            {
-                // UTF-8 so Unicode display names (fancy/stylized usernames) are
-                // preserved in the log file instead of being written as "?".
-                logFileStream = new PrintStream(logFile, "UTF-8");
-            }
-            catch (Exception ex)
-            {
-                throw new Error("Failed to initialize log file", ex);
-            }
-        }
-
-        private static void thread()
-        {
-            while (!Thread.interrupted()) try
-            {
-                ThreadLogEntry entry = entries.take();
-                
-                entry.stream.print(entry.logMessage);
-                logFileStream.print(entry.logMessage);
-                
-                if (entry.throwable != null)
-                {
-                    entry.throwable.printStackTrace(entry.stream);
-                    entry.throwable.printStackTrace(logFileStream);
-                }
-                
-            }
-            catch (Exception ex)
-            {
-                // ignore
-            }
-        }
-
-        private static void shutdown()
-        {
-            try
-            {
-                printer_thread.interrupt();
-                printer_thread.join(1_000L);
-            }
-            catch (Exception ex)
-            {
-                ex.printStackTrace(System.err);
-            }
-            if (logFileStream != null) try
-            {
-                logFileStream.flush();
-                logFileStream.close();
-            }
-            catch (Exception ex)
-            {
-                ex.printStackTrace(System.err);
-            }
-        }
-
+        @Override public void flush() { }
+        @Override public void close() { }
     }
 
+    static final class ConsoleOutput
+    {
+        static final BoundedLogSink sink = new BoundedLogSink("Scarlet console logging", 512, 1024 * 1024,
+            entry -> (entry.stream != null ? entry.stream : entry.error ? System.err : System.out).print(entry.text), () -> {});
+        static { Runtime.getRuntime().addShutdownHook(new Thread(() -> sink.close(1000), "Scarlet console drain")); }
+    }
+    static final class FileOutput
+    {
+        static final File logFile = new File(Scarlet.dir, "logs/scarlet_log_" + DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss").format(LocalDateTime.now()) + ".txt");
+        static PrintStream stream;
+        static final BoundedLogSink sink = new BoundedLogSink("Scarlet file logging", 2048, 4 * 1024 * 1024, entry -> {
+            try
+            {
+                if (stream == null)
+                {
+                    java.nio.file.Files.createDirectories(logFile.toPath().getParent());
+                    stream = new PrintStream(logFile, "UTF-8");
+                }
+                stream.print(entry.text); stream.flush();
+                if (stream.checkError()) throw new IllegalStateException("Log file write failed");
+            }
+            catch (java.io.IOException failure) { throw new IllegalStateException("Could not open log file", failure); }
+        }, () -> { if (stream != null) stream.close(); });
+        static { Runtime.getRuntime().addShutdownHook(new Thread(() -> sink.close(1000), "Scarlet file drain")); }
+    }
 }

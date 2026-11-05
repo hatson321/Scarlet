@@ -57,8 +57,46 @@ class ScarletIpcLifecycleTest
             int security = Class.forName("org.scalasbt.ipcsocket.Win32SecurityLevel").getField("OWNER_DACL").getInt(null);
             ServerSocket server = (ServerSocket)serverType.getConstructor(String.class, boolean.class, int.class)
                 .newInstance(pipe, false, security);
-            return new Endpoint(server, () -> (Socket)Class.forName("org.scalasbt.ipcsocket.Win32NamedPipeSocket")
-                .getConstructor(String.class, boolean.class).newInstance(pipe, false), null);
+            Connect connect = () -> {
+                long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (true)
+                {
+                    try {
+                        Socket nativeClient = (Socket)Class.forName("org.scalasbt.ipcsocket.Win32NamedPipeSocket")
+                            .getConstructor(String.class, boolean.class).newInstance(pipe, false);
+                        // The library's client CloseCallback is empty. Explicitly own
+                        // these synthetic handles so close actually signals pipe EOF.
+                        return new Socket() {
+                            boolean closed;
+                            @Override public java.io.OutputStream getOutputStream() throws IOException { return nativeClient.getOutputStream(); }
+                            @Override public void shutdownOutput() throws IOException { close(); }
+                            @Override public void close() throws IOException {
+                                if (closed) return; closed = true;
+                                try {
+                                    Class<?> type = nativeClient.getClass();
+                                    java.lang.reflect.Field provider = type.getDeclaredField("provider"); provider.setAccessible(true);
+                                    java.lang.reflect.Method close = Class.forName("org.scalasbt.ipcsocket.Win32NamedPipeLibraryProvider")
+                                        .getDeclaredMethod("CloseHandle", Class.forName("org.scalasbt.ipcsocket.Handle"));
+                                    close.setAccessible(true);
+                                    for (String name : new String[]{"handle", "readerWaitable", "writerWaitable"}) {
+                                        java.lang.reflect.Field field = type.getDeclaredField(name); field.setAccessible(true);
+                                        close.invoke(provider.get(nativeClient), field.get(nativeClient));
+                                    }
+                                } catch (ReflectiveOperationException failure) { throw new IOException(failure); }
+                            }
+                        };
+                    }
+                    catch (java.lang.reflect.InvocationTargetException failure)
+                    {
+                        if (!(failure.getCause() instanceof IOException) || System.nanoTime() >= until) throw failure;
+                        Thread.sleep(10);
+                    }
+                }
+            };
+            return new Endpoint(server, connect, () -> {
+                try (Socket empty = connect.open()) { }
+                catch (Exception failure) { throw new IOException(failure); }
+            });
         }
         // Unix socket paths must stay short even when the checkout or test root is deeply nested.
         Path directory = Files.createTempDirectory(Path.of("/tmp"), "sc-ipc-");
@@ -78,9 +116,79 @@ class ScarletIpcLifecycleTest
     }
 
     @Test void tcpBlockingAcceptStops() throws Exception { blockingAccept(tcp()); }
+
+    @Test void shutdownRetriesWakeUntilNativeAcceptPublishesItsHandle() throws Exception
+    {
+        ScarletIpcLifecycle owner = new ScarletIpcLifecycle();
+        CountDownLatch accepting = new CountDownLatch(1), firstWake = new CountDownLatch(1), connected = new CountDownLatch(1);
+        AtomicInteger wakes = new AtomicInteger(), closes = new AtomicInteger();
+        ServerSocket server = new ServerSocket() {
+            @Override public Socket accept() throws IOException {
+                accepting.countDown();
+                try { if (!connected.await(3, TimeUnit.SECONDS)) throw new IOException("wake timeout"); }
+                catch (InterruptedException failure) { throw new IOException(failure); }
+                return new TrackingSocket();
+            }
+            @Override public void close() { closes.incrementAndGet(); }
+        };
+        owner.publishServer(server, () -> {
+            if (wakes.incrementAndGet() < 3) { firstWake.countDown(); throw new IOException("handle not created yet"); }
+            connected.countDown();
+        });
+        FutureTask<Void> task = new FutureTask<>(() -> {
+            assertThrows(IOException.class, () -> owner.accept(server)); return null;
+        });
+        start(task); assertTrue(accepting.await(2, TimeUnit.SECONDS));
+        owner.close(); task.get(3, TimeUnit.SECONDS); owner.close();
+        assertEquals(3, wakes.get()); assertEquals(1, closes.get());
+    }
     @Test void actualPlatformNativeBlockingAcceptStops() throws Exception { blockingAccept(nativeEndpoint()); }
     @Test void tcpPartialReadStopsWithoutDispatch() throws Exception { partialRead(tcp()); }
     @Test void actualPlatformNativePartialReadStopsWithoutDispatch() throws Exception { partialRead(nativeEndpoint()); }
+    @Test void tcpIdleRequestExpiresAndNextCommandRuns() throws Exception { expiredRequest(tcp(), false); }
+    @Test void nativeIdleRequestExpiresAndNextCommandRuns() throws Exception { expiredRequest(nativeEndpoint(), false); }
+    @Test void tcpDrippingRequestHasTotalDeadline() throws Exception { expiredRequest(tcp(), true); }
+    @Test void nativeDrippingRequestHasTotalDeadline() throws Exception { expiredRequest(nativeEndpoint(), true); }
+
+    private void expiredRequest(Endpoint endpoint, boolean drip) throws Exception
+    {
+        ScarletIpcLifecycle owner = new ScarletIpcLifecycle(drip ? 2_000 : 150, drip ? 300 : 2_000);
+        owner.publishServer(endpoint.server, endpoint.wake);
+        CountDownLatch expired = new CountDownLatch(1);
+        FutureTask<byte[]> task = new FutureTask<>(() -> {
+            Socket first = owner.accept(endpoint.server);
+            try { assertNull(owner.readCommandBytes(first, 65536)); }
+            finally { owner.releaseClient(first); expired.countDown(); }
+            Socket next = owner.accept(endpoint.server);
+            try { return owner.readCommandBytes(next, 65536); }
+            finally { owner.releaseClient(next); }
+        });
+        Thread reader = start(task);
+        try
+        {
+            awaitStack(reader, "accept");
+            try (Socket slow = endpoint.connect.open())
+            {
+                long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (drip && expired.getCount() != 0 && System.nanoTime() < end)
+                {
+                    try { slow.getOutputStream().write('x'); slow.getOutputStream().flush(); }
+                    catch (IOException closed) { break; }
+                    Thread.sleep(20);
+                }
+                assertTrue(expired.await(3, TimeUnit.SECONDS));
+            }
+            awaitStack(reader, "accept");
+            try (Socket complete = endpoint.connect.open())
+            {
+                complete.getOutputStream().write("ok".getBytes(StandardCharsets.UTF_8)); complete.getOutputStream().flush();
+                complete.shutdownOutput();
+            }
+            assertArrayEquals("ok".getBytes(StandardCharsets.UTF_8), task.get(3, TimeUnit.SECONDS));
+            assertFalse(owner.isStopped());
+        }
+        finally { owner.close(); endpoint.cleanup(); }
+    }
 
     private void blockingAccept(Endpoint endpoint) throws Exception
     {
@@ -91,7 +199,7 @@ class ScarletIpcLifecycleTest
             Socket accepted = null;
             try
             {
-                accepted = endpoint.server.accept();
+                accepted = owner.accept(endpoint.server);
                 if (owner.publishClient(accepted) && !owner.isStopped()) dispatched.incrementAndGet();
             }
             catch (IOException | IllegalStateException failure) { if (!owner.isStopped()) throw failure; }
@@ -119,7 +227,7 @@ class ScarletIpcLifecycleTest
             Socket accepted = null;
             try
             {
-                accepted = endpoint.server.accept();
+                accepted = owner.accept(endpoint.server);
                 if (!owner.publishClient(accepted)) return null;
                 published.countDown();
                 byte[] command = owner.readCommandBytes(accepted, 65536);
@@ -202,7 +310,7 @@ class ScarletIpcLifecycleTest
         }
     }
 
-    private static Thread start(FutureTask<Void> task)
+    private static Thread start(FutureTask<?> task)
     {
         Thread thread = new Thread(task, "Synthetic IPC lifecycle test");
         thread.setDaemon(true);

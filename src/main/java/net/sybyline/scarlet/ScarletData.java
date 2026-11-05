@@ -899,8 +899,8 @@ public class ScarletData
         }
         public int getUserCaseEvidenceCount()
         {
-            String[] auditEntryIds = this.auditEntryIds;
-            return auditEntryIds == null ? 0 : auditEntryIds.length;
+            EvidenceSubmission[] evidence = this.evidenceSubmissions;
+            return evidence == null ? 0 : evidence.length;
         }
         public synchronized void addUserCaseEvidence(EvidenceSubmission evidenceSubmission)
         {
@@ -915,6 +915,7 @@ public class ScarletData
     }
     public static class EvidenceSubmission
     {
+        public String receiptId;
         public EvidenceSubmission(String auditEntryId, String submitterSnowflake, String submitterDisplayName, OffsetDateTime submissionTime, String fileName, String filePath, String url, String proxyUrl)
         {
             this.auditEntryId = auditEntryId;

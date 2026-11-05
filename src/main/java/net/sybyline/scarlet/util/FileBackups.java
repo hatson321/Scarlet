@@ -39,7 +39,9 @@ public final class FileBackups
 {
     static final Logger LOG = LoggerFactory.getLogger("Scarlet/FileBackups");
 
-    private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+    private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSSSSSSSS");
+    private static final Comparator<File> NEWEST_FIRST = Comparator.comparingLong(File::lastModified)
+        .thenComparing(File::getName).reversed();
 
     /** Default number of dated backups retained per file. */
     public static final int DEFAULT_KEEP = 10;
@@ -191,16 +193,53 @@ public final class FileBackups
 
     private static void backup(File target, int keep)
     {
+        backup(target, keep, LocalDateTime.now());
+    }
+
+    static void backup(File target, int keep, LocalDateTime time)
+    {
         if (keep <= 0)
             return;
         try
         {
             File dir = new File(target.getAbsoluteFile().getParentFile(), "backups");
-            if (!dir.isDirectory() && !dir.mkdirs())
-                return;
-            String name = target.getName(),
-                   stamped = name + "." + LocalDateTime.now().format(STAMP) + ".bak";
-            Files.copy(target.toPath(), new File(dir, stamped).toPath(), StandardCopyOption.REPLACE_EXISTING);
+            Files.createDirectories(dir.toPath());
+            String name = target.getName();
+            String prefix = name + "." + time.format(STAMP) + "-";
+            // Start after the highest retained suffix, not at the first free slot:
+            // pruning can free an old name while the clock still has the same value.
+            int next = 0;
+            String[] existing = dir.list((d, n) -> n.startsWith(prefix) && n.endsWith(".bak"));
+            if (existing == null) throw new IOException("Cannot list retained backups");
+            for (String saved : existing)
+            {
+                String suffix = saved.substring(prefix.length(), saved.length() - 4);
+                if (suffix.matches("[0-9]{6}")) next = Math.max(next, Integer.parseInt(suffix) + 1);
+            }
+            boolean copied = false;
+            for (int collision = next; collision < 1_000_000; collision++)
+            {
+                String stamped = prefix + String.format(java.util.Locale.ROOT, "%06d.bak", collision);
+                Path destination = new File(dir, stamped).toPath();
+                boolean created = false;
+                try (java.io.OutputStream output = Files.newOutputStream(destination,
+                    java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE))
+                {
+                    // CREATE_NEW reserves the name atomically, including on Windows.
+                    created = true;
+                    Files.copy(target.toPath(), output);
+                    copied = true;
+                }
+                catch (IOException ex)
+                {
+                    if (!created && ex instanceof java.nio.file.FileAlreadyExistsException) continue;
+                    if (created) try { Files.deleteIfExists(destination); }
+                        catch (IOException cleanup) { ex.addSuppressed(cleanup); }
+                    throw ex;
+                }
+                break;
+            }
+            if (!copied) throw new IOException("No unique backup filename available");
             prune(dir, name, keep);
         }
         catch (Exception ex)
@@ -215,7 +254,7 @@ public final class FileBackups
         File[] backups = dir.listFiles((d, n) -> n.startsWith(baseName + ".") && n.endsWith(".bak"));
         if (backups == null || backups.length <= keep)
             return;
-        Arrays.sort(backups, Comparator.comparing(File::getName).reversed()); // newest first (stamp sorts lexically)
+        Arrays.sort(backups, NEWEST_FIRST);
         for (int i = keep; i < backups.length; i++)
             if (!backups[i].delete())
                 LOG.debug("Could not prune old backup {}", backups[i]);
@@ -223,7 +262,8 @@ public final class FileBackups
 
     /**
      * Dated backups for {@code target} (from the sibling {@code backups/} folder), newest first.
-     * The timestamp stamp sorts lexically, so a reverse name sort is newest-first. Empty when none.
+     * Creation writes are ordered by modification time, with stamped names breaking ties.
+     * This also supports backups made with the older second-resolution names. Empty when none.
      * Used to recover a file whose primary copy was truncated/emptied by an unclean shutdown.
      */
     public static File[] backupsNewestFirst(File target)
@@ -232,7 +272,7 @@ public final class FileBackups
         File[] backups = dir.listFiles((d, n) -> n.startsWith(target.getName() + ".") && n.endsWith(".bak"));
         if (backups == null)
             return new File[0];
-        Arrays.sort(backups, Comparator.comparing(File::getName).reversed());
+        Arrays.sort(backups, NEWEST_FIRST);
         return backups;
     }
 }

@@ -327,7 +327,7 @@ class ScarletTimedBanPersistenceTest
         assertFalse(store.hasPending(GroupAuditType.USER_BAN, TARGET));
     }
 
-    @Test void concurrentNewBanWaitsForExpirySubmissionAndCannotOvertakeIt() throws Exception
+    @Test void concurrentNewBanIsRefusedWithoutBlockingUnrelatedActions() throws Exception
     {
         FailingStore store = store();
         active(store);
@@ -350,7 +350,9 @@ class ScarletTimedBanPersistenceTest
                 return store.reservePending(GroupAuditType.USER_BAN, TARGET, ACTOR, GROUP_A);
             });
             assertTrue(contender.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class, () -> ban.get(100, TimeUnit.MILLISECONDS));
+            assertNull(ban.get(2, TimeUnit.SECONDS), "Pending unban prevents a same-target ban");
+            assertNotNull(workers.submit(() -> store.reservePending(GroupAuditType.USER_BAN,
+                "usr_unrelated", ACTOR, GROUP_A)).get(2, TimeUnit.SECONDS));
             finish.countDown();
             sweep.get(5, TimeUnit.SECONDS);
             assertNull(ban.get(5, TimeUnit.SECONDS), "Pending unban still awaits audit confirmation");
@@ -361,5 +363,31 @@ class ScarletTimedBanPersistenceTest
             finish.countDown();
             workers.shutdownNow();
         }
+    }
+
+    @Test void newerBanDuringSlowLookupCancelsExpiryAndOtherSweepsSkipClaim() throws Exception
+    {
+        FailingStore store = store(); active(store);
+        CountDownLatch entered = new CountDownLatch(1), finish = new CountDownLatch(1);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try
+        {
+            Future<?> sweep = workers.submit(() -> ScarletTimedBanProcessor.process(store, () -> GROUP_A, clock::get,
+                (g, u) -> {
+                    entered.countDown();
+                    try { assertTrue(finish.await(5, TimeUnit.SECONDS)); }
+                    catch (InterruptedException ex) { throw new AssertionError(ex); }
+                    return GroupMemberStatus.BANNED;
+                },
+                (g, u, t) -> new ScarletTimedBanContinuity.Proof(ScarletTimedBanContinuity.Verdict.VERIFIED, "gaud_synthetic_original"),
+                (g, u) -> { fail("Replaced ban must never be unbanned"); return null; }));
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            workers.submit(() -> noCalls(store, GROUP_A)).get(2, TimeUnit.SECONDS);
+            assertNotNull(workers.submit(() -> store.reservePending(GroupAuditType.USER_BAN, TARGET, ACTOR, GROUP_A))
+                .get(2, TimeUnit.SECONDS));
+            finish.countDown(); sweep.get(5, TimeUnit.SECONDS);
+            assertTrue(store.hasPending(GroupAuditType.USER_BAN, TARGET));
+        }
+        finally { finish.countDown(); workers.shutdownNow(); }
     }
 }

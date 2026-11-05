@@ -1,5 +1,6 @@
 package net.sybyline.scarlet.util;
-import java.awt.Image;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
@@ -22,6 +23,8 @@ public interface Gifs
     static final int MAX_GIF_DIMENSION = 2048;
     static final long MAX_GIF_PIXELS = 2_048L * 2_048L;
     static final long MAX_GIF_DECODED_BYTES = 128L * 1024L * 1024L;
+    // GIFs can omit timing; use a finite 100 ms per unspecified frame.
+    static final int DEFAULT_FRAME_DELAY_MILLIS = 100;
 
     static String resolveTenorGifUrl(String url) throws IOException
     {
@@ -88,25 +91,32 @@ public interface Gifs
                 stride = 1024 / cells,
                 rsWidth = stride, rsHeight = stride,
                 osX = 0, osY = 0;
-            int totalTime = IntStream.range(0, count).map(decoder::getDelay).sum();
+            int totalTime = IntStream.range(0, count).map(i -> decoder.getDelay(i) > 0
+                ? decoder.getDelay(i) : DEFAULT_FRAME_DELAY_MILLIS).sum();
             if (width > height)
             {
-                rsHeight = Math.round((((float)height) / ((float)width)) * ((float)stride));
+                rsHeight = Math.max(1, Math.min(stride, Math.round((float) height / width * stride)));
                 osY = (stride - rsHeight) / 2;
             }
             else if (width < height)
             {
-                rsWidth = Math.round((((float)width) / ((float)height)) * ((float)stride));
+                rsWidth = Math.max(1, Math.min(stride, Math.round((float) width / height * stride)));
                 osX = (stride - rsWidth) / 2;
             }
-            for (int outIndex = 0, end = scrunch ? 64 : count; outIndex < end; outIndex++)
+            Graphics2D graphics = out.createGraphics();
+            try
             {
+                graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                for (int outIndex = 0, end = scrunch ? 64 : count; outIndex < end; outIndex++)
+                {
                 int index = scrunch ? Math.round((((float)outIndex) / 63.0F) * ((float)(count - 1))) : outIndex;
                 BufferedImage frame = decoder.getFrame(index);
                 int outX = (outIndex % cells) * stride + osX,
                     outY = (outIndex / cells) * stride + osY;
-                out.getGraphics().drawImage(frame.getScaledInstance(rsWidth, rsHeight, Image.SCALE_DEFAULT), outX, outY, null);
+                    graphics.drawImage(frame, outX, outY, rsWidth, rsHeight, null);
+                }
             }
+            finally { graphics.dispose(); }
             int renderedFrames = scrunch ? 64 : count;
             float fps = 1000.0F * ((float)renderedFrames) / ((float)totalTime);
             Rectangle renderedFrameBounds = new Rectangle(osX, osY, rsWidth, rsHeight);

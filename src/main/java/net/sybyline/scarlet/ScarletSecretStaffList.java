@@ -58,6 +58,8 @@ public class ScarletSecretStaffList
     final File secretStaffListFile;
     final Set<String> secretStaffUserIds;
     final Map<String, String> secretStaffNames;
+    private final Map<String, Long> nameRefreshedAt = new ConcurrentHashMap<>();
+    long nameCacheNow() { return System.currentTimeMillis(); }
     private final Storage storage;
     private final Set<String> pendingAdditions = new HashSet<>();
     private boolean initialized;
@@ -74,12 +76,24 @@ public class ScarletSecretStaffList
         if (!this.isSecretStaffId(userId))
             return null;
         String name = this.secretStaffNames.get(userId);
-        if (name == null && vrc != null)
+        long now = this.nameCacheNow();
+        Long refreshed = this.nameRefreshedAt.get(userId);
+        if (vrc != null && (name == null || refreshed == null || now < refreshed || now - refreshed >= 3_600_000L))
         {
             User user = vrc.getUser(userId);
             if (user != null)
             {
-                name = user.getDisplayName();
+                String fetched = user.getDisplayName();
+                synchronized (this)
+                {
+                    if (!this.isSecretStaffId(userId)) return null;
+                    if (fetched != null && !fetched.trim().isEmpty())
+                    {
+                        name = fetched;
+                        this.secretStaffNames.put(userId, name);
+                        this.nameRefreshedAt.put(userId, now);
+                    }
+                }
             }
         }
         if (name == null)
@@ -141,7 +155,7 @@ public class ScarletSecretStaffList
             throw new PersistenceException("The secret-staff removal could not be saved. The user remains "
                 + "protected. Fix the storage problem and retry.");
         this.secretStaffUserIds.remove(userId);
-        this.secretStaffNames.remove(userId);
+        this.secretStaffNames.remove(userId); this.nameRefreshedAt.remove(userId);
         this.pendingAdditions.clear();
         return true;
     }
@@ -199,6 +213,7 @@ public class ScarletSecretStaffList
             this.secretStaffUserIds.clear();
             this.secretStaffUserIds.addAll(ids);
             this.secretStaffNames.keySet().retainAll(ids);
+            this.nameRefreshedAt.keySet().retainAll(ids);
             this.initialized = true;
             this.unavailable = false;
             return true;

@@ -19,8 +19,40 @@ final class ScarletIpcLifecycle implements AutoCloseable
     private ServerSocket server;
     private Socket client;
     private WakeAccept wakeAccept;
+    private boolean accepting;
+    private final long idleMillis, totalMillis;
+    private final java.util.concurrent.ScheduledThreadPoolExecutor deadlines;
+
+    ScarletIpcLifecycle() { this(3_000L, 10_000L); }
+    ScarletIpcLifecycle(long idleMillis, long totalMillis)
+    {
+        if (idleMillis <= 0 || totalMillis <= 0) throw new IllegalArgumentException("Invalid IPC deadline");
+        this.idleMillis = idleMillis; this.totalMillis = totalMillis;
+        this.deadlines = new java.util.concurrent.ScheduledThreadPoolExecutor(1, work -> {
+            Thread thread = new Thread(work, "Scarlet IPC deadline"); thread.setDaemon(true); return thread;
+        });
+        this.deadlines.setRemoveOnCancelPolicy(true);
+    }
 
     synchronized boolean isStopped() { return this.stopped; }
+
+    Socket accept(ServerSocket listener) throws IOException
+    {
+        synchronized (this)
+        {
+            if (this.stopped || this.server != listener) throw new java.net.SocketException("IPC stopped");
+            this.accepting = true;
+        }
+        try
+        {
+            Socket accepted = listener.accept();
+            if (!this.publishClient(accepted)) throw new java.net.SocketException("IPC stopped");
+            return accepted;
+        }
+        finally { synchronized (this) { this.accepting = false; this.notifyAll(); } }
+    }
+
+    private synchronized boolean isAccepting() { return this.accepting; }
 
     boolean publishServer(ServerSocket value, WakeAccept wake) throws IOException
     {
@@ -54,29 +86,64 @@ final class ScarletIpcLifecycle implements AutoCloseable
             if (this.client != value) return;
             this.client = null;
         }
-        value.close();
+        closeConnection(value);
     }
 
     byte[] readCommandBytes(Socket connection, int maximumBytes) throws IOException
     {
+        final long started = System.nanoTime();
+        java.util.concurrent.atomic.AtomicLong progress = new java.util.concurrent.atomic.AtomicLong(started);
+        java.util.concurrent.atomic.AtomicBoolean reading = new java.util.concurrent.atomic.AtomicBoolean(true), expired = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.ScheduledFuture<?> deadline;
+        try
+        {
+            deadline = this.deadlines.scheduleAtFixedRate(() -> {
+                long now = System.nanoTime();
+                if ((now - started >= TimeUnit.MILLISECONDS.toNanos(this.totalMillis)
+                    || now - progress.get() >= TimeUnit.MILLISECONDS.toNanos(this.idleMillis))
+                    && reading.compareAndSet(true, false))
+                {
+                    expired.set(true);
+                    try { this.releaseClient(connection); }
+                    catch (IOException ignored) { /* The reader also observes expiry before dispatch. */ }
+                }
+            }, Math.min(50L, this.idleMillis), Math.min(50L, this.idleMillis), TimeUnit.MILLISECONDS);
+        }
+        catch (java.util.concurrent.RejectedExecutionException stopped) { return null; }
+        try
+        {
         byte[] buffer = new byte[maximumBytes];
         int length = 0;
         InputStream input = connection.getInputStream();
         // Some native adapters return a zero byte instead of EOF after local close.
         // Never issue another read once shutdown has begun, even on those adapters.
-        while (!this.isStopped() && !connection.isClosed() && length < buffer.length)
+        while (reading.get() && !this.isStopped() && !connection.isClosed() && length < buffer.length)
         {
             final int value;
             try { value = input.read(); }
             catch (IOException failure)
             {
+                if (expired.get() || this.isStopped() || connection.isClosed()) return null;
                 if ("ReadFile() failed: 109".equals(failure.getMessage())) break;
                 throw failure;
             }
             if (value < 0) break;
             buffer[length++] = (byte)value;
+            progress.set(System.nanoTime());
         }
-        return this.isStopped() || connection.isClosed() ? null : Arrays.copyOf(buffer, length);
+        // Claim completion before dispatch; a deadline that won this race owns the request.
+        boolean completed = reading.compareAndSet(true, false);
+        return !completed || expired.get() || this.isStopped() || connection.isClosed() ? null : Arrays.copyOf(buffer, length);
+        }
+        finally { reading.set(false); deadline.cancel(false); }
+    }
+
+    private static void closeConnection(Socket connection) throws IOException
+    {
+        if (connection instanceof UnixDomainSocket)
+            try { connection.shutdownInput(); }
+            catch (IOException ignored) { }
+        connection.close();
     }
 
     @Override public void close() throws IOException
@@ -84,6 +151,7 @@ final class ScarletIpcLifecycle implements AutoCloseable
         final ServerSocket listener;
         final Socket connection;
         final WakeAccept wake;
+        final boolean pendingAccept;
         synchronized (this)
         {
             if (this.stopped) return;
@@ -91,27 +159,39 @@ final class ScarletIpcLifecycle implements AutoCloseable
             listener = this.server;
             connection = this.client;
             wake = this.wakeAccept;
+            pendingAccept = this.accepting;
             this.server = null;
             this.client = null;
             this.wakeAccept = null;
         }
         IOException failure = null;
+        this.deadlines.shutdownNow();
         if (connection != null)
         {
             // The native Unix socket retains the descriptor while read() is pending;
             // close() alone therefore does not wake that read. shutdownInput() does.
-            if (connection instanceof UnixDomainSocket)
-                try { connection.shutdownInput(); }
-                catch (IOException ignored) { /* A disconnected peer may already have ended the read. */ }
-            try { connection.close(); }
+            try { closeConnection(connection); }
             catch (IOException ex) { failure = ex; }
         }
         if (listener != null)
         {
-            // Native Unix accept() is not interrupted by close(fd) on another thread.
-            // An empty local connection wakes it; no token or command is ever sent.
-            if (connection == null && wake != null)
-                try { wakeBounded(wake); }
+            // Wake before closing: native accept can publish its handle after close's drain.
+            // An empty connection carries neither a token nor a command.
+            if (connection == null && wake != null && pendingAccept)
+                try { wakeBounded(() -> {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+                    do
+                    {
+                        try { wake.wake(); return; }
+                        catch (IOException failureToConnect)
+                        {
+                            if (!this.isAccepting()) return;
+                            if (System.nanoTime() >= deadline) throw failureToConnect;
+                            try { Thread.sleep(10L); }
+                            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
+                        }
+                    } while (true);
+                }); }
                 catch (IOException ex) { failure = append(failure, ex); }
             try { listener.close(); }
             catch (IOException ex) { failure = append(failure, ex); }

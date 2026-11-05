@@ -62,6 +62,7 @@ class ScarletDiscordReadinessTest
             System.setErr(capture);
             assertNull(discord.getOrCreateIWC("synthetic"));
             assertTrue(logged.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertTrue(net.sybyline.scarlet.log.ScarletLogger.awaitConsoleIdle(2000));
         }
         finally { System.setErr(previous); }
         assertFalse(output.toString("UTF-8").contains(credential));

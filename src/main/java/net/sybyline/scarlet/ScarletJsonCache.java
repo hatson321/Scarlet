@@ -60,13 +60,19 @@ public class ScarletJsonCache<T>
 
     ScarletJsonCache(File cacheRoot, String kind, TypeToken<T> type)
     {
+        this(cacheRoot, kind, type, System::currentTimeMillis);
+    }
+
+    ScarletJsonCache(File cacheRoot, String kind, TypeToken<T> type, java.util.function.LongSupplier clock)
+    {
         if (!safeName(kind)) throw new IllegalArgumentException("Invalid cache kind");
         this.cacheRoot = cacheRoot;
         this.kind = kind;
         this.type = type;
         this.dir = new File(cacheRoot, kind);
         this.entries = LRUMap.ofSynchronized();
-        this.known404s = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        this.known404s = new ConcurrentHashMap<>();
+        this.clock = clock;
         this.load404s();
     }
 
@@ -75,24 +81,40 @@ public class ScarletJsonCache<T>
     private final TypeToken<T> type;
     private final File dir;
     private final Map<String, Entry> entries;
-    private final Set<String> known404s;
+    private final Map<String, Long> known404s;
+    private final java.util.function.LongSupplier clock;
+    static final long NEGATIVE_TTL_MILLIS = java.util.concurrent.TimeUnit.MINUTES.toMillis(5);
 
     public boolean is404(String id)
     {
-        return !safeKey(id) || this.known404s.contains(id);
+        return this.is404(id, ALWAYS_PREFER_CACHED);
     }
 
-    public boolean add404(String id)
+    public boolean is404(String id, long minEpoch)
     {
-        if (!safeKey(id) || !this.known404s.add(id))
+        if (!safeKey(id)) return true;
+        Long observed = this.known404s.get(id);
+        if (observed == null) return false;
+        long now = this.clock.getAsLong();
+        if (observed > now || now - observed >= NEGATIVE_TTL_MILLIS)
+        {
+            this.known404s.remove(id, observed);
             return false;
+        }
+        return observed >= minEpoch && minEpoch != ALWAYS_FETCH;
+    }
+
+    public synchronized boolean add404(String id)
+    {
+        if (!safeKey(id)) return false;
+        this.known404s.put(id, this.clock.getAsLong());
         this.save404s();
         return true;
     }
 
-    public boolean remove404(String id)
+    public synchronized boolean remove404(String id)
     {
-        if (!safeKey(id) || !this.known404s.remove(id))
+        if (!safeKey(id) || this.known404s.remove(id) == null)
             return false;
         this.save404s();
         return true;
@@ -102,25 +124,40 @@ public class ScarletJsonCache<T>
     {
         if (!Files.exists(this.dir.toPath().resolve("known_404s.json"), LinkOption.NOFOLLOW_LINKS))
             return;
-        String[] known404sa;
         try (Reader reader = this.reader("known_404s"))
         {
-            known404sa = Scarlet.GSON_PRETTY.fromJson(reader, String[].class);
+            com.google.gson.JsonElement saved = com.google.gson.JsonParser.parseReader(reader);
+            // Legacy arrays carry no observation time and must not become permanent misses.
+            if (saved.isJsonObject()) saved.getAsJsonObject().entrySet().forEach(entry -> {
+                try {
+                    long observed = entry.getValue().getAsLong(), now = this.clock.getAsLong();
+                    if (safeKey(entry.getKey()) && observed <= now && now - observed < NEGATIVE_TTL_MILLIS)
+                        this.known404s.put(entry.getKey(), observed);
+                } catch (RuntimeException invalid) { /* Ignore an invalid disposable cache entry. */ }
+            });
         }
         catch (Exception ex)
         {
             LOG.error("Exception reading knows 404s JSON of kind `"+this.kind+"`");
             return;
         }
-        if (known404sa != null)
-            Arrays.stream(known404sa).filter(ScarletJsonCache::safeKey).forEach(this.known404s::add);
+    }
+
+    public synchronized void clear404s()
+    {
+        if (!this.known404s.isEmpty()) { this.known404s.clear(); this.save404s(); }
     }
 
     void save404s()
     {
+        long now = this.clock.getAsLong();
+        // Distinct misses may never be looked up again. Retire them before each
+        // persisted update so long-running sessions do not rewrite stale history.
+        this.known404s.entrySet().removeIf(entry -> entry.getValue() > now
+            || now - entry.getValue() >= NEGATIVE_TTL_MILLIS);
         try (Writer writer = this.writer("known_404s"))
         {
-            Scarlet.GSON_PRETTY.toJson(this.known404s, Set.class, writer);
+            Scarlet.GSON_PRETTY.toJson(this.known404s, Map.class, writer);
         }
         catch (Exception ex)
         {
@@ -162,39 +199,46 @@ public class ScarletJsonCache<T>
     {
         if (!safeKey(id))
             return null;
-        return this.entries.compute(id, (id0, entry) ->
+        synchronized (this.entries)
         {
+            Entry entry = this.entries.get(id);
             if (entry == null)
             {
-                entry = this.loadEntry(id0, minEpoch);
+                entry = this.loadEntry(id, minEpoch);
+                if (entry != null) this.entries.put(id, entry);
             }
-            else if (entry.modified >= minEpoch)
+            if (entry != null && minEpoch != ALWAYS_FETCH && entry.modified >= minEpoch)
             {
                 return entry;
             }
             if (populate != null) try
             {
-                T value = populate.populate(id0);
+                T value = populate.populate(id);
                 if (value != null)
                 {
+                    this.remove404(id);
                     if (entry == null)
                     {
-                        entry = new Entry(id0, value, 0L);
+                        entry = new Entry(id, value, 0L);
                     }
                     else
                     {
                         entry.value = value;
                     }
                     entry.save();
+                    this.entries.put(id, entry);
+                    return entry;
                 }
             }
             catch (Exception ex)
             {
-                LOG.error("Exception populating JSON cache of kind `"+this.kind+"`, id `"+id0+"`");
+                LOG.error("Exception populating JSON cache of kind `"+this.kind+"`, id `"+id+"`");
                 
             }
-            return entry;
-        });
+            // Retain an old entry for callers that explicitly allow cached data,
+            // but never present it as satisfying this caller's freshness limit.
+            return null;
+        }
     }
 
     public void put(String id, T value)
@@ -203,9 +247,13 @@ public class ScarletJsonCache<T>
             return;
         if (value == null)
             return;
-        Entry entry = this.entries.computeIfAbsent(id, Entry::new);
-        entry.value = value;
-        entry.save();
+        this.remove404(id);
+        synchronized (this.entries)
+        {
+            Entry entry = this.entries.computeIfAbsent(id, Entry::new);
+            entry.value = value;
+            entry.save();
+        }
     }
 
     private Entry loadEntry(String id, long minEpoch)
@@ -320,8 +368,8 @@ public class ScarletJsonCache<T>
             this.modified = modified;
         }
         private final String id;
-        private T value;
-        private long modified;
+        private volatile T value;
+        private volatile long modified;
         public String id()
         {
             return this.id;
@@ -336,7 +384,10 @@ public class ScarletJsonCache<T>
         }
         public void save()
         {
-            ScarletJsonCache.this.saveEntry(this);
+            synchronized (ScarletJsonCache.this.entries)
+            {
+                ScarletJsonCache.this.saveEntry(this);
+            }
         }
     }
 

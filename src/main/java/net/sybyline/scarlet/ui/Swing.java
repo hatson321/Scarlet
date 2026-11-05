@@ -162,14 +162,9 @@ public class Swing
         }
         CLASSIC_MODE = classic;
 
-        if (!CLASSIC_MODE)
-        {
-            // Read saved accent from settings.json before building the theme.
-            // Scarlet.dir is a static final set before any Scarlet instance is
-            // constructed, so it is safe to read here.
-            Color savedAccent = loadSavedAccent();
-            applyTheme(savedAccent != null ? savedAccent : DEFAULT_ACCENT);
-        }
+        // Hand-styled components need the palette even when FlatLaf cannot load.
+        Color savedAccent = loadSavedAccent();
+        applyTheme(savedAccent != null ? savedAccent : DEFAULT_ACCENT);
     }
 
     /**
@@ -233,9 +228,11 @@ public class Swing
      */
     public static void applyTheme(Color accent)
     {
-        // Skip theming in classic mode because these UIManager keys are FlatLaf-specific.
-        if (CLASSIC_MODE)
-            return;
+        applyTheme(accent, CLASSIC_MODE);
+    }
+
+    static void applyTheme(Color accent, boolean classicMode)
+    {
         // Derive companion colours from the accent
         Color accentDark = new Color(
             Math.max(0, accent.getRed()   - 50),
@@ -252,6 +249,10 @@ public class Swing
         ACCENT_DARK = accentDark;
         ACCENT_GLOW = accentGlow;
         SEL_BG      = selBg;
+
+        // Keep the system look and feel; only the shared palette applies in classic mode.
+        if (classicMode)
+            return;
 
         // ── Apply to UIManager (palette constants are the class-level statics) ─
         UIManager.put("@accentColor",                  accent);
@@ -1049,60 +1050,34 @@ public class Swing
 
     public static Font fontForText(String text, Font baseFont)
     {
-        if (text == null || text.isEmpty())
-            return baseFont;
+        return fontForText(text, baseFont, () -> fallbackFamilies().stream()
+            .map(family -> new Font(family, baseFont.getStyle(), baseFont.getSize()).deriveFont(baseFont.getSize2D()))
+            .collect(java.util.stream.Collectors.toList()));
+    }
 
+    static Font fontForText(String text, Font baseFont, java.util.function.Supplier<java.util.List<Font>> candidates)
+    {
+        if (text == null || text.isEmpty() || baseFont == null) return baseFont;
         int firstMissing = firstMissingCodePoint(text, baseFont);
-        if (firstMissing < 0)
-            return baseFont;
-
-        // Find the first codepoint the base font cannot display and derive
-        // a cache key from its Unicode script
-        Character.UnicodeScript needScript = null;
-        try { needScript = Character.UnicodeScript.of(firstMissing); }
-        catch (IllegalArgumentException ex) { needScript = Character.UnicodeScript.UNKNOWN; }
-        if (needScript == null)
-            return baseFont;
-
-        String cacheKey = needScript.name() + ":" + baseFont.getSize() + ":" + baseFont.getStyle();
-        java.util.Optional<Font> cached = FALLBACK_CACHE.get(cacheKey);
-        if (cached != null)
-            return cached.orElse(baseFont);
-
-        // Search fallback families for one that covers the script
-        Font found = null;
-        for (String family : fallbackFamilies())
+        if (firstMissing < 0) return baseFont;
+        Character.UnicodeScript script = Character.UnicodeScript.of(firstMissing);
+        String key = baseFont.getName() + ":" + baseFont.getSize2D() + ":" + baseFont.getStyle() + ":" + script;
+        java.util.Optional<Font> cached = FALLBACK_CACHE.get(key);
+        if (cached != null && cached.isPresent() && fontCovers(cached.get(), text)) return cached.get();
+        for (Font candidate : candidates.get())
         {
-            Font candidate = new Font(family, baseFont.getStyle(), baseFont.getSize());
-            if (candidate.canDisplay(firstMissing))
+            if (candidate != null && fontCovers(candidate, text))
             {
-                // Quick check passed: verify every codepoint the base font lacks.
-                boolean covers = true;
-                for (int i = 0; i < text.length(); )
+                synchronized (FALLBACK_CACHE)
                 {
-                    int cp = text.codePointAt(i);
-                    i += Character.charCount(cp);
-                    if (!baseFont.canDisplay(cp) && !candidate.canDisplay(cp))
-                    {
-                        covers = false;
-                        break;
-                    }
+                    if (FALLBACK_CACHE.size() >= 256) FALLBACK_CACHE.clear();
+                    FALLBACK_CACHE.put(key, java.util.Optional.of(candidate));
                 }
-                if (covers)
-                {
-                    found = candidate;
-                    break;
-                }
+                return candidate;
             }
         }
-
-        java.util.Optional<Font> result = java.util.Optional.ofNullable(found);
-        FALLBACK_CACHE.put(cacheKey, result);
-        if (found != null)
-            LOG.debug("Font fallback: {} for script {} → {}", baseFont.getFamily(), needScript, found.getFamily());
-        else
-            LOG.warn("No font fallback found for script {} (text: {})", needScript, text);
-        return found != null ? found : baseFont;
+        // A mixed-script miss must not prevent a later name from finding a font.
+        return baseFont;
     }
 
     private static boolean fontCovers(Font font, String text)

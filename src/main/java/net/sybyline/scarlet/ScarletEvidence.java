@@ -99,16 +99,18 @@ public class ScarletEvidence
         }
         public File nextFile(String evidenceRoot, String format) throws IOException
         {
-            File root = new File(evidenceRoot).getCanonicalFile();
-            File file = new File(root, sanitizeRelativePath(this.format(format))).getCanonicalFile();
+            File root = new File(evidenceRoot).getAbsoluteFile();
+            File file = new File(root, sanitizeRelativePath(this.format(format))).getAbsoluteFile();
             if (!file.toPath().startsWith(root.toPath()))
                 throw new IOException("Refusing to write evidence outside configured evidence root");
-            if (format.contains("{index}"))
+            if (format != null && format.contains("{index}"))
             {
-                while (file.isFile())
+                int collisions = 0;
+                while (java.nio.file.Files.exists(file.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS))
                 {
+                    if (++collisions > 10000) throw new IOException("No free evidence filename available");
                     this.incrementIndex();
-                    file = new File(root, sanitizeRelativePath(this.format(format))).getCanonicalFile();
+                    file = new File(root, sanitizeRelativePath(this.format(format))).getAbsoluteFile();
                     if (!file.toPath().startsWith(root.toPath()))
                         throw new IOException("Refusing to write evidence outside configured evidence root");
                 }

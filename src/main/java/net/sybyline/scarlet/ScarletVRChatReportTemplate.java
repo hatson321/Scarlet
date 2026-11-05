@@ -82,15 +82,20 @@ public class ScarletVRChatReportTemplate
     {
         if (contents == null || contents.trim().isEmpty())
             return false;
-        this.contents = contents;
         this.templateFile.getParentFile().mkdirs();
+        this.persist(contents);
+        this.contents = contents;
+        this.lastModified = this.templateFile.lastModified();
+        return true;
+    }
+
+    void persist(String contents) throws IOException
+    {
         try (net.sybyline.scarlet.util.FileBackups.AtomicWriter out = net.sybyline.scarlet.util.FileBackups.writer(this.templateFile))
         {
             out.append(contents);
             out.commit();
         }
-        this.lastModified = this.templateFile.lastModified();
-        return true;
     }
 
     public static final String MISSING = "???????";

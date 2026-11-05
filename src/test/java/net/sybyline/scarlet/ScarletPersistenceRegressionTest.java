@@ -16,6 +16,17 @@ import net.sybyline.scarlet.util.ProcLock;
 
 class ScarletPersistenceRegressionTest
 {
+    @org.junit.jupiter.api.Test void evidenceSequenceCountsSubmissionsIndependentlyOfAuditHistory()
+    {
+        ScarletData.UserMetadata metadata = new ScarletData.UserMetadata();
+        metadata.auditEntryIds = new String[]{"audit-one", "audit-two", "audit-three"};
+        assertEquals(0, metadata.getUserCaseEvidenceCount());
+        metadata.addUserCaseEvidence(new ScarletData.EvidenceSubmission());
+        assertEquals(1, metadata.getUserCaseEvidenceCount());
+        metadata.auditEntryIds = null;
+        metadata.addUserCaseEvidence(new ScarletData.EvidenceSubmission());
+        assertEquals(2, metadata.getUserCaseEvidenceCount());
+    }
     @TempDir Path directory;
 
     @Test void settingsPersistNormalizedValuesAndValidateLoadedValues() throws Exception

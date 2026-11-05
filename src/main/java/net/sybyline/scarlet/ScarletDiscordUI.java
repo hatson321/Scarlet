@@ -96,9 +96,11 @@ public class ScarletDiscordUI
             event.reply("That group is not watched").setEphemeral(true).queue();
             return;
         }
-        event.reply("Set notes for group").setEphemeral(true).queue();
         watchedGroup.notes = event.getValue("notes").getAsString();
-        this.discord.scarlet.watchedGroups.save();
+        try { this.discord.scarlet.watchedGroups.updateWatchedGroup(watchedGroup); }
+        catch (IllegalStateException failure)
+        { event.reply("Could not save notes. Reload the entry and retry.").setEphemeral(true).queue(); return; }
+        event.reply("Saved notes.").setEphemeral(true).queue();
     }
 
     @ModalSub("watched-entity-set-notes")
@@ -170,21 +172,67 @@ public class ScarletDiscordUI
             return null;
         try
         {
-            return channel.getHistoryFromBeginning(3).complete().getRetrievedHistory().stream()
-                .map(Message::getComponentTree)
-                .map($ -> $.findAll(Button.class))
-                .flatMap(List::stream)
-                .map(Button::getCustomId)
-                .filter($ -> $ != null && $.startsWith("edit-tags:"))
-                .map($ -> $.split(":")[1])
-                .findFirst()
-                .orElse(null);
+            for (Message message : channel.getHistoryFromBeginning(3).complete().getRetrievedHistory())
+                for (Button button : message.getComponentTree().findAll(Button.class))
+                {
+                    String customId = button.getCustomId();
+                    if (customId != null && customId.startsWith("edit-tags:"))
+                    {
+                        String auditId = customId.substring("edit-tags:".length());
+                        if (this.trustedThreadOrigin(auditId, message, channel)) return auditId;
+                    }
+                }
+            return null;
         }
         catch (Exception ex)
         {
             LOG.warn("Could not read moderation thread "+channel.getId()+" to find its audit entry", ex);
             return null;
         }
+    }
+
+    boolean trustedThreadOrigin(String auditId, Message message, MessageChannel channel)
+    {
+        try
+        {
+            ScarletData.AuditEntryMetadata meta = this.interactionMetadata(auditId);
+            return meta != null && message != null && message.isFromGuild() && !message.isWebhookMessage()
+                && this.discord.jda != null && this.discord.jda.getSelfUser().getId().equals(message.getAuthor().getId())
+                && this.discord.guildSf.equals(message.getGuild().getId())
+                && Objects.equals(meta.auxMessageSnowflake, message.getId())
+                && channel instanceof ThreadChannel && channel.getId().equals(message.getChannel().getId())
+                && this.discord.auditThreadDestinationProblem(meta, (ThreadChannel)channel) == null;
+        }
+        catch (RuntimeException unavailable) { return false; }
+    }
+
+    private ScarletData.AuditEntryMetadata interactionMetadata(String auditId)
+    {
+        if (auditId == null || !auditId.matches("[A-Za-z0-9_-]{1,128}")) return null;
+        ScarletData.AuditEntryMetadata meta = this.discord.scarlet.data.auditEntryMetadata(auditId);
+        return meta != null && meta.entry != null && auditId.equals(meta.entry.getId())
+            && this.discord.scarlet.vrc != null && Objects.equals(this.discord.scarlet.vrc.groupId, meta.entry.getGroupId())
+            && this.discord.guildSf != null && this.discord.guildSf.equals(meta.guildSnowflake) ? meta : null;
+    }
+
+    String auditBindingDenial(Member member, MessageChannel channel, String auditId)
+    {
+        try
+        {
+            ScarletData.AuditEntryMetadata meta = this.interactionMetadata(auditId);
+            if (meta == null || member == null || !(channel instanceof net.dv8tion.jda.api.entities.channel.middleman.GuildChannel))
+                return "The stored audit event and its destination cannot be verified.";
+            net.dv8tion.jda.api.entities.channel.middleman.GuildChannel gc = (net.dv8tion.jda.api.entities.channel.middleman.GuildChannel)channel;
+            Member current = gc.getGuild().getMemberById(member.getId());
+            if (!this.discord.guildSf.equals(gc.getGuild().getId()) || !this.discord.guildSf.equals(member.getGuild().getId())
+                || current == null || !current.hasPermission(gc, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY)
+                || !this.discord.auditVisibleTo(meta, current.getId())) return "You no longer have access to this audit event.";
+            if (channel instanceof ThreadChannel)
+                return this.discord.auditThreadDestinationProblem(meta, (ThreadChannel)channel);
+            return channel.getId().equals(meta.channelSnowflake) && channel.getId().equals(this.discord.approvedAuditChannel(meta))
+                ? null : "This is not the recorded audit destination.";
+        }
+        catch (RuntimeException unavailable) { return "The audit event or its permissions are unavailable. Please retry."; }
     }
 
     /** Every tag, split across Discord's 25-option menus (max five rows = 125 tags, Scarlet's tag cap), with existing tags pre-ticked. */
@@ -664,12 +712,17 @@ public class ScarletDiscordUI
         String targetUserId = parts[1];
         if (!this.checkPendingBanOwnership(event, targetUserId))
             return;
-        if (this.discord.scarlet.pendingModActions.setBanInfoTags(targetUserId, event.getValues().toArray(new String[0])))
+        try
         {
-            event.reply("No pending ban").setEphemeral(true).queue();
-            return;
+            if (!this.discord.scarlet.pendingModActions.setBanInfoTags(targetUserId, event.getValues().toArray(new String[0])))
+            {
+                event.reply("No pending ban").setEphemeral(true).queue();
+                return;
+            }
+            event.deferEdit().queue();
         }
-        event.deferEdit().queue();
+        catch (IllegalStateException failure)
+        { event.reply("Could not save the pending ban tags. Please retry.").setEphemeral(true).queue(); }
     }
 
     @ButtonClk("immediate-ban-edit-desc")
@@ -697,12 +750,17 @@ public class ScarletDiscordUI
         String targetUserId = parts[1];
         if (!this.checkPendingBanOwnership(event, targetUserId))
             return;
-        if (this.discord.scarlet.pendingModActions.setBanInfoDescription(targetUserId, event.getValue("input-desc:"+targetUserId).getAsString()))
+        try
         {
-            event.reply("No pending ban").setEphemeral(true).queue();
-            return;
+            if (!this.discord.scarlet.pendingModActions.setBanInfoDescription(targetUserId, event.getValue("input-desc:"+targetUserId).getAsString()))
+            {
+                event.reply("No pending ban").setEphemeral(true).queue();
+                return;
+            }
+            event.deferEdit().queue();
         }
-        event.deferEdit().queue();
+        catch (IllegalStateException failure)
+        { event.reply("Could not save the pending ban description. Please retry.").setEphemeral(true).queue(); }
     }
 
     @ButtonClk("immediate-ban-cancel")
@@ -1583,26 +1641,14 @@ public class ScarletDiscordUI
             return;
         }
         
-        String[] partsRef = channel
-            .getHistoryFromBeginning(2)
-            .complete()
-            .getRetrievedHistory()
-            .stream()
-            .map(Message::getComponentTree)
-            .map($->$.findAll(Button.class))
-            .flatMap(List::stream)
-            .filter($ -> $.getCustomId().startsWith("edit-tags:"))
-            .findFirst()
-            .map($ -> $.getCustomId().split(":"))
-            .orElse(null)
-            ;
-        
-        if (partsRef == null)
+        String auditEntryId = this.auditEntryIdForThread(channel);
+        if (auditEntryId == null)
         {
-            hook.sendMessage("Could not determine audit event id.").setEphemeral(true).queue();
+            hook.sendMessage("Could not verify this Scarlet audit thread.").setEphemeral(true).queue();
             return;
         }
-        
+        if (!this.checkAuditEntryTagAccess(event.getMember(), channel, hook, auditEntryId)) return;
+
         List<Message.Attachment> attachments = getAttachments.get();//message.getAttachments();
         
         if (attachments.isEmpty())
@@ -1611,7 +1657,6 @@ public class ScarletDiscordUI
             return;
         }
         
-        String auditEntryId = partsRef[1];
         
         ScarletData.AuditEntryMetadata auditEntryMeta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
         if (auditEntryMeta == null || auditEntryMeta.entry == null)
@@ -1626,8 +1671,7 @@ public class ScarletDiscordUI
                requesterDisplayName = event.getUser().getEffectiveName();
         OffsetDateTime timestamp = event.getTimeCreated();
         
-        // TODO : better model for avoiding race conditions
-        synchronized (auditEntryTargetId.intern())
+        final String selectedEvidenceRoot = evidenceRoot;
         {
             
             ScarletData.UserMetadata auditEntryTargetUserMeta = this.discord.scarlet.data.userMetadata(auditEntryTargetId);
@@ -1655,21 +1699,29 @@ public class ScarletDiscordUI
                 try
                 {
                     File dest = filePath.nextFile(evidenceRoot, this.discord.evidenceFilePathFormat.get());
-                    if (dest.isFile())
-                    {
-                        hook.sendMessageFormat("File '%s' already exists, skipping.", fileName).setEphemeral(true).queue();
-                        continue;
-                    }
-                    if (!dest.getParentFile().isDirectory())
-                        dest.getParentFile().mkdirs();
-                    attachment.getProxy().downloadToFile(dest).join();
-                    
-                    ScarletData.EvidenceSubmission evidence = new ScarletData.EvidenceSubmission(auditEntryId, requesterSf, requesterDisplayName, timestamp, fileName, filePath.prevFormat(), attachmentUrl, attachmentProxyUrl);
-                    auditEntryTargetUserMeta = this.discord.scarlet.data.updateUserMetadata(auditEntryTargetId,
-                        metadata -> { metadata.addUserCaseEvidence(evidence); return metadata; });
-                    
-                    hook.sendMessageFormat("Saved '%s'.", filePath.prevFormat()).setEphemeral(true).queue();
-                    LOG.info(String.format("%s (<@%s>) saved evidence to '%s'.", requesterDisplayName, requesterSf, filePath.prevFormat()));
+                    if (attachment.getSize() > ScarletEvidenceStore.MAX_BYTES) throw new java.io.IOException("Evidence attachment exceeds 25 MiB");
+                    java.nio.file.Path rootPath = java.nio.file.Path.of(selectedEvidenceRoot).toAbsolutePath().normalize();
+                    String receiptKey = ScarletEvidenceStore.key(auditEntryId + "\n" + auditEntryTargetId + "\n" + attachment.getId());
+                    String saved = ScarletEvidenceStore.save(rootPath, receiptKey, rootPath.relativize(dest.toPath().toAbsolutePath().normalize()).toString(),
+                        () -> net.sybyline.scarlet.util.HttpURLInputStream.get(attachmentUrl, connection -> {
+                            connection.setConnectTimeout(15_000); connection.setReadTimeout(15_000);
+                        }, net.sybyline.scarlet.util.HttpURLInputStream.PUBLIC_ONLY),
+                        () -> this.discord.evidenceEnabled.get() && selectedEvidenceRoot.equals(this.discord.evidenceRoot)
+                            && this.auditBindingDenial(event.getMember(), channel, auditEntryId) == null
+                            && ScarletAuditPrivacy.sameRecordedAudit(auditEntryMeta, this.discord.scarlet.data.auditEntryMetadata(auditEntryId)),
+                        relative -> this.discord.scarlet.data.updateUserMetadata(auditEntryTargetId, metadata -> {
+                            if (metadata.evidenceSubmissions != null)
+                                for (ScarletData.EvidenceSubmission existing : metadata.evidenceSubmissions)
+                                    if (receiptKey.equals(existing.receiptId)) return metadata;
+                            ScarletData.EvidenceSubmission evidence = new ScarletData.EvidenceSubmission(auditEntryId, requesterSf,
+                                requesterDisplayName, timestamp, fileName, relative, attachmentUrl, attachmentProxyUrl);
+                            evidence.receiptId = receiptKey;
+                            metadata.addUserCaseEvidence(evidence);
+                            return metadata;
+                        }));
+                    auditEntryTargetUserMeta = this.discord.scarlet.data.userMetadata(auditEntryTargetId);
+                    hook.sendMessageFormat("Saved '%s'.", saved).setEphemeral(true).queue();
+                    LOG.info("Evidence file and metadata saved for audit {}", auditEntryId);
                 }
                 catch (Exception ex)
                 {
@@ -2180,6 +2232,9 @@ public class ScarletDiscordUI
      */
     String auditEntryTagDenial(Member member, net.dv8tion.jda.api.entities.channel.middleman.MessageChannel channel, String auditEntryId)
     {
+        String binding = this.auditBindingDenial(member, channel, auditEntryId);
+        if (binding != null) return binding;
+        member = ((net.dv8tion.jda.api.entities.channel.middleman.GuildChannel)channel).getGuild().getMemberById(member.getId());
         if (member == null)
             return "Could not determine your guild permissions.";
         // Staff are whoever the server lets post in its moderation threads: if your role can send
@@ -2192,22 +2247,22 @@ public class ScarletDiscordUI
                 ? net.dv8tion.jda.api.Permission.MESSAGE_SEND_IN_THREADS
                 : net.dv8tion.jda.api.Permission.MESSAGE_SEND;
             if (member.hasPermission(gc, net.dv8tion.jda.api.Permission.VIEW_CHANNEL, post))
-                return null;
+                return this.auditBindingDenial(member, channel, auditEntryId);
         }
         if (this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_bans_manage, member)
             || this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_BANS_MANAGE, member, false)
             || this.discord.checkMemberHasScarletPermission(ScarletPermission.GROUPEX_TAGS_EDIT, member, false)
             || member.hasPermission(net.dv8tion.jda.api.Permission.MODERATE_MEMBERS)
             || member.hasPermission(net.dv8tion.jda.api.Permission.MANAGE_SERVER))
-            return null;
+            return this.auditBindingDenial(member, channel, auditEntryId);
         String vrcId = this.discord.scarlet.data.globalMetadata_getSnowflakeId(member.getId());
         if (vrcId != null)
         {
             if (this.discord.checkMemberHasVRChatPermission(GroupPermissions.group_instance_moderate, member))
-                return null;
+                return this.auditBindingDenial(member, channel, auditEntryId);
             ScarletData.AuditEntryMetadata meta = this.discord.scarlet.data.auditEntryMetadata(auditEntryId);
             if (meta != null && meta.entry != null && (vrcId.equals(meta.entry.getActorId()) || vrcId.equals(meta.auxActorId)))
-                return null;
+                return this.auditBindingDenial(member, channel, auditEntryId);
         }
         LOG.warn("Rejected tag/description edit by {} for audit entry {}", member.getId(), auditEntryId);
         return vrcId == null

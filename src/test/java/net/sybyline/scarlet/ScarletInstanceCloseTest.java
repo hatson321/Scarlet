@@ -485,12 +485,14 @@ class ScarletInstanceCloseTest
 
         String text() throws Exception
         {
+            assertTrue(ScarletLogger.awaitConsoleIdle(2000));
             output.flush();
             return bytes.toString("UTF-8");
         }
 
         @Override public void close()
         {
+            ScarletLogger.awaitConsoleIdle(2000);
             System.setOut(previousOutput);
             ScarletLogger.setConsoleOnly(previousConsoleOnly);
             output.close();

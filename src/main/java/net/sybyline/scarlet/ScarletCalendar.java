@@ -53,6 +53,24 @@ public class ScarletCalendar
 
     static final Logger LOG = LoggerFactory.getLogger("Scarlet/Calendar");
 
+    static Icon loadCoverImage(ModelFile file, java.util.concurrent.Callable<java.io.InputStream> open) throws Exception
+    {
+        if (file == null || file.getMimeType() == null) return null;
+        Icon.IconType type;
+        switch (file.getMimeType())
+        {
+        case IMAGE_GIF: type = Icon.IconType.GIF; break;
+        case IMAGE_JPEG: case IMAGE_JPG: type = Icon.IconType.JPEG; break;
+        case IMAGE_PNG: type = Icon.IconType.PNG; break;
+        case IMAGE_WEBP: type = Icon.IconType.WEBP; break;
+        default: return null;
+        }
+        try (java.io.InputStream input = open.call())
+        {
+            return Icon.from(input, type);
+        }
+    }
+
     public ScarletCalendar(Scarlet scarlet, File calendarFile)
     {
         this.scarlet = scarlet;
@@ -84,6 +102,7 @@ public class ScarletCalendar
         public Frequency frequency = Frequency.ONE_OFF;
         public LocalDate date;
         public OffsetTime time;
+        public String timeZoneId;
         public Duration duration = Duration.ofHours(1L);
         
         public CreateCalendarEventRequest vrcCalendarEventParameters = new CreateCalendarEventRequest();
@@ -91,6 +110,17 @@ public class ScarletCalendar
         
         public Map<LocalDate, Scheduled> pending = new HashMap<>();
         private transient boolean receiptSavePending;
+
+        java.time.ZoneId zone()
+        {
+            return this.timeZoneId == null ? (this.time == null ? ZoneOffset.UTC : this.time.getOffset()) : java.time.ZoneId.of(this.timeZoneId);
+        }
+
+        OffsetDateTime startOn(LocalDate date)
+        {
+            // Gaps move forward by the gap; overlaps select the earlier occurrence once.
+            return date.atTime(this.time.toLocalTime()).atZone(this.zone()).toOffsetDateTime();
+        }
         
         public synchronized EmbedBuilder embed(EmbedBuilder builder)
         {
@@ -100,12 +130,12 @@ public class ScarletCalendar
                 .setThumbnail(this.vrcCalendarEventParameters.getImageId() == null ? null : (VrcWeb.file1Data(this.vrcCalendarEventParameters.getImageId())))
                 .addField("ID", this.id, false)
                 .addField("Scheduling", this.active?"Active":"Inactive", true)
-                .addField("Time", String.valueOf(this.time), true)
+                .addField("Time", this.timeZoneId == null ? String.valueOf(this.time) : this.time.toLocalTime()+" "+this.timeZoneId, true)
                 .addField("Duration", String.valueOf(MiscUtils.stringify_ymd_hms(this.duration)), true)
                 .addField("Category", GroupEventCategory.of(this.vrcCalendarEventParameters.getCategory()).display(), true)
             ;
             Scheduled scheduled = this.pending.values().stream().min(Comparator.comparing($->$.start)).orElse(null);
-            String epochStarting = Long.toUnsignedString((scheduled == null ? this.date.atTime(this.time) : scheduled.start).toEpochSecond());
+            String epochStarting = Long.toUnsignedString((scheduled == null ? this.startOn(this.date) : scheduled.start).toEpochSecond());
             builder.addField("Next event", "<t:"+epochStarting+":D> (<t:"+epochStarting+":R>)", false);
             if (scheduled != null)
             {
@@ -135,14 +165,14 @@ public class ScarletCalendar
 if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
             if (!this.active)
                 return;
-            LocalDate nowDate = now.toLocalDate();
+            LocalDate nowDate = now.atZoneSameInstant(this.zone()).toLocalDate();
             LocalDate nextDate = this.date;
             if (nextDate != null)
             {
                 int diff = this.maxPending - this.pending.size();
                 if (diff > 0)
                 {
-                    while (nextDate != null && nextDate.atTime(this.time).isBefore(now))
+                    while (nextDate != null && this.startOn(nextDate).isBefore(now))
                     {
                         nextDate = this.frequency.next(nextDate);
                     }
@@ -189,7 +219,7 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
         public synchronized void makeEvent(ScarletCalendar calendar, ScarletVRChat vrc, String groupId, ScarletDiscordJDA discord, LocalDate futureDate)
         {
             if (calendar.loadFailed) return;
-            OffsetDateTime start = futureDate.atTime(this.time),
+            OffsetDateTime start = this.startOn(futureDate),
                     end = start.plus(this.duration);
             Scheduled scheduled = this.getOrCreatePending(futureDate, start, end);
             
@@ -266,30 +296,7 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
                     if (imageId != null && imageUrl != null) try
                     {
                         ModelFile file = vrc.getModelFile(imageId);
-                        if (file != null)
-                        {
-                            Icon.IconType type = null;
-                            switch (file.getMimeType())
-                            {
-                            case IMAGE_GIF:
-                                type = Icon.IconType.GIF;
-                            break;
-                            case IMAGE_JPEG: case IMAGE_JPG:
-                                type = Icon.IconType.JPEG;
-                            break;
-                            case IMAGE_PNG:
-                                type = Icon.IconType.PNG;
-                            break;
-                            case IMAGE_WEBP:
-                                type = Icon.IconType.WEBP;
-                            break;
-                            default:
-                            }
-                            if (type != null)
-                            {
-                                icon = Icon.from(HttpURLInputStream.get(imageUrl, HttpURLInputStream.PUBLIC_ONLY), null);
-                            }
-                        }
+                        icon = loadCoverImage(file, () -> HttpURLInputStream.get(imageUrl, HttpURLInputStream.PUBLIC_ONLY));
                     }
                     catch (Exception ex)
                     {
@@ -633,6 +640,7 @@ if(Scarlet.IS_DEV_ENV){groupId="grp_c19f568a-d105-442d-b82a-b5a2e103d13d";}
                     if (event == null || event.frequency == null || event.pending == null
                         || event.pending.containsKey(null) || event.pending.containsValue(null))
                         throw new IOException("Invalid calendar schedule state");
+                    if (event.timeZoneId != null) java.time.ZoneId.of(event.timeZoneId);
                     // Older versions could save a pending date before its successful
                     // API receipt. Absence of that receipt is not permission to replay.
                     for (Scheduled scheduled : event.pending.values())

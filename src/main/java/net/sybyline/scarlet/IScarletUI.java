@@ -24,7 +24,9 @@ public interface IScarletUI extends Closeable
     {
         if (Platform.forceHeadlessUi() || GraphicsEnvironment.isHeadless())
             return new ScarletUIHeadless();
-        return new ScarletUI(scarlet);
+        ScarletUI[] created = new ScarletUI[1];
+        net.sybyline.scarlet.ui.Swing.invokeWait(() -> created[0] = new ScarletUI(scarlet));
+        return created[0];
     }
 
     /**
