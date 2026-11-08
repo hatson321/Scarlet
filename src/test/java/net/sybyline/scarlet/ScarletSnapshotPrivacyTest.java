@@ -92,13 +92,15 @@ class ScarletSnapshotPrivacyTest
             JsonObject hidden = group(); hidden.addProperty("memberVisibility", "hidden"); groups.add(hidden);
             f.reply(groups.toString());
             f.reply(group().toString());
+            f.reply(self().toString());
             ScarletData.AuditEntryMetadata metadata = ScarletDiscordSafetyTest.metadata(AUDIT, "ordinary");
             metadata.entry.setTargetId(USER);
             assertEquals(1, f.vrc.snapshot(metadata).size());
-            assertEquals(3, f.requests.size());
+            assertEquals(4, f.requests.size());
             f.assertGet(0, "/users/" + USER);
             f.assertGet(1, "/users/" + USER + "/groups");
             f.assertGet(2, "/users/" + USER + "/groups/represented");
+            f.assertGet(3, "/profile/" + USER);
             assertPublic(metadata.snapshotTargetUser);
             assertFalse(Scarlet.GSON.toJson(metadata).contains("PRIVATE_"));
             ScarletData data = new ScarletData(temp.resolve("data").toFile());
@@ -125,7 +127,7 @@ class ScarletSnapshotPrivacyTest
             assertTrue(f.requests.isEmpty());
             metadata.entryRedacted = false;
             metadata.snapshotTargetUser = self();
-            f.reply(403, "{}"); f.reply(403, "{}"); f.reply(403, "{}");
+            f.reply(403, "{}"); f.reply(403, "{}"); f.reply(403, "{}"); f.reply(403, "{}");
             f.vrc.snapshot(metadata);
             assertNull(metadata.snapshotTargetUser);
             assertNull(metadata.snapshotTargetUserGroups);
@@ -165,10 +167,10 @@ class ScarletSnapshotPrivacyTest
         raw.add("bioLinks", links);
         JsonObject safe = ScarletSnapshotPrivacy.user(raw, USER);
         assertEquals(32, safe.getAsJsonArray("bioLinks").size());
-        for (MessageEmbed embed : ScarletSnapshotPrivacy.embeds(safe))
+        for (MessageEmbed embed : ScarletSnapshotEmbeds.user(safe))
         {
-            assertTrue(embed.getDescription().length() <= 2000);
-            assertTrue(embed.getFields().isEmpty());
+            assertTrue(embed.getDescription().length() <= 4096);
+            assertTrue(embed.getLength() <= 6000);
         }
         JsonArray groups = new JsonArray();
         for (int i = 0; i < 250; i++) groups.add(group());
@@ -314,8 +316,8 @@ class ScarletSnapshotPrivacyTest
             {
                 assertFalse(embed.toData().toString().contains("PRIVATE_"));
                 assertFalse(java.util.Arrays.asList("username", "obfuscatedEmail", "email", "twoFactorAuthEnabled", "friends", "presence").contains(embed.getTitle()));
-                assertTrue(embed.getDescription().length() <= 2000);
-                assertTrue(embed.getFields().isEmpty());
+                assertTrue(embed.getDescription().length() <= 4096);
+                assertTrue(embed.getLength() <= 6000);
             }
         }
     }

@@ -133,7 +133,11 @@ class ScarletVersionTest
         assertTrue(MiscUtils.isPreviewVersion("0.6.2-a1"));
         assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", "0.6.1") > 0);
         assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", "0.6.2") < 0);
-        assertEquals("0.6.2-a1", Scarlet.VERSION);
+        assertEquals("0.6.2-T3", Scarlet.VERSION);
+        assertTrue(MiscUtils.isPreviewVersion(Scarlet.VERSION));
+        assertTrue(MiscUtils.compareScarletVersion(Scarlet.VERSION, "0.6.2-a1") > 0);
+        assertTrue(MiscUtils.compareScarletVersion(Scarlet.VERSION, "0.6.2-T2") > 0);
+        assertTrue(MiscUtils.compareScarletVersion(Scarlet.VERSION, "0.6.2") < 0);
     }
 
     @Test void publicAlphaCandidateOrdersAfterDeliveredAlphasAndBeforeStable() throws Exception
@@ -159,7 +163,7 @@ class ScarletVersionTest
 
     @Test void testBuildsSortAfterAlphaBuildsAndBeforeTheStableRelease()
     {
-        String[] ordered = {"0.6.0", "0.6.1-a8", "0.6.1-T1", "0.6.1-T2", "0.6.1-T9", "0.6.1-T10", "0.6.1", "0.6.2-T1"};
+        String[] ordered = {"0.6.0", "0.6.1-a8", "0.6.1-T1", "0.6.1-T2", "0.6.1-T9", "0.6.1-T10", "0.6.1", "0.6.2-T2"};
         for (int i = 0; i < ordered.length; i++)
         {
             assertTrue(MiscUtils.isValidVersion(ordered[i]));

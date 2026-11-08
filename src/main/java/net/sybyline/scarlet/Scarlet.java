@@ -200,7 +200,7 @@ public class Scarlet implements Closeable
             if (implementationVersion != null && !implementationVersion.trim().isEmpty())
                 return implementationVersion.trim();
         }
-        return "0.6.2-a1";
+        return "0.6.2-T3";
     }
 
     public static void main(String[] args) throws Exception
@@ -241,10 +241,7 @@ public class Scarlet implements Closeable
                 Files.createDirectories(dir.toPath());
                 ScarletLogger.setConsoleOnly(false);
                 logRuntimeInformation();
-                if (Platform.isPowerPC() && Platform.isPpcEdition())
-                    LOG.warn("PowerPC edition on a PowerPC CPU: skipping startup security self-tests (their PBKDF2 derivations take many minutes without a JIT). Real encryption is unchanged.");
-                else
-                    SecurityRegressionChecks.runAll();
+                SecurityRegressionChecks.runAll();
                 try (Scarlet scarlet = new Scarlet())
                 {
                     scarlet.run();
@@ -3631,18 +3628,29 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
     void maybeRefresh()
     {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        if (this.wantsVrcRefresh || now.isAfter(this.settings.lastAuthRefresh.getOrSupply().plusHours(72)))
+        // Consume before refreshing so requests arriving in flight survive until the next poll.
+        if (VRC_REFRESH_REQUEST.getAndSet(this, 0) != 0
+            || now.isAfter(this.settings.lastAuthRefresh.getOrSupply().plusHours(72)))
         {
-            this.settings.lastAuthRefresh.set(now);
-            this.vrc.refresh();
-            this.wantsVrcRefresh = false;
+            try
+            {
+                this.settings.lastAuthRefresh.set(now);
+                this.vrc.refresh();
+            }
+            catch (RuntimeException | Error failure)
+            {
+                this.queueVrcRefresh();
+                throw failure;
+            }
         }
     }
 
-    boolean wantsVrcRefresh = false;
+    private static final java.util.concurrent.atomic.AtomicIntegerFieldUpdater<Scarlet> VRC_REFRESH_REQUEST =
+        java.util.concurrent.atomic.AtomicIntegerFieldUpdater.newUpdater(Scarlet.class, "wantsVrcRefresh");
+    volatile int wantsVrcRefresh;
     public void queueVrcRefresh()
     {
-        this.wantsVrcRefresh = true;
+        VRC_REFRESH_REQUEST.set(this, 1);
     }
     /** How much already-covered time each audit query re-fetches, so out-of-order-ingested entries are never missed. */
     static final long AUDIT_QUERY_OVERLAP_MINUTES = 5L;

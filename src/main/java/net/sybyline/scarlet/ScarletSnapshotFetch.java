@@ -20,7 +20,7 @@ final class ScarletSnapshotFetch
 {
     static final long DEADLINE_MILLIS = 8_000L;
     private final ThreadPoolExecutor executor = new ThreadPoolExecutor(3, 3, 30L, TimeUnit.SECONDS,
-        new ArrayBlockingQueue<>(6), task -> {
+        new ArrayBlockingQueue<>(9), task -> {
             Thread thread = new Thread(task, "Scarlet snapshot lookup");
             thread.setDaemon(true);
             return thread;
@@ -53,14 +53,14 @@ final class ScarletSnapshotFetch
 
     Result fetch(String targetId, BooleanSupplier allowed, long timeoutMillis, Read... reads)
     {
-        if (reads.length != 3) throw new IllegalArgumentException("Three snapshot reads required");
+        if (reads.length != 4) throw new IllegalArgumentException("Four snapshot reads required");
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         Batch batch = new Batch(reads);
         try
         {
             synchronized (this)
             {
-                // At most three batches (nine calls) may run or wait; reject excess work
+                // At most three batches (twelve calls) may run or wait; reject excess work
                 // instead of making the audit loop wait behind an unbounded work queue.
                 if (this.stopped || this.active.size() >= 3 || !allowed.getAsBoolean()) return null;
                 this.active.add(batch);
@@ -75,7 +75,7 @@ final class ScarletSnapshotFetch
                             // Futures must never retain raw API responses or exceptions containing
                             // response bodies. Only explicitly public projections leave the worker.
                             if (!allowed.getAsBoolean()) return null;
-                            if (kind == 0) return raw != null && raw.isJsonObject()
+                            if (kind == 0 || kind == 3) return raw != null && raw.isJsonObject()
                                 ? ScarletSnapshotPrivacy.user(raw.getAsJsonObject(), targetId) : null;
                             if (kind == 1) return raw != null && raw.isJsonArray()
                                 ? ScarletSnapshotPrivacy.groups(raw.getAsJsonArray()) : null;
@@ -91,7 +91,7 @@ final class ScarletSnapshotFetch
                     }));
                 }
             }
-            List<JsonElement> safe = new ArrayList<>(3);
+            List<JsonElement> safe = new ArrayList<>(4);
             for (Future<JsonElement> future : batch.futures)
             {
                 long remaining = deadline - System.nanoTime();
@@ -99,7 +99,8 @@ final class ScarletSnapshotFetch
                 safe.add(future.get(remaining, TimeUnit.NANOSECONDS));
             }
             if (!allowed.getAsBoolean() || Thread.currentThread().isInterrupted()) return null;
-            return new Result((JsonObject)safe.get(0), (JsonArray)safe.get(1), (JsonObject)safe.get(2));
+            return new Result(ScarletSnapshotPrivacy.mergeUser((JsonObject)safe.get(0), (JsonObject)safe.get(3)),
+                (JsonArray)safe.get(1), (JsonObject)safe.get(2));
         }
         catch (InterruptedException ex)
         {

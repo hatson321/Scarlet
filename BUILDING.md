@@ -66,11 +66,6 @@ Use distribution-provided compatible glibc, C++ and GCC runtime packages.
 Do not copy random shared libraries into system directories or replace the
 system loader to satisfy a version error; use a compatible supported distribution.
 
-> **PowerPC status:** the PowerPC edition remains experimental and is not part
-> of the supported Linux verification gate. Do not treat a successful x86-64
-> or AArch64 package check as PowerPC runtime validation. No PowerPC JAR is attached
-> to the standard desktop release; it is an experimental source-build output.
-
 ## Install the prerequisites on Linux
 
 Install a JDK 21 distribution and Apache Maven 3.9 or newer using packages from
@@ -102,8 +97,7 @@ It performs these steps in order:
 3. builds and installs all vendored `libdave-maven/` modules into the
    workspace-local Maven repository;
 4. runs Scarlet's full Maven `verify` lifecycle (including tests when present);
-5. validates the main, debug, and experimental PowerPC JAR manifests, plus the
-   packaged PowerPC ELF identity without claiming PowerPC runtime support;
+5. validates the main and debug JAR manifests and rejects obsolete edition markers or payloads;
 6. verifies the supported Linux x86-64 and AArch64 native payload names, ELF
    class, byte order, machine type, fallback C++ ABI requirements, ZIP safety, duplicate-entry absence, and
    the Java 11 base-class runtime floor;
@@ -208,14 +202,13 @@ All in `target/`:
 |---|---|
 | `scarlet-<version>.jar` | **the one you want** — shaded, desktop natives only |
 | `scarlet-<version>-debug.jar` | diagnostic build with the in-app Debug menu enabled; not the normal release download |
-| `scarlet-<version>-ppc.jar` | experimental PowerPC edition; not in the supported Linux gate |
 | `original-scarlet-<version>.jar` | pre-shade jar; not runnable on its own |
 | `SHA256SUMS-linux.txt` | SHA-256 checksums written by the Linux package verifier |
 | `SHA256SUMS-packages.txt` | SHA-256 checksums written by the Windows package verifier |
 
 The current source build produces no Android application or mobile companion.
 The published desktop assets are the standard Windows/Linux JAR, matching source
-ZIP and checksum file; building debug or PowerPC outputs does not publish them.
+ZIP and checksum file; building the debug output does not publish it.
 
 Run with:
 

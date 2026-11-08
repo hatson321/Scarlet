@@ -3735,17 +3735,24 @@ finally
         }
         java.util.function.BooleanSupplier allowed = () -> identity.valid()
             && !Thread.currentThread().isInterrupted();
-        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[3];
+        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[4];
         try
         {
             OkHttpClient http = snapshotHttpClient(this.client.getHttpClient(), primaryCookies, identity::valid);
-            String[] suffixes = {"", "/groups", "/groups/represented"};
+            String[] paths = {"/users/" + targetId, "/users/" + targetId + "/groups",
+                "/users/" + targetId + "/groups/represented", "/profile/" + targetId};
             for (int i = 0; i < reads.length; i++)
             {
                 Map<String, String> headers = new HashMap<>();
                 headers.put("Accept", "application/json");
-                Request request = this.client.buildCall(null, "/users/" + targetId + suffixes[i], "GET",
-                    new ArrayList<>(), new ArrayList<>(), null, headers, new HashMap<>(), new HashMap<>(),
+                java.util.List<io.github.vrchatapi.Pair> query = new ArrayList<>();
+                if (i == 3)
+                {
+                    query.addAll(this.client.parameterToPair("asSelf", Boolean.FALSE));
+                    query.addAll(this.client.parameterToPair("withGroupsAndWorlds", Boolean.FALSE));
+                }
+                Request request = this.client.buildCall(null, paths[i], "GET",
+                    query, new ArrayList<>(), null, headers, new HashMap<>(), new HashMap<>(),
                     new String[]{"authCookie"}, null).request().newBuilder()
                     .removeHeader("Authorization").removeHeader("Cookie").tag(SnapshotIdentity.class, identity).build();
                 final okhttp3.Call call = http.newCall(request);

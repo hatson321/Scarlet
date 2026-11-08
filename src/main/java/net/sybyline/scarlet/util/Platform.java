@@ -51,47 +51,6 @@ public enum Platform
     public boolean isXNU()   { return this == XNU; }
     public boolean isSun()   { return this == SUN; }
     public boolean isOther() { return this == OTHER; }
-    /**
-     * @return {@code true} when the JVM reports a PowerPC CPU (32- or 64-bit,
-     * either endianness), e.g. a Wii running Wii-Linux or an old PowerPC Mac.
-     * PowerPC is still classified as {@link Arch#OTHER}; this is a finer check.
-     */
-    public static boolean isPowerPC()
-    {
-        return ARCH_RAW.startsWith("ppc") || ARCH_RAW.startsWith("powerpc");
-    }
-
-    private static volatile Boolean PPC_EDITION;
-    /**
-     * @return {@code true} when this jar is the PowerPC edition, i.e. its
-     * manifest carries {@code Scarlet-Edition: ppc} (added by the
-     * {@code shade-ppc} build execution). Can also be forced with
-     * {@code -Dscarlet.ppcEdition=true}.
-     */
-    public static boolean isPpcEdition()
-    {
-        Boolean cached = PPC_EDITION;
-        if (cached != null)
-            return cached;
-        boolean result = Boolean.getBoolean("scarlet.ppcEdition");
-        if (!result) try
-        {
-            java.util.Enumeration<java.net.URL> manifests = Platform.class.getClassLoader().getResources("META-INF/MANIFEST.MF");
-            while (!result && manifests.hasMoreElements())
-            {
-                try (java.io.InputStream in = manifests.nextElement().openStream())
-                {
-                    java.util.jar.Manifest mf = new java.util.jar.Manifest(in);
-                    result = "ppc".equalsIgnoreCase(mf.getMainAttributes().getValue("Scarlet-Edition"));
-                }
-                catch (Exception ignored) {}
-            }
-        }
-        catch (Exception ignored) {}
-        PPC_EDITION = result;
-        return result;
-    }
-
     public static boolean forceHeadlessUi()
     {
         return FORCE_HEADLESS_UI || Boolean.getBoolean("java.awt.headless");

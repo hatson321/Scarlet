@@ -2,7 +2,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>net.sybyline</groupId>
   <artifactId>scarlet</artifactId>
-	<version>0.6.2-a1</version><!--scarlet-version-->
+	<version>0.6.2-T3</version><!--scarlet-version-->
   <name>Scarlet</name>
   <build>
     <resources>
@@ -81,7 +81,7 @@
         <artifactId>maven-jar-plugin</artifactId>
         <version>3.2.0</version>
         <configuration>
-          <!-- Recreate the unshaded input: a previous desktop shade excludes PowerPC resources. -->
+          <!-- Recreate the original input before each shading run. -->
           <forceCreation>true</forceCreation>
           <archive>
             <manifest>
@@ -105,55 +105,6 @@
           <createDependencyReducedPom>false</createDependencyReducedPom>
         </configuration>
         <executions>
-          <!-- ================================================================
-               PowerPC edition - attached as a classifier, always built.
-               Output: target/scarlet-${version}-ppc.jar
-               Identical desktop payload to shade-full, but its manifest carries
-               Scarlet-Edition=ppc. When that jar runs on a PowerPC CPU (e.g. a
-               Wii on Wii-Linux, where Java has no JIT), Scarlet skips the
-               startup SecurityRegressionChecks self-tests, whose 100k-round
-               PBKDF2 derivations take many minutes in the interpreter.
-               ================================================================ -->
-          <execution>
-            <id>shade-ppc</id>
-            <phase>package</phase>
-            <goals>
-              <goal>shade</goal>
-            </goals>
-            <configuration>
-              <shadedArtifactAttached>true</shadedArtifactAttached>
-              <shadedClassifierName>ppc</shadedClassifierName>
-              <transformers>
-                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <mainClass>net.sybyline.scarlet.Scarlet</mainClass>
-                  <manifestEntries>
-                    <Scarlet-VRChatApi-Version>${vrchatapi.version}</Scarlet-VRChatApi-Version>
-                    <Implementation-Title>${project.artifactId}</Implementation-Title>
-                    <Implementation-Version>${project.version}</Implementation-Version>
-                    <Implementation-Vendor>${project.groupId}</Implementation-Vendor>
-                    <Scarlet-Edition>ppc</Scarlet-Edition>
-                  </manifestEntries>
-                </transformer>
-              </transformers>
-              <filters>
-                <filter>
-                  <artifact>*:*</artifact>
-                  <excludes>
-                    <exclude>META-INF/*.SF</exclude>
-                    <exclude>META-INF/*.RSA</exclude>
-                    <exclude>META-INF/*.DSA</exclude>
-                    <exclude>META-INF/*.EC</exclude>
-                  </excludes>
-                </filter>
-                <filter>
-                  <artifact>moe.kyokobot.libdave:libdave-jvm-impl</artifact>
-                  <excludes>
-                    <exclude>moe/kyokobot/libdave/natives/DaveNativeBindings.class</exclude>
-                  </excludes>
-                </filter>
-              </filters>
-            </configuration>
-          </execution>
           <!-- ================================================================
                Main distribution jar. Replaces the Maven main artifact.
                Output: target/scarlet-${version}.jar

@@ -164,7 +164,7 @@ class ScarletVRChatApi122CompatibilityTest
                 assertNull(f.vrc.getUser(USER), "HTTP " + status);
                 assertFalse(Files.exists(f.cacheFile()));
                 assertEquals(status == 404, f.vrc.cachedUsers.is404(USER));
-                assertEquals(status == 401, f.scarlet.wantsVrcRefresh);
+                assertEquals(status == 401 ? 1 : 0, f.scarlet.wantsVrcRefresh);
             }
     }
 

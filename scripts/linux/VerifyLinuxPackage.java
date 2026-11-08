@@ -39,8 +39,8 @@ public final class VerifyLinuxPackage {
     private int failures;
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 4) {
-            System.err.println("Usage: java VerifyLinuxPackage.java <main.jar> <debug.jar> <ppc.jar> <checksums.txt>");
+        if (args.length != 3) {
+            System.err.println("Usage: java VerifyLinuxPackage.java <main.jar> <debug.jar> <checksums.txt>");
             System.exit(2);
         }
 
@@ -48,12 +48,10 @@ public final class VerifyLinuxPackage {
         List<Path> artifacts = new ArrayList<>();
         artifacts.add(Path.of(args[0]));
         artifacts.add(Path.of(args[1]));
-        artifacts.add(Path.of(args[2]));
 
-        verifier.verifyDistribution(artifacts.get(0), false, false);
-        verifier.verifyDistribution(artifacts.get(1), true, false);
-        verifier.verifyDistribution(artifacts.get(2), false, true);
-        verifier.writeChecksums(artifacts, Path.of(args[3]));
+        verifier.verifyDistribution(artifacts.get(0), false);
+        verifier.verifyDistribution(artifacts.get(1), true);
+        verifier.writeChecksums(artifacts, Path.of(args[2]));
 
         System.out.printf("Verification summary: %d failure(s).%n", verifier.failures);
         if (verifier.failures != 0) {
@@ -61,7 +59,7 @@ public final class VerifyLinuxPackage {
         }
     }
 
-    private void verifyDistribution(Path artifact, boolean expectDebug, boolean expectPowerPcEdition) {
+    private void verifyDistribution(Path artifact, boolean expectDebug) {
         System.out.printf("%nInspecting %s%n", artifact.toAbsolutePath().normalize());
         if (!Files.isRegularFile(artifact)) {
             fail("Distribution JAR is missing: " + artifact);
@@ -70,7 +68,7 @@ public final class VerifyLinuxPackage {
 
         try (JarFile jar = new JarFile(artifact.toFile(), true)) {
             verifyEntryNames(jar);
-            verifyManifest(jar.getManifest(), expectDebug, expectPowerPcEdition);
+            verifyManifest(jar.getManifest(), expectDebug);
             requireEntry(jar, MAIN_CLASS_ENTRY);
             verifyBaseClassVersion(jar);
             verifyElfEntry(jar, DAVE_JVM_X86_64, 2, 1, 62, true, 2, 25);
@@ -78,9 +76,7 @@ public final class VerifyLinuxPackage {
             verifyElfEntry(jar, LINUX_AARCH64, 2, 1, 183, true, 2, 38);
 
             JarEntry powerPcNative = jar.getJarEntry(LINUX_PPC);
-            if (expectPowerPcEdition) {
-                verifyElfEntry(jar, LINUX_PPC, 1, 2, 20, true, null, null);
-            } else if (powerPcNative != null) {
+            if (powerPcNative != null) {
                 fail("Supported desktop JAR unexpectedly contains experimental payload " + LINUX_PPC);
             } else {
                 pass("Experimental PowerPC native is absent from the supported desktop JAR");
@@ -105,7 +101,7 @@ public final class VerifyLinuxPackage {
         pass("JAR paths are relative, traversal-free, and unique (" + names.size() + " entries)");
     }
 
-    private void verifyManifest(Manifest manifest, boolean expectDebug, boolean expectPowerPcEdition) {
+    private void verifyManifest(Manifest manifest, boolean expectDebug) {
         if (manifest == null) {
             fail("JAR manifest is missing");
             return;
@@ -113,7 +109,7 @@ public final class VerifyLinuxPackage {
         Attributes attributes = manifest.getMainAttributes();
         expectAttribute(attributes, Attributes.Name.MAIN_CLASS.toString(), MAIN_CLASS);
         expectAttribute(attributes, "Scarlet-Debug", expectDebug ? "true" : null);
-        expectAttribute(attributes, "Scarlet-Edition", expectPowerPcEdition ? "ppc" : null);
+        expectAttribute(attributes, "Scarlet-Edition", null);
     }
 
     private void expectAttribute(Attributes attributes, String name, String expected) {

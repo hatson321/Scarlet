@@ -40,13 +40,23 @@ jobs:
       - name: Build and verify supported Linux packages
         run: sh scripts/linux/build-and-verify.sh
 
+      - name: Select desktop release artifact
+        id: desktop
+        shell: bash
+        run: |
+          version=$(tr -d '\r\n' < scarlet.version)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(a|T)[0-9]+)?$ ]]
+          jar="target/scarlet-$version.jar"
+          test -f "$jar"
+          echo "jar=$jar" >> "$GITHUB_OUTPUT"
+          (cd target && sha256sum "scarlet-$version.jar") > target/SHA256SUMS-desktop.txt
+
       - name: Upload Scarlet JAR
         uses: actions/upload-artifact@v4
         with:
           name: Scarlet-Desktop
           path: |
-            target/scarlet-*.jar
-            !target/scarlet-*-debug.jar
-            target/SHA256SUMS-linux.txt
+            ${{ steps.desktop.outputs.jar }}
+            target/SHA256SUMS-desktop.txt
           if-no-files-found: error
           retention-days: 30

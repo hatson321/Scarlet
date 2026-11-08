@@ -1,16 +1,13 @@
 package net.sybyline.scarlet;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
-import net.dv8tion.jda.api.EmbedBuilder;
-import net.dv8tion.jda.api.entities.MessageEmbed;
-import net.dv8tion.jda.api.utils.MarkdownSanitizer;
 import net.sybyline.scarlet.util.VrcIds;
 
 /** Explicit public projections for new captures and untrusted, older saved snapshots. */
@@ -19,13 +16,31 @@ final class ScarletSnapshotPrivacy
     private ScarletSnapshotPrivacy() {}
 
     static final int MAX_TEXT = 2000, MAX_LINKS = 32, MAX_GROUPS = 200;
+    static final int MAX_DESCRIPTION = 8192;
+    private static final Set<String> TRUST_TAGS = new HashSet<>(Arrays.asList(
+        "system_troll", "system_probable_troll", "system_trust_basic", "system_trust_known",
+        "system_trust_trusted", "system_trust_veteran"));
 
     static JsonObject user(JsonObject raw, String targetId)
     {
         if (raw == null || targetId == null || !VrcIds.id_user.matcher(targetId).matches()
             || !targetId.equals(text(raw, "id"))) return null;
-        JsonObject safe = strings(raw, "id", "displayName", "bio", "date_joined", "userIcon",
-            "profilePicOverride", "currentAvatarImageUrl", "currentAvatarThumbnailImageUrl");
+        JsonObject safe = strings(raw, "id", "displayName", "bio", "date_joined", "pronouns", "userIcon", "iconUrl",
+            "profilePicOverride", "currentAvatarImageUrl", "currentAvatarThumbnailImageUrl", "bannerUrl", "bannerCustomUrl",
+            "currentAvatarName", "currentAvatarAuthorName");
+        JsonElement tags = raw.has("trustTags") ? raw.get("trustTags") : raw.get("tags");
+        if (tags != null && tags.isJsonArray())
+        {
+            JsonArray publicTags = new JsonArray();
+            int inspected = 0;
+            for (JsonElement tag : tags.getAsJsonArray())
+            {
+                if (inspected++ >= 128) break;
+                if (tag.isJsonPrimitive() && tag.getAsJsonPrimitive().isString()
+                    && TRUST_TAGS.contains(tag.getAsString()) && !publicTags.contains(tag)) publicTags.add(tag.getAsString());
+            }
+            safe.add("trustTags", publicTags);
+        }
         JsonElement links = raw.get("bioLinks");
         if (links != null && links.isJsonArray())
         {
@@ -39,6 +54,16 @@ final class ScarletSnapshotPrivacy
             safe.add("bioLinks", safeLinks);
         }
         return safe;
+    }
+
+    static JsonObject mergeUser(JsonObject account, JsonObject profile)
+    {
+        if (profile == null) return account;
+        JsonObject result = profile.deepCopy();
+        // The public profile is authoritative for fields that may have been cleared.
+        if (account != null && text(result, "id").equals(text(account, "id")) && account.has("date_joined"))
+            result.add("date_joined", account.get("date_joined").deepCopy());
+        return result;
     }
 
     static JsonArray groups(JsonArray raw)
@@ -63,8 +88,11 @@ final class ScarletSnapshotPrivacy
         if (id == null || !VrcIds.id_group.matcher(id).matches()
             || !"visible".equals(text(raw, "memberVisibility"))
             || !"default".equals(text(raw, "privacy"))) return null;
-        return strings(raw, "groupId", "name", "shortCode", "discriminator", "description",
+        JsonObject safe = strings(raw, "groupId", "name", "shortCode", "discriminator",
             "iconUrl", "bannerUrl", "memberVisibility", "privacy");
+        String description = text(raw, "description");
+        if (description != null) safe.addProperty("description", limit(description, MAX_DESCRIPTION));
+        return safe;
     }
 
     private static JsonObject strings(JsonObject raw, String... names)
@@ -87,36 +115,15 @@ final class ScarletSnapshotPrivacy
 
     private static String limit(String value)
     {
-        if (value.length() <= MAX_TEXT) return value;
-        int end = MAX_TEXT - 1;
+        return limit(value, MAX_TEXT);
+    }
+
+    private static String limit(String value, int maximum)
+    {
+        if (value.length() <= maximum) return value;
+        int end = maximum - 1;
         if (Character.isHighSurrogate(value.charAt(end - 1))) end--;
         return value.substring(0, end) + "\u2026";
     }
 
-    static MessageEmbed[] embeds(JsonObject safe)
-    {
-        List<MessageEmbed> result = new ArrayList<>();
-        if (safe != null) for (Map.Entry<String, JsonElement> field : safe.entrySet())
-        {
-            String value = field.getValue().isJsonArray() ? field.getValue().toString() : field.getValue().getAsString();
-            // One bounded embed per page avoids Discord's aggregate 6000-character limit.
-            result.add(new EmbedBuilder().setTitle(field.getKey())
-                .setDescription(limit(MarkdownSanitizer.escape(value.isEmpty() ? "(empty)" : value))).build());
-        }
-        return result.toArray(new MessageEmbed[0]);
-    }
-
-    static MessageEmbed[] groupEmbeds(JsonArray safe)
-    {
-        List<MessageEmbed> result = new ArrayList<>();
-        if (safe != null) for (JsonElement item : safe)
-        {
-            JsonObject group = item.getAsJsonObject();
-            String name = text(group, "name"), description = text(group, "description");
-            result.add(new EmbedBuilder().setTitle("Public group")
-                .setDescription(limit(MarkdownSanitizer.escape((name == null ? "" : name + "\n")
-                    + text(group, "groupId") + (description == null ? "" : "\n" + description)))).build());
-        }
-        return result.toArray(new MessageEmbed[0]);
-    }
 }

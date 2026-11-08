@@ -215,24 +215,45 @@ public class ScarletDiscordUI
             && this.discord.guildSf != null && this.discord.guildSf.equals(meta.guildSnowflake) ? meta : null;
     }
 
+    private String auditDenied(String code, String message)
+    {
+        LOG.warn("Audit interaction denied [{}]", code);
+        return message + " [" + code + "]";
+    }
+
     String auditBindingDenial(Member member, MessageChannel channel, String auditId)
     {
         try
         {
             ScarletData.AuditEntryMetadata meta = this.interactionMetadata(auditId);
             if (meta == null || member == null || !(channel instanceof net.dv8tion.jda.api.entities.channel.middleman.GuildChannel))
-                return "The stored audit event and its destination cannot be verified.";
+                return this.auditDenied("AUD-METADATA", "The stored audit event and its destination cannot be verified.");
             net.dv8tion.jda.api.entities.channel.middleman.GuildChannel gc = (net.dv8tion.jda.api.entities.channel.middleman.GuildChannel)channel;
+            if (!this.discord.guildSf.equals(gc.getGuild().getId()) || !this.discord.guildSf.equals(member.getGuild().getId()))
+                return this.auditDenied("AUD-GUILD", "This audit event does not belong to the configured Discord server.");
             Member current = gc.getGuild().getMemberById(member.getId());
-            if (!this.discord.guildSf.equals(gc.getGuild().getId()) || !this.discord.guildSf.equals(member.getGuild().getId())
-                || current == null || !current.hasPermission(gc, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY)
-                || !this.discord.auditVisibleTo(meta, current.getId())) return "You no longer have access to this audit event.";
+            if (current == null)
+                return this.auditDenied("AUD-MEMBER", "Your current server membership could not be verified. Please retry.");
+            if (!current.hasPermission(gc, Permission.VIEW_CHANNEL))
+                return this.auditDenied("AUD-VIEW", "You do not have access to this audit channel.");
+            if (!current.hasPermission(gc, Permission.MESSAGE_HISTORY))
+                return this.auditDenied("AUD-HISTORY", "Read Message History permission is required in this audit channel.");
+            if (meta.entryRedacted)
+                return this.auditDenied("AUD-REDACTED", "This audit event is unavailable.");
+            if (!this.discord.auditVisibleTo(meta, current.getId()))
+                return this.auditDenied("AUD-AUDIENCE", "This audit event is unavailable to your linked account.");
             if (channel instanceof ThreadChannel)
-                return this.discord.auditThreadDestinationProblem(meta, (ThreadChannel)channel);
+            {
+                String problem = this.discord.auditThreadDestinationProblem(meta, (ThreadChannel)channel);
+                return problem == null ? null : this.auditDenied("AUD-THREAD", problem);
+            }
             return channel.getId().equals(meta.channelSnowflake) && channel.getId().equals(this.discord.approvedAuditChannel(meta))
-                ? null : "This is not the recorded audit destination.";
+                ? null : this.auditDenied("AUD-DESTINATION", "This is not the recorded audit destination.");
         }
-        catch (RuntimeException unavailable) { return "The audit event or its permissions are unavailable. Please retry."; }
+        catch (RuntimeException unavailable)
+        {
+            return this.auditDenied("AUD-UNAVAILABLE", "The audit event or its permissions are unavailable. Please retry.");
+        }
     }
 
     /** Every tag, split across Discord's 25-option menus (max five rows = 125 tags, Scarlet's tag cap), with existing tags pre-ticked. */
@@ -1534,20 +1555,22 @@ public class ScarletDiscordUI
         ScarletData.AuditEntryMetadata metadata = this.snapshotMetadata(auditId);
         String requester = event.getMember() == null ? null : event.getMember().getId();
         Message origin = event.getMessage();
-        if (!this.snapshotAllowed(metadata, requester, origin, operation))
+        String denial = this.snapshotDenial(metadata, requester, origin, operation);
+        if (denial != null)
         {
-            hook.sendMessage("This snapshot is unavailable or you no longer have access to its audit event.")
+            hook.sendMessage(denial)
                 .setEphemeral(true).queue();
             return;
         }
         // Project again: old files may still contain the original unfiltered self-account response.
-        MessageEmbed[] embeds = kind == 0 ? ScarletSnapshotPrivacy.embeds(ScarletSnapshotPrivacy.user(
+        MessageEmbed[] embeds = kind == 0 ? ScarletSnapshotEmbeds.user(ScarletSnapshotPrivacy.user(
             metadata.snapshotTargetUser, metadata.entry.getTargetId()))
-            : kind == 1 ? ScarletSnapshotPrivacy.groupEmbeds(ScarletSnapshotPrivacy.groups(metadata.snapshotTargetUserGroups))
-            : ScarletSnapshotPrivacy.embeds(ScarletSnapshotPrivacy.group(metadata.snapshotTargetUserRepresentedGroup));
-        if (!this.snapshotAllowed(metadata, requester, origin, operation))
+            : kind == 1 ? ScarletSnapshotEmbeds.groups(ScarletSnapshotPrivacy.groups(metadata.snapshotTargetUserGroups))
+            : ScarletSnapshotEmbeds.representedGroup(ScarletSnapshotPrivacy.group(metadata.snapshotTargetUserRepresentedGroup));
+        denial = this.snapshotDenial(metadata, requester, origin, operation);
+        if (denial != null)
         {
-            hook.sendMessage("This snapshot is unavailable or you no longer have access to its audit event.")
+            hook.sendMessage(denial)
                 .setEphemeral(true).queue();
             return;
         }
@@ -1557,7 +1580,7 @@ public class ScarletDiscordUI
                 .setEphemeral(true).queue();
             return;
         }
-        this.discord.interactions.new Pagination(event.getId(), embeds, 1)
+        this.discord.interactions.new Pagination(event.getId(), embeds, kind == 1 ? ScarletSnapshotEmbeds.GROUPS_PER_PAGE : 1)
             .restrictTo(requester, interaction -> this.snapshotAllowed(metadata,
                 interaction.getMember() == null ? null : interaction.getMember().getId(), origin, operation))
             .queue(hook);
@@ -1579,10 +1602,17 @@ public class ScarletDiscordUI
 
     boolean snapshotAllowed(ScarletData.AuditEntryMetadata snapshot, String requester, Message origin, String operation)
     {
+        return this.snapshotDenial(snapshot, requester, origin, operation) == null;
+    }
+
+    String snapshotDenial(ScarletData.AuditEntryMetadata snapshot, String requester, Message origin, String operation)
+    {
         try
         {
             ScarletData.AuditEntryMetadata current = snapshot == null || snapshot.entry == null ? null
                 : this.snapshotMetadata(snapshot.entry.getId());
+            if (current != null && current.entryRedacted)
+                return this.auditDenied("AUD-REDACTED", "This snapshot is unavailable.");
             if (!ScarletAuditPrivacy.sameRecordedAudit(snapshot, current) || requester == null || origin == null
                 || current.entry.getActorId() == null || current.entry.getActorId().trim().isEmpty()
                 || current.entry.getTargetId() == null || !VrcIds.id_user.matcher(current.entry.getTargetId()).matches()
@@ -1592,19 +1622,29 @@ public class ScarletDiscordUI
                 || !this.discord.jda.getSelfUser().getId().equals(origin.getAuthor().getId())
                 || current.auxMessageSnowflake == null || !current.auxMessageSnowflake.equals(origin.getId())
                 || !Objects.equals(snapshot.auxMessageSnowflake, current.auxMessageSnowflake)
-                || current.threadSnowflake == null || !current.threadSnowflake.equals(origin.getChannel().getId())) return false;
+                || current.threadSnowflake == null || !current.threadSnowflake.equals(origin.getChannel().getId()))
+                return this.auditDenied("AUD-SNAPSHOT-ORIGIN", "The original snapshot message or its current audit record cannot be verified.");
             Member member = origin.getGuild().getMemberById(requester);
             ThreadChannel thread = origin.getGuild().getThreadChannelById(current.threadSnowflake);
-            return member != null && thread != null && this.discord.perms != null
-                && this.discord.perms.checkOperation(member, DPerms.PermType.BUTTON_PRESS, operation)
-                && member.hasPermission(thread, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY)
-                && this.discord.auditVisibleTo(current, requester)
-                && this.discord.auditThreadDestinationProblem(current, thread) == null;
+            if (member == null)
+                return this.auditDenied("AUD-MEMBER", "Your current server membership could not be verified. Please retry.");
+            if (thread == null)
+                return this.auditDenied("AUD-THREAD", "The original audit thread is currently unavailable.");
+            if (this.discord.perms == null || !this.discord.perms.checkOperation(member, DPerms.PermType.BUTTON_PRESS, operation))
+                return this.auditDenied("AUD-OPERATION", "You do not have permission to use this snapshot button.");
+            if (!member.hasPermission(thread, Permission.VIEW_CHANNEL))
+                return this.auditDenied("AUD-VIEW", "You do not have access to this audit channel.");
+            if (!member.hasPermission(thread, Permission.MESSAGE_HISTORY))
+                return this.auditDenied("AUD-HISTORY", "Read Message History permission is required in this audit channel.");
+            if (!this.discord.auditVisibleTo(current, requester))
+                return this.auditDenied("AUD-AUDIENCE", "This snapshot is unavailable to your linked account.");
+            String problem = this.discord.auditThreadDestinationProblem(current, thread);
+            return problem == null ? null : this.auditDenied("AUD-THREAD", problem);
         }
         catch (RuntimeException unavailable)
         {
             // A missing/corrupt record, policy or Discord cache must never authorize disclosure.
-            return false;
+            return this.auditDenied("AUD-UNAVAILABLE", "The snapshot or its permissions are unavailable. Please retry.");
         }
     }
 

@@ -54,9 +54,6 @@ case "$architecture" in
     aarch64|arm64)
         pass "CPU architecture: AArch64"
         ;;
-    ppc|powerpc|ppc64|ppc64le)
-        fail "CPU architecture is $architecture; PowerPC remains experimental and is outside the supported build gate"
-        ;;
     *)
         fail "CPU architecture is $architecture; supported release builds require x86-64 or AArch64"
         ;;

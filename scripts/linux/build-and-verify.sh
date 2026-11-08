@@ -51,7 +51,6 @@ printf '\n%s\n' 'Inspecting Linux distribution payloads...'
 java "$script_directory/VerifyLinuxPackage.java" \
     "$repository_root/target/scarlet-$version.jar" \
     "$repository_root/target/scarlet-$version-debug.jar" \
-    "$repository_root/target/scarlet-$version-ppc.jar" \
     "$repository_root/target/SHA256SUMS-linux.txt"
 
 printf '\nBuild and supported Linux package verification completed successfully.\n'

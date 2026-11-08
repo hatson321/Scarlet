@@ -260,28 +260,10 @@ public class ScarletDiscordJDA implements ScarletDiscord
             else if (Features.DAVE_ENABLED)
                 LOG.warn("DAVE session factory unavailable on {}; continuing without Discord voice E2EE support",
                     net.sybyline.scarlet.util.Platform.describe());
-            JDABuilder jdaBuilder = JDABuilder
-            .createDefault(token0)
-            .enableIntents(GatewayIntent.MESSAGE_CONTENT, GatewayIntent.GUILD_MEMBERS)
+            JDABuilder jdaBuilder = gatewayBuilder(token0)
             .addEventListeners(new JDAEvents())
             .enableCache(CacheFlag.VOICE_STATE)
             .setAudioModuleConfig(audioModuleConfig);
-            if (net.sybyline.scarlet.util.Platform.isPowerPC() && net.sybyline.scarlet.util.Platform.isPpcEdition())
-            {
-                // PowerPC edition (e.g. a Wii, no JIT): every gateway event is parsed in the bytecode
-                // interpreter, and a busy server starves the heartbeat. Stop Discord sending event
-                // types Scarlet never handles (no listeners exist for typing, reactions, emoji/sticker
-                // updates, AutoMod or polls). Nothing Scarlet uses is removed.
-                jdaBuilder
-                    .disableIntents(
-                        GatewayIntent.GUILD_MESSAGE_TYPING, GatewayIntent.DIRECT_MESSAGE_TYPING,
-                        GatewayIntent.GUILD_MESSAGE_REACTIONS, GatewayIntent.DIRECT_MESSAGE_REACTIONS,
-                        GatewayIntent.GUILD_EXPRESSIONS,
-                        GatewayIntent.AUTO_MODERATION_CONFIGURATION, GatewayIntent.AUTO_MODERATION_EXECUTION,
-                        GatewayIntent.GUILD_MESSAGE_POLLS, GatewayIntent.DIRECT_MESSAGE_POLLS)
-                    .disableCache(CacheFlag.EMOJI, CacheFlag.STICKER);
-                LOG.warn("PowerPC edition: not subscribing to Discord typing/reaction/emoji/sticker/AutoMod/poll events (Scarlet has no handlers for them)");
-            }
             jda = jdaBuilder.build();
         }
         catch (InvalidTokenException ex)
@@ -357,6 +339,14 @@ public class ScarletDiscordJDA implements ScarletDiscord
             // Preserve the interrupt status for callers further up the stack.
             Thread.currentThread().interrupt();
         }
+    }
+
+    static JDABuilder gatewayBuilder(String token)
+    {
+        // Keep interaction members available for audit checks and subsequent role/removal updates.
+        return JDABuilder.createDefault(token)
+            .enableIntents(GatewayIntent.MESSAGE_CONTENT, GatewayIntent.GUILD_MEMBERS)
+            .setMemberCachePolicy(net.dv8tion.jda.api.utils.MemberCachePolicy.ALL);
     }
 
     // Snapshot of JDA's shipped default failure handler — we delegate to it for
@@ -2066,18 +2056,11 @@ public class ScarletDiscordJDA implements ScarletDiscord
         @Override
         public void onSlashCommandInteraction(SlashCommandInteractionEvent event)
         {
-            final boolean ppcTiming = net.sybyline.scarlet.util.Platform.isPowerPC() && net.sybyline.scarlet.util.Platform.isPpcEdition();
-            final long ppcArrived = System.currentTimeMillis();
-            if (ppcTiming)
-                LOG.info("PPC timing: /{} reached Scarlet {} ms after Discord created it (Discord allows 3000 ms to acknowledge; local clock skew not corrected)",
-                    event.getName(), Long.valueOf(ppcArrived - event.getTimeCreated().toInstant().toEpochMilli()));
             if (!ScarletDiscordJDA.this.perms.check(event))
             {
                 this.interactionPerms(event);
                 return;
             }
-            if (ppcTiming)
-                LOG.info("PPC timing: /{} permission check took {} ms", event.getName(), Long.valueOf(System.currentTimeMillis() - ppcArrived));
             if (ScarletDiscordJDA.this.interactions.handle(event))
                 return;
             if ("scarlet-discord-permissions".equals(event.getName())) try

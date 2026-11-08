@@ -1100,29 +1100,8 @@ public final class EncryptedPrefs
         }
     }
 
-    /**
-     * PowerPC edition only: PBKDF2 at 100k rounds takes many minutes per secret on a
-     * JIT-less PowerPC JVM (e.g. a Wii), and every secret derives its own key. When the
-     * password is Scarlet's auto-generated 256-bit random key file (no SCARLET_GLOBAL_PW /
-     * scarlet.global.pw override), key stretching adds no meaningful protection, so the
-     * PowerPC edition uses a much lower round count there. Secrets written this way can
-     * only be read back by the PowerPC edition on PowerPC (keys differ from other builds).
-     */
-    private static final int PPC_KEYGEN_ITERATIONS = 1_000;
-    private static volatile boolean ppcIterationsLogged;
     static int keygenIterations()
     {
-        if (Platform.isPowerPC() && Platform.isPpcEdition()
-            && System.getenv("SCARLET_GLOBAL_PW") == null
-            && System.getProperty("scarlet.global.pw") == null)
-        {
-            if (!ppcIterationsLogged)
-            {
-                ppcIterationsLogged = true;
-                LOG.warn("PowerPC edition: using {} PBKDF2 rounds for the local credential store (random key file; stretching adds nothing there). Secrets saved here are only readable by the PowerPC edition.", PPC_KEYGEN_ITERATIONS);
-            }
-            return PPC_KEYGEN_ITERATIONS;
-        }
         return KEYGEN_ITERATIONS;
     }
 

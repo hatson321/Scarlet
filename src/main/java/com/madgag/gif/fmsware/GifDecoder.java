@@ -296,7 +296,7 @@ public class GifDecoder {
 				}
 			}
 		} else {
-			status = STATUS_OPEN_ERROR;
+			return status = STATUS_OPEN_ERROR;
 		}
 		try {
 			is.close();
@@ -325,7 +325,7 @@ public class GifDecoder {
 				}
 			}
 		} else {
-			status = STATUS_OPEN_ERROR;
+			return status = STATUS_OPEN_ERROR;
 		}
 		try {
 			is.close();

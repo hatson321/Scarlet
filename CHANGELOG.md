@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.2-T3 — November 7, 2026 (prerelease)
+
+- Fixed incorrect access denials on moderation-log buttons, including tags, descriptions and snapshots, while retaining authorization checks.
+- Expanded saved profile snapshots and added five linked group cards per page with group artwork and descriptions. Represented-group snapshots show the full saved description.
+- Fixed authentication-refresh requests being lost while another refresh is running.
+- Fixed GIF decoder error handling for missing input streams.
+- Removed the experimental PowerPC edition and its runtime exceptions. Automated desktop downloads now contain only the standard JAR and matching checksum.
+
 ## 0.6.1 — November 3, 2026
 
 - Released early to correct maintainer status and requested credit references.

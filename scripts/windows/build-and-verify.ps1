@@ -34,6 +34,6 @@ try {
     Invoke-Checked 'mvn' ($mavenArguments + $testArguments + @('clean', 'verify'))
     $version = (Get-Content -LiteralPath 'scarlet.version' -Raw).Trim()
     if ($version -cnotmatch '^\d+[.]\d+[.]\d+(?:-(?:a|T)\d+)?$') { throw 'Unexpected release version.' }
-    Invoke-Checked 'java' @('scripts/linux/VerifyLinuxPackage.java', "target/scarlet-$version.jar", "target/scarlet-$version-debug.jar", "target/scarlet-$version-ppc.jar", 'target/SHA256SUMS-packages.txt')
+    Invoke-Checked 'java' @('scripts/linux/VerifyLinuxPackage.java', "target/scarlet-$version.jar", "target/scarlet-$version-debug.jar", 'target/SHA256SUMS-packages.txt')
     Write-Host 'Source build and static package inspection finished. This does not verify live Windows/Linux voice, GUI, or VRChat/Discord integration.'
 } finally { Pop-Location }

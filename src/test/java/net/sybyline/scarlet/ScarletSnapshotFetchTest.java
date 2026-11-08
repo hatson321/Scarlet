@@ -26,15 +26,15 @@ class ScarletSnapshotFetchTest
         };
     }
 
-    @Test void allThreeReadsOverlapAndOnlyPublicFieldsLeaveWorkers() throws Exception
+    @Test void threeWorkersOverlapFourReadsAndOnlyPublicFieldsLeaveWorkers() throws Exception
     {
         ScarletSnapshotFetch fetch = new ScarletSnapshotFetch();
         CountDownLatch started = new CountDownLatch(3);
         AtomicInteger peak = new AtomicInteger(), active = new AtomicInteger();
         JsonArray groups = new JsonArray(); groups.add(ScarletSnapshotPrivacyTest.group());
-        JsonElement[] payloads = {ScarletSnapshotPrivacyTest.self(), groups, ScarletSnapshotPrivacyTest.group()};
-        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[3];
-        for (int i = 0; i < 3; i++)
+        JsonElement[] payloads = {ScarletSnapshotPrivacyTest.self(), groups, ScarletSnapshotPrivacyTest.group(), ScarletSnapshotPrivacyTest.self()};
+        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[4];
+        for (int i = 0; i < 4; i++)
         {
             JsonElement payload = payloads[i];
             reads[i] = new ScarletSnapshotFetch.Read() {
@@ -69,7 +69,7 @@ class ScarletSnapshotFetchTest
                 read(ScarletSnapshotPrivacyTest.self()), new ScarletSnapshotFetch.Read() {
                     public JsonElement read() throws Exception { throw new IOException("PRIVATE_RESPONSE_BODY"); }
                     public void cancel() {}
-                }, read(ScarletSnapshotPrivacyTest.group()));
+                }, read(ScarletSnapshotPrivacyTest.group()), read(ScarletSnapshotPrivacyTest.self()));
             assertNotNull(result);
             ScarletSnapshotPrivacyTest.assertPublic(result.user);
             assertNull(result.groups);
@@ -83,8 +83,8 @@ class ScarletSnapshotFetchTest
         ScarletSnapshotFetch fetch = new ScarletSnapshotFetch();
         AtomicInteger cancelledBeforeInterrupt = new AtomicInteger();
         CountDownLatch finished = new CountDownLatch(3);
-        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[3];
-        for (int i = 0; i < 3; i++) reads[i] = new ScarletSnapshotFetch.Read() {
+        ScarletSnapshotFetch.Read[] reads = new ScarletSnapshotFetch.Read[4];
+        for (int i = 0; i < 4; i++) reads[i] = new ScarletSnapshotFetch.Read() {
             final AtomicBoolean cancelled = new AtomicBoolean();
             public JsonElement read() throws Exception {
                 try { new CountDownLatch(1).await(); return ScarletSnapshotPrivacyTest.self(); }
@@ -115,7 +115,7 @@ class ScarletSnapshotFetchTest
             public void cancel() {}
         };
         Thread caller = new Thread(() -> {
-            result.set(fetch.fetch(USER, () -> true, hanging, hanging, hanging));
+            result.set(fetch.fetch(USER, () -> true, hanging, hanging, hanging, hanging));
             interrupted.set(Thread.currentThread().isInterrupted());
         });
         caller.start();
@@ -128,7 +128,7 @@ class ScarletSnapshotFetchTest
             public JsonElement read() { calls.incrementAndGet(); return null; }
             public void cancel() {}
         };
-        assertNull(fetch.fetch(USER, () -> true, unexpected, unexpected, unexpected));
+        assertNull(fetch.fetch(USER, () -> true, unexpected, unexpected, unexpected, unexpected));
         assertEquals(0, calls.get());
         assertTrue(fetch.shutdown());
     }
@@ -150,7 +150,7 @@ class ScarletSnapshotFetchTest
         {
             for (int i = 0; i < 3; i++)
             {
-                callers[i] = new Thread(() -> fetch.fetch(USER, () -> true, hanging, hanging, hanging));
+                callers[i] = new Thread(() -> fetch.fetch(USER, () -> true, hanging, hanging, hanging, hanging));
                 callers[i].start();
             }
             assertTrue(started.await(2, TimeUnit.SECONDS));
@@ -161,7 +161,7 @@ class ScarletSnapshotFetchTest
                 public void cancel() {}
             };
             long before = System.nanoTime();
-            assertNull(fetch.fetch(USER, () -> true, 100L, fourth, fourth, fourth));
+            assertNull(fetch.fetch(USER, () -> true, 100L, fourth, fourth, fourth, fourth));
             assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - before) < 1_000L);
             assertEquals(0, fourthCalls.get()); assertEquals(3, peak.get());
         }

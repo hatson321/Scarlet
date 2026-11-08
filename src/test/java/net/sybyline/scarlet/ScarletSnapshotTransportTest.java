@@ -109,7 +109,8 @@ class ScarletSnapshotTransportTest
         void reply(String body) { reply(200, body); }
         void reply(int code, String body)
         {
-            String path = "/api/1/users/" + USER + new String[]{"", "/groups", "/groups/represented"}[replyIndex++];
+            String path = "/api/1/users/" + USER + new String[]{"", "/groups", "/groups/represented", ""}[replyIndex++];
+            if (replyIndex == 4) path = "/api/1/profile/" + USER;
             bodies.put(path, body); codes.put(path, code);
         }
         void replies()
@@ -117,6 +118,7 @@ class ScarletSnapshotTransportTest
             reply(ScarletSnapshotPrivacyTest.self().toString());
             JsonArray groups = new JsonArray(); groups.add(ScarletSnapshotPrivacyTest.group());
             reply(groups.toString()); reply(ScarletSnapshotPrivacyTest.group().toString());
+            reply(ScarletSnapshotPrivacyTest.self().toString());
         }
         void assertGet(int kind, String path)
         {
@@ -136,14 +138,17 @@ class ScarletSnapshotTransportTest
         }
     }
 
-    @Test void actualTransportOverlapsThreeRequestsAndUsesBoundedPublicResults() throws Exception
+    @Test void actualTransportUsesFourRequestsWithThreeWorkersAndBoundedPublicResults() throws Exception
     {
         try (Fixture f = new Fixture(temp))
         {
             f.replies(); f.overlap = new CountDownLatch(3);
             ScarletData.AuditEntryMetadata metadata = f.metadata();
             assertEquals(1, f.vrc.snapshot(metadata).size());
-            assertEquals(3, f.requests.size()); assertEquals(3, f.passedLimiter.get());
+            assertEquals(4, f.requests.size()); assertEquals(4, f.passedLimiter.get());
+            Request profile = f.requests.stream().filter(r -> r.url().encodedPath().equals("/api/1/profile/" + USER)).findFirst().get();
+            assertEquals("false", profile.url().queryParameter("asSelf"));
+            assertEquals("false", profile.url().queryParameter("withGroupsAndWorlds"));
             ScarletSnapshotPrivacyTest.assertPublic(metadata.snapshotTargetUser);
             assertFalse(Scarlet.GSON.toJson(metadata).contains("PRIVATE_"));
         }

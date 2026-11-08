@@ -40,7 +40,7 @@ For matching source, use the `scarlet-<version>-source.zip` and checksums attach
 
 **Discord delivery.** Moderation threads are prepared after the main embed, and unfinished work can survive a restart in the local delivery queue. Profile preparation, audit availability, permissions, rate limits, and service response times can still delay messages. There is no guaranteed “within seconds” delivery time.
 
-**Platforms.** Windows and Linux are the normal desktop targets. Experimental PowerPC build support is not a promise of runtime compatibility, and no PPC JAR is attached to the public releases listed above.
+**Platforms.** Windows and Linux use the same standard desktop JAR. See [Building from source](BUILDING.md) for supported native payloads and runtime requirements.
 
 ## Installation
 
@@ -302,7 +302,7 @@ The console `--import-bundle "<bundle.zip>"` workflow also exists. Its `--data-o
 - Session recovery may attempt unattended authentication, but expired credentials, 2FA, permissions, and network failures can still need operator action.
 - Audit catch-up is bounded by `audit_catchup_max_days` (default 14 in a11). Events beyond that window can be skipped; catch-up is not guaranteed to finish within minutes.
 - Guarded saves and backups reduce corruption risk; no application can guarantee that a crash, disk failure, or external edit never loses data.
-- An intermittent Windows internal-communication shutdown-test timeout remains unresolved. Static package checks do not establish live Linux/PowerPC, GUI/audio, or service compatibility.
+- An intermittent Windows internal-communication shutdown-test timeout remains unresolved. Static package checks do not establish live Linux, GUI/audio, or service compatibility.
 
 When reporting a problem, include the exact Scarlet build, relevant setting names, approximate event time, and a narrowly scoped Scarlet log excerpt. Review/redact credentials, tokens, private join links, and unnecessary personal information before sharing. Do not post migration bundles or credential stores in public issues.
 
