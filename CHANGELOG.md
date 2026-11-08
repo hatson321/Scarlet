@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.2-T3 — November 7, 2026 (prerelease)
+## 0.6.2-a2 — November 8, 2026 (prerelease)
 
 - Fixed incorrect access denials on moderation-log buttons, including tags, descriptions and snapshots, while retaining authorization checks.
 - Expanded saved profile snapshots and added five linked group cards per page with group artwork and descriptions. Represented-group snapshots show the full saved description.
