@@ -65,9 +65,7 @@ public final class SingleVrcClient
         {
             if (process == null || process.pid() < 0 || !seen.add(process.pid()) || process.executable() == null
                 || process.executable().isBlank()) throw new IllegalStateException("Client inventory incomplete");
-            String name = process.executable().replace('\\', '/');
-            name = name.substring(name.lastIndexOf('/') + 1).toLowerCase(java.util.Locale.ROOT);
-            if (name.startsWith("wine") && process.arguments().isEmpty()) throw new IllegalStateException("Wine identity unavailable");
+            if (ManagedVrcClient.uncertainWineIdentity(process)) throw new IllegalStateException("Wine identity unavailable");
             if (ManagedVrcClient.isClient(process)) clients.add(process);
         }
         return clients;
@@ -75,7 +73,8 @@ public final class SingleVrcClient
 
     private boolean verified(ProcessInfo candidate)
     {
-        return candidate.pid() > 0 && candidate.startedAt() != null && !candidate.startedAt().isAfter(this.clock.instant())
+        return !candidate.inventoryOnly() && candidate.pid() > 0 && candidate.startedAt() != null
+            && !candidate.startedAt().isAfter(this.clock.instant())
             && candidate.user() != null && !candidate.user().isBlank() && candidate.user().equals(this.processes.currentUser())
             && (candidate.executable().contains("/") || candidate.executable().contains("\\"))
             && ManagedVrcClient.sameProcess(candidate, this.processes.find(candidate.pid()));

@@ -660,4 +660,234 @@ class ManagedVrcClientTest
         assertEquals(List.of(), this.tracker.confirmedClientPids());
         assertEquals(0, this.processes.attempts);
     }
+
+    private static ProcessInfo loader(long pid, List<String> arguments)
+    {
+        return new ProcessInfo(pid, START, "test-user", "/synthetic/wine64-preloader", arguments, 100);
+    }
+
+    private static ProcessInfo procProgram(ProcessInfo process, String name)
+    {
+        return ManagedVrcClient.resolveLinuxMetadata(process, name, "C:\\synthetic\\" + name, process);
+    }
+
+    @Test void corroboratedWineHelpersDoNotBlockAnOtherwiseEmptyInventory()
+    {
+        for (String helper : List.of("services.exe", "winedevice.exe", "plugplay.exe", "rpcss.exe",
+            "svchost.exe", "explorer.exe", "conhost.exe"))
+        {
+            FakeProcesses fake = new FakeProcesses();
+            ProcessInfo original = loader(77, List.of());
+            ProcessInfo resolved = procProgram(original, helper);
+            fake.entries.add(resolved);
+            assertEquals(original.executable(), resolved.executable(), helper);
+            assertEquals(original.arguments(), resolved.arguments(), helper);
+            assertTrue(resolved.inventoryOnly(), helper);
+            assertFalse(ManagedVrcClient.isClient(resolved), helper);
+            assertFalse(ManagedVrcClient.uncertainWineIdentity(resolved), helper);
+            Tracker tested = new Tracker(fake, this.clock);
+            assertFalse(tested.hasClientsOrPending(), helper);
+            assertTrue(tested.beginLaunch(LOCATION) > 0, helper);
+            assertEquals(0, fake.signals, helper);
+        }
+    }
+
+    @Test void exactNativeWineServerNeedsAPathAndCompleteIdentity()
+    {
+        ProcessInfo server = new ProcessInfo(77, START, "test-user", "/synthetic/wineserver", List.of());
+        assertFalse(ManagedVrcClient.uncertainWineIdentity(server));
+        for (ProcessInfo uncertain : List.of(
+            new ProcessInfo(77, START, "test-user", "wineserver", List.of()),
+            new ProcessInfo(77, START, "test-user", "relative/wineserver", List.of()),
+            new ProcessInfo(77, null, "test-user", "/synthetic/wineserver", List.of()),
+            new ProcessInfo(77, START, null, "/synthetic/wineserver", List.of()),
+            new ProcessInfo(77, START, "test-user", "/synthetic/wineserver64", List.of())))
+            assertTrue(ManagedVrcClient.uncertainWineIdentity(uncertain));
+    }
+
+    @Test void procClientHintBlocksDuplicateLaunchAndReportsPresenceWithoutGrantingOwnership()
+    {
+        ProcessInfo original = loader(77, List.of("--no-vr"));
+        ProcessInfo resolved = procProgram(original, "VRChat.exe");
+        this.processes.entries.add(resolved);
+        assertTrue(ManagedVrcClient.isClient(resolved));
+        assertFalse(ManagedVrcClient.uncertainWineIdentity(resolved));
+        assertTrue(this.tracker.hasClientsOrPending());
+        assertEquals(List.of("77"), this.tracker.confirmedClientPids());
+        assertEquals(0, this.tracker.beginLaunch(LOCATION));
+        assertNull(this.tracker.current());
+        SingleVrcClient.Selection selected = this.tracker.shutdownClient(LOCATION, START);
+        assertEquals(SingleVrcClient.Status.IDENTITY_UNVERIFIED, selected.status);
+        assertNull(selected.client);
+        assertFalse(ManagedVrcClient.matches(new Client(1, LOCATION, START, 77, START, "test-user"), resolved));
+        assertEquals(0, this.processes.attempts);
+    }
+
+    @Test void procClientHintCannotBecomeALaunchDescendantWithCloseAuthority()
+    {
+        begin();
+        ProcessInfo raw = new ProcessInfo(41, this.clock.instant(), "test-user", "/synthetic/wine64", List.of(), 100);
+        this.processes.entries.add(procProgram(raw, "VRChat.exe"));
+        assertNull(this.tracker.current());
+        this.clock.advance(5);
+        assertNull(this.tracker.current());
+        assertEquals(0, this.processes.attempts);
+        assertEquals(0, this.processes.signals);
+    }
+
+    @Test void rawClientArgumentsWinOverConflictingHelperNames()
+    {
+        ProcessInfo raw = loader(77, List.of("Z:\\synthetic\\VRChat.exe", "--no-vr"));
+        ProcessInfo resolved = procProgram(raw, "services.exe");
+        assertSame(raw, resolved);
+        assertTrue(ManagedVrcClient.isClient(resolved));
+        assertFalse(resolved.inventoryOnly());
+        assertFalse(ManagedVrcClient.uncertainWineIdentity(resolved));
+    }
+
+    @Test void rawUnknownLoaderAndConflictingExecutableCannotBecomeHelpers()
+    {
+        for (String executable : List.of("wine64-preloade", "wine-other", "wine64.exe"))
+        {
+            ProcessInfo raw = new ProcessInfo(77, START, "test-user", "/synthetic/" + executable, List.of());
+            assertSame(raw, procProgram(raw, "services.exe"));
+            assertTrue(ManagedVrcClient.uncertainWineIdentity(raw));
+        }
+        ProcessInfo conflict = loader(77, List.of("notepad.exe"));
+        assertSame(conflict, procProgram(conflict, "services.exe"));
+        assertFalse(ManagedVrcClient.uncertainWineIdentity(conflict));
+        assertFalse(ManagedVrcClient.isClient(conflict));
+    }
+
+    @Test void optionShapedClientNamesNeverBecomeOwnershipEvidence()
+    {
+        for (String argument : List.of("--program=C:\\synthetic\\VRChat.exe", "--config=/synthetic/VRChat.exe",
+            "--path/VRChat.exe", "program=C:\\synthetic\\VRChat.exe", "VRChat.exe\n"))
+        {
+            ProcessInfo raw = loader(77, List.of(argument));
+            assertFalse(ManagedVrcClient.isClient(raw), argument);
+            assertTrue(ManagedVrcClient.uncertainWineIdentity(raw), argument);
+            assertFalse(ManagedVrcClient.matches(new Client(1, LOCATION, START, 77, START, "test-user"), raw));
+        }
+    }
+
+    @Test void equalsInsideAnAbsoluteProgramPathDoesNotHideTheClient()
+    {
+        for (String argument : List.of("C:\\synthetic=a\\VRChat.exe", "/synthetic=a/VRChat.exe"))
+        {
+            ProcessInfo raw = loader(77, List.of(argument));
+            assertTrue(ManagedVrcClient.isClient(raw), argument);
+            assertFalse(ManagedVrcClient.uncertainWineIdentity(raw), argument);
+        }
+    }
+
+    @Test void unrelatedWineProgramDoesNotBecomeANewLaunchBlocker()
+    {
+        ProcessInfo other = loader(77, List.of("C:\\synthetic\\notepad.exe"));
+        this.processes.entries.add(other);
+        assertFalse(ManagedVrcClient.isClient(other));
+        assertFalse(this.tracker.hasClientsOrPending());
+        assertTrue(this.tracker.beginLaunch(LOCATION) > 0);
+        for (String ambiguous : List.of("--no-vr", "--program=notepad.exe", "--notepad.exe", "notepad", ""))
+            assertTrue(ManagedVrcClient.uncertainWineIdentity(loader(77, List.of(ambiguous))));
+    }
+
+    @Test void unknownTruncatedBlankAndMismatchedProcNamesRemainUncertain()
+    {
+        ProcessInfo raw = loader(77, List.of());
+        for (String name : Arrays.asList(null, "", " ", "wine64-preloade", "services.ex", "unknown.exe",
+            "services.exe.backup", "services.exe\n", "path/services.exe", "services.exe\0"))
+        {
+            ProcessInfo resolved = ManagedVrcClient.resolveLinuxMetadata(raw, name, "C:\\synthetic\\services.exe", raw);
+            assertSame(raw, resolved, String.valueOf(name));
+            assertTrue(ManagedVrcClient.uncertainWineIdentity(resolved));
+        }
+        for (String argument : Arrays.asList(null, "", "VRChat.exe", "services.exe.bad", "services.exe\0",
+            "services.exe\n", "services.exe\r", "--program=C:\\synthetic\\services.exe",
+            "program=C:\\synthetic\\services.exe", "--path/services.exe"))
+            assertSame(raw, ManagedVrcClient.resolveLinuxMetadata(raw, "services.exe", argument, raw));
+    }
+
+    @Test void incompleteIdentityCannotBeEnrichedByProcNames()
+    {
+        for (ProcessInfo raw : List.of(
+            new ProcessInfo(77, null, "test-user", "/synthetic/wine64", List.of()),
+            new ProcessInfo(77, START, null, "/synthetic/wine64", List.of()),
+            new ProcessInfo(0, START, "test-user", "/synthetic/wine64", List.of())))
+        {
+            assertSame(raw, procProgram(raw, "services.exe"));
+            assertTrue(ManagedVrcClient.uncertainWineIdentity(raw));
+        }
+    }
+
+    @Test void changingRawIdentityDuringProcReadRejectsTheEntireSample()
+    {
+        ProcessInfo raw = loader(77, List.of());
+        for (ProcessInfo changed : Arrays.asList(null,
+            new ProcessInfo(78, START, "test-user", raw.executable(), List.of(), 100),
+            new ProcessInfo(77, START.plusSeconds(1), "test-user", raw.executable(), List.of(), 100),
+            new ProcessInfo(77, START, "other-user", raw.executable(), List.of(), 100),
+            new ProcessInfo(77, START, "test-user", "/other/wine64", List.of(), 100),
+            new ProcessInfo(77, START, "test-user", raw.executable(), List.of("changed"), 100),
+            new ProcessInfo(77, START, "test-user", raw.executable(), List.of(), 101)))
+            assertThrows(IllegalStateException.class,
+                () -> ManagedVrcClient.resolveLinuxMetadata(raw, "services.exe", "services.exe", changed));
+    }
+
+    @Test void hintProvenanceChangesInvalidateProcessEquality()
+    {
+        ProcessInfo raw = loader(77, List.of());
+        ProcessInfo helper = procProgram(raw, "services.exe"), client = procProgram(raw, "VRChat.exe");
+        assertFalse(ManagedVrcClient.sameProcess(raw, helper));
+        assertFalse(ManagedVrcClient.sameProcess(helper, client));
+        assertTrue(ManagedVrcClient.sameProcess(helper, procProgram(raw, "services.exe")));
+    }
+
+    @Test void protectedCommandNameFallbackCanReportClientButNeverControlIt()
+    {
+        ProcessInfo raw = new ProcessInfo(77, START, "test-user", null, List.of());
+        ProcessInfo named = ManagedVrcClient.resolveLinuxMetadata(raw, "VRChat.exe", null, raw);
+        this.processes.entries.add(named);
+        assertTrue(named.inventoryOnly());
+        assertTrue(ManagedVrcClient.isClient(named));
+        assertEquals(0, this.tracker.beginLaunch(LOCATION));
+        assertEquals(SingleVrcClient.Status.IDENTITY_UNVERIFIED,
+            this.tracker.shutdownClient(LOCATION, START).status);
+        assertFalse(ManagedVrcClient.matches(new Client(1, LOCATION, START, 77, START, "test-user"), named));
+        assertThrows(IllegalStateException.class,
+            () -> ManagedVrcClient.resolveLinuxMetadata(raw, "wine64-preloade", null, raw));
+    }
+
+    @Test void secondHintOnlyClientStillInvalidatesManagedClient()
+    {
+        Client client = managed();
+        this.processes.entries.add(procProgram(loader(77, List.of()), "VRChat.exe"));
+        assertNull(this.tracker.current());
+        assertEquals(CloseResult.NOT_MANAGED, this.tracker.close(client, () -> true));
+        assertEquals(0, this.processes.signals);
+    }
+
+    private static java.io.InputStream bytes(String value)
+    {
+        return new java.io.ByteArrayInputStream(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    @Test void procCommandNameParserRequiresACompleteUntruncatedRecord() throws Exception
+    {
+        assertEquals("VRChat.exe", ManagedVrcClient.readProcCommandName(bytes("VRChat.exe\n")));
+        assertEquals("winedevice.exe", ManagedVrcClient.readProcCommandName(bytes("winedevice.exe\n")));
+        for (String invalid : List.of("", "\n", "services.exe", "services.exe\nX", "services.exe\0\n",
+            "services.exe\n\n", "1234567890123456\n"))
+            assertThrows(java.io.IOException.class, () -> ManagedVrcClient.readProcCommandName(bytes(invalid)));
+    }
+
+    @Test void procArgumentParserReadsOnlyBoundedArgvZero() throws Exception
+    {
+        java.io.ByteArrayInputStream input = new java.io.ByteArrayInputStream(
+            "C:\\synthetic\\VRChat.exe\0--private-synthetic-argument\0".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals("C:\\synthetic\\VRChat.exe", ManagedVrcClient.readProcFirstArgument(input));
+        assertEquals('-', input.read(), "Later arguments must not be consumed");
+        for (String invalid : List.of("", "\0", "unterminated", "x".repeat(4096) + "\0"))
+            assertThrows(java.io.IOException.class, () -> ManagedVrcClient.readProcFirstArgument(bytes(invalid)));
+    }
 }

@@ -45,6 +45,10 @@ import net.sybyline.scarlet.util.Platform;
  */
 public final class ManagedVrcClient
 {
+    private static final Set<String> WINE_LOADERS = Set.of("wine", "wine64", "wine-preloader", "wine64-preloader");
+    private static final Set<String> WINE_HELPERS = Set.of("services.exe", "winedevice.exe", "plugplay.exe",
+        "rpcss.exe", "svchost.exe", "explorer.exe", "conhost.exe");
+
     private ManagedVrcClient() {}
 
     public static final class Client
@@ -155,6 +159,8 @@ public final class ManagedVrcClient
         private final List<String> arguments;
         private final long parentPid;
         private final ProcessLease launchLease;
+        private final String wineProgram;
+        private final boolean inventoryOnly;
 
         ProcessInfo(long pid, Instant startedAt, String user, String executable, List<String> arguments)
         {
@@ -169,6 +175,12 @@ public final class ManagedVrcClient
         ProcessInfo(long pid, Instant startedAt, String user, String executable, List<String> arguments,
                     long parentPid, ProcessLease launchLease)
         {
+            this(pid, startedAt, user, executable, arguments, parentPid, launchLease, null, false);
+        }
+
+        private ProcessInfo(long pid, Instant startedAt, String user, String executable, List<String> arguments,
+                            long parentPid, ProcessLease launchLease, String wineProgram, boolean inventoryOnly)
+        {
             this.pid = pid;
             this.startedAt = startedAt;
             this.user = user;
@@ -176,6 +188,8 @@ public final class ManagedVrcClient
             this.arguments = arguments == null ? List.of() : List.copyOf(arguments);
             this.parentPid = parentPid;
             this.launchLease = launchLease;
+            this.wineProgram = wineProgram;
+            this.inventoryOnly = inventoryOnly;
         }
 
         long pid() { return this.pid; }
@@ -184,6 +198,7 @@ public final class ManagedVrcClient
         String executable() { return this.executable; }
         List<String> arguments() { return this.arguments; }
         long parentPid() { return this.parentPid; }
+        boolean inventoryOnly() { return this.inventoryOnly; }
     }
 
     interface Processes
@@ -288,7 +303,7 @@ public final class ManagedVrcClient
             for (ProcessInfo process : snapshot)
                 if (process == null || process.pid() < 0L || !pids.add(process.pid())
                     || process.executable() == null || process.executable().isBlank()
-                    || (basename(process.executable()).startsWith("wine") && process.arguments().isEmpty()))
+                    || uncertainWineIdentity(process))
                     throw new IllegalStateException("Process inventory is incomplete");
             return snapshot;
         }
@@ -896,14 +911,14 @@ public final class ManagedVrcClient
 
     static boolean matches(Client client, ProcessInfo process)
     {
-        return process != null && client.pid() == process.pid() && client.startedAt() != null
+        return process != null && !process.inventoryOnly() && client.pid() == process.pid() && client.startedAt() != null
             && client.startedAt().equals(process.startedAt()) && client.user() != null
             && client.user().equals(process.user()) && isClient(process);
     }
 
     private static boolean completeIdentity(ProcessInfo process)
     {
-        return process != null && process.pid() > 0L && process.startedAt() != null
+        return process != null && !process.inventoryOnly() && process.pid() > 0L && process.startedAt() != null
             && process.user() != null && !process.user().isBlank()
             && process.executable() != null && !process.executable().isBlank();
     }
@@ -912,7 +927,8 @@ public final class ManagedVrcClient
     {
         return first != null && second != null && first.pid() == second.pid()
             && Objects.equals(first.startedAt(), second.startedAt()) && Objects.equals(first.user(), second.user())
-            && Objects.equals(first.executable(), second.executable()) && first.arguments().equals(second.arguments());
+            && Objects.equals(first.executable(), second.executable()) && first.arguments().equals(second.arguments())
+            && first.inventoryOnly() == second.inventoryOnly() && Objects.equals(first.wineProgram, second.wineProgram);
     }
 
     static boolean isClient(ProcessInfo process)
@@ -924,8 +940,105 @@ public final class ManagedVrcClient
             return true;
         // Proton may expose the Wine loader as the executable. Accept only its first
         // argument naming VRChat.exe, never a loose substring or a later shell argument.
-        return Set.of("wine", "wine64", "wine-preloader", "wine64-preloader").contains(executable)
-            && !process.arguments().isEmpty() && "vrchat.exe".equals(basename(process.arguments().get(0)));
+        return WINE_LOADERS.contains(executable)
+            && ((namesWineProgram(process) && "vrchat.exe".equals(basename(process.arguments().get(0))))
+                || "vrchat.exe".equals(process.wineProgram));
+    }
+
+    /** Unknown Wine metadata is not evidence that another client can be launched. */
+    static boolean uncertainWineIdentity(ProcessInfo process)
+    {
+        if (process == null || process.executable() == null) return true;
+        String name = basename(process.executable());
+        if (!name.startsWith("wine")) return false;
+        if (isClient(process) || namesWineProgram(process)) return false;
+        if (completeIdentity(process) && (process.executable().startsWith("/")
+            || process.executable().matches("^[A-Za-z]:[\\\\/].*"))
+            && ("wineserver".equals(name) || WINE_HELPERS.contains(name))) return false;
+        return !WINE_LOADERS.contains(name) || process.wineProgram == null || !WINE_HELPERS.contains(process.wineProgram);
+    }
+
+    private static boolean namesWineProgram(ProcessInfo process)
+    {
+        if (process.executable() == null || !WINE_LOADERS.contains(basename(process.executable()))
+            || process.arguments().isEmpty()) return false;
+        return isProgramArgument(process.arguments().get(0));
+    }
+
+    private static boolean isProgramArgument(String argument)
+    {
+        if (argument == null) return false;
+        String name = basename(argument);
+        int separator = argument.replace('\\', '/').indexOf('/'), assignment = argument.indexOf('=');
+        return !argument.startsWith("-") && !(assignment >= 0 && (separator < 0 || assignment < separator))
+            && argument.indexOf('\0') < 0 && argument.indexOf('\n') < 0 && argument.indexOf('\r') < 0
+            && name.length() > 4 && name.endsWith(".exe");
+    }
+
+    /**
+     * Procfs names can change at runtime. Corroboration only classifies inventory;
+     * it never supplies ownership or close authority, and never replaces Java's
+     * executable/arguments. Read both names between matching raw identity samples.
+     */
+    static ProcessInfo resolveLinuxMetadata(ProcessInfo before, String commandName, String firstArgument, ProcessInfo after)
+    {
+        if (before == null || !sameProcess(before, after) || before.parentPid() != after.parentPid())
+            throw new IllegalStateException("Process identity changed during Linux inventory");
+        if (before.executable() == null)
+        {
+            if (!validCommandName(commandName) || basename(commandName).startsWith("wine"))
+                throw new IllegalStateException("Process inventory is incomplete");
+            return new ProcessInfo(before.pid(), before.startedAt(), before.user(), commandName,
+                before.arguments(), before.parentPid(), null, null, true);
+        }
+        if (!WINE_LOADERS.contains(basename(before.executable())) || namesWineProgram(before)) return before;
+        if (!completeIdentity(before) || !validCommandName(commandName) || !isProgramArgument(firstArgument)) return before;
+        String program = basename(firstArgument);
+        if (!program.equals(commandName.toLowerCase(Locale.ROOT))
+            || (!"vrchat.exe".equals(program) && !WINE_HELPERS.contains(program))) return before;
+        // A conflicting first argument may be a different Windows executable, not
+        // argv[0] omitted by Java. Do not reinterpret that ambiguity as a helper.
+        if (!before.arguments().isEmpty())
+        {
+            String argument = basename(before.arguments().get(0));
+            if (argument.endsWith(".exe") && !argument.equals(program)) return before;
+        }
+        return new ProcessInfo(before.pid(), before.startedAt(), before.user(), before.executable(),
+            before.arguments(), before.parentPid(), null, program, true);
+    }
+
+    private static boolean validCommandName(String name)
+    {
+        return name != null && !name.isBlank() && name.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 15
+            && name.indexOf('\0') < 0 && name.indexOf('\n') < 0 && name.indexOf('\r') < 0
+            && name.indexOf('/') < 0 && name.indexOf('\\') < 0;
+    }
+
+    static String readProcCommandName(java.io.InputStream input) throws IOException
+    {
+        byte[] value = input.readNBytes(17);
+        if (value.length < 2 || value.length > 16 || value[value.length - 1] != '\n')
+            throw new IOException("Incomplete process name");
+        String name = new String(value, 0, value.length - 1, java.nio.charset.StandardCharsets.UTF_8);
+        if (!validCommandName(name)) throw new IOException("Invalid process name");
+        return name;
+    }
+
+    static String readProcFirstArgument(java.io.InputStream input) throws IOException
+    {
+        java.io.ByteArrayOutputStream value = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < 4096; i++)
+        {
+            int next = input.read();
+            if (next < 0) break;
+            if (next == 0)
+            {
+                if (value.size() == 0) break;
+                return value.toString(java.nio.charset.StandardCharsets.UTF_8);
+            }
+            value.write(next);
+        }
+        throw new IOException("Incomplete or oversized process argument");
     }
 
     private static String basename(String value)
@@ -974,24 +1087,7 @@ public final class ManagedVrcClient
                 throw new IllegalStateException("Process inventory is unsupported on this operating system");
             try (Stream<ProcessHandle> processes = ProcessHandle.allProcesses())
             {
-                return processes.map(process -> {
-                    ProcessInfo info = info(process);
-                    if (info == null || info.executable() != null) return info;
-                    // /proc/comm is OS process metadata, not a game file. It supplies a
-                    // name for protected unrelated processes, not ownership evidence.
-                    try
-                    {
-                        String name = java.nio.file.Files.readString(java.nio.file.Path.of("/proc", Long.toString(process.pid()), "comm")).trim();
-                        if (name.isEmpty() || name.toLowerCase(Locale.ROOT).startsWith("wine"))
-                            throw new IOException("Unidentified process command");
-                        return new ProcessInfo(info.pid(), info.startedAt(), info.user(), name, info.arguments(), info.parentPid());
-                    }
-                    catch (IOException | RuntimeException failure)
-                    {
-                        if (!process.isAlive()) return null;
-                        throw new IllegalStateException("Process inventory is incomplete", failure);
-                    }
-                }).filter(Objects::nonNull).collect(Collectors.toList());
+                return processes.map(NativeProcesses::info).filter(Objects::nonNull).collect(Collectors.toList());
             }
         }
 
@@ -1051,12 +1147,47 @@ public final class ManagedVrcClient
 
         private static ProcessInfo info(ProcessHandle process)
         {
-            if (!process.isAlive())
-                return null;
+            ProcessInfo before = rawInfo(process);
+            if (before == null || !"linux".equalsIgnoreCase(System.getProperty("os.name"))) return before;
+            if (before.executable() != null && basename(before.executable()).startsWith("wine")
+                && !WINE_LOADERS.contains(basename(before.executable())) && !uncertainWineIdentity(before))
+            {
+                ProcessInfo after = rawInfo(process);
+                if (after == null) return null;
+                if (!sameProcess(before, after) || before.parentPid() != after.parentPid())
+                    throw new IllegalStateException("Process identity changed during Linux inventory");
+                return before;
+            }
+            if (before.executable() != null && (!WINE_LOADERS.contains(basename(before.executable())) || namesWineProgram(before)))
+                return before;
+            try
+            {
+                java.nio.file.Path directory = java.nio.file.Path.of("/proc", Long.toString(process.pid()));
+                String name, argument = null;
+                try (java.io.InputStream input = java.nio.file.Files.newInputStream(directory.resolve("comm")))
+                { name = readProcCommandName(input); }
+                if (before.executable() != null)
+                    try (java.io.InputStream input = java.nio.file.Files.newInputStream(directory.resolve("cmdline")))
+                    { argument = readProcFirstArgument(input); }
+                ProcessInfo after = rawInfo(process);
+                if (after == null) return null;
+                return resolveLinuxMetadata(before, name, argument, after);
+            }
+            catch (IOException | RuntimeException failure)
+            {
+                if (!process.isAlive()) return null;
+                throw new IllegalStateException("Process inventory is incomplete", failure);
+            }
+        }
+
+        private static ProcessInfo rawInfo(ProcessHandle process)
+        {
+            if (!process.isAlive()) return null;
             ProcessHandle.Info info = process.info();
+            long parent = process.parent().map(ProcessHandle::pid).orElse(-1L);
+            if (!process.isAlive()) return null;
             return new ProcessInfo(process.pid(), info.startInstant().orElse(null), info.user().orElse(null),
-                info.command().orElse(null), info.arguments().map(List::of).orElse(List.of()),
-                process.parent().map(ProcessHandle::pid).orElse(-1L));
+                info.command().orElse(null), info.arguments().map(List::of).orElse(List.of()), parent);
         }
 
         public boolean requestClose(ProcessInfo expected, BooleanSupplier revalidate)
@@ -1066,6 +1197,7 @@ public final class ManagedVrcClient
 
         public CloseResult requestCloseDetailed(ProcessInfo expected, BooleanSupplier revalidate)
         {
+            if (expected == null || expected.inventoryOnly()) return CloseResult.IDENTITY_CHANGED;
             if (Platform.CURRENT.isNT())
             {
                 return WindowsClientClose.request(expected.pid(), new WindowsClientClose.Windows<HWND>() {

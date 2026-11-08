@@ -851,95 +851,103 @@ public interface MiscUtils
         /**
          * Opens a directory in the platform's native file manager.
          *
-         * <p>Priority order:
-         * <ol>
-         *   <li>AWT {@code Desktop.open()} — opens Explorer on Windows,
-         *       the default file manager on macOS, and whatever is registered
-         *       for directories via {@code xdg-open} on Linux.</li>
-         *   <li>Windows: {@code explorer.exe} directly.</li>
-         *   <li>Linux: {@code xdg-open}, then common file managers
-         *       (Nautilus, Dolphin, Thunar, Nemo, PCManFM, Caja).</li>
-         *   <li>Last resort: {@code browse(dir.toURI())} — opens in a web
-         *       browser if no file manager is available.</li>
-         * </ol>
+         * <p>Linux first uses {@code xdg-open} to follow the active desktop
+         * session, including Wayland. AWT and named file managers remain
+         * fallbacks. Windows and macOS retain AWT as their first choice.</p>
          *
          * @param dir the directory to reveal in the file manager
-         * @return true if the directory was opened successfully
+         * @return true if a directory-opening request was accepted
          */
         static boolean browseDirectory(File dir)
         {
-            // Attempt 1: AWT Desktop.open() — works for directories on all
-            // platforms and correctly invokes the file manager, not a browser.
-            if (Desktop.isDesktopSupported()) try
+            return browseDirectory(dir, Platform.CURRENT, new DirectoryOpener()
             {
-                Desktop desktop = Desktop.getDesktop();
-                if (desktop.isSupported(Desktop.Action.OPEN))
+                @Override public boolean desktopOpen(File directory) throws IOException
                 {
-                    desktop.open(dir);
-                    Scarlet.LOG.info("Opened directory via Desktop.open(): {}", dir);
+                    if (!Desktop.isDesktopSupported()) return false;
+                    Desktop desktop = Desktop.getDesktop();
+                    if (!desktop.isSupported(Desktop.Action.OPEN)) return false;
+                    desktop.open(directory);
                     return true;
                 }
-            }
-            catch (Exception ex)
-            {
-                Scarlet.LOG.warn("Desktop.open() failed for directory {}: {}", dir, ex.getMessage());
-            }
-
-            // Attempt 2: Windows — call explorer.exe directly
-            if (Platform.CURRENT.isNT()) try
-            {
-                new ProcessBuilder("explorer.exe", dir.getAbsolutePath())
-                    .inheritIO()
-                    .start();
-                Scarlet.LOG.info("Opened directory via explorer.exe: {}", dir);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Scarlet.LOG.warn("explorer.exe failed for {}: {}", dir, ex.getMessage());
-            }
-
-            // Attempt 3: Linux — xdg-open, then named file managers
-            if (Platform.CURRENT.is$nix())
-            {
-                for (String cmd : new String[]{
-                    "xdg-open",       // standard freedesktop launcher
-                    "nautilus",       // GNOME
-                    "dolphin",        // KDE
-                    "thunar",         // XFCE
-                    "nemo",           // Cinnamon
-                    "pcmanfm",        // LXDE
-                    "caja",           // MATE
-                })
+                @Override public Process start(String... command) throws IOException
                 {
-                    try
+                    return new ProcessBuilder(command).inheritIO().start();
+                }
+                @Override public boolean browse(URI uri)
+                {
+                    return AWTDesktop.browse(uri);
+                }
+            });
+        }
+
+        interface DirectoryOpener
+        {
+            boolean desktopOpen(File directory) throws IOException;
+            Process start(String... command) throws IOException;
+            boolean browse(URI uri);
+        }
+
+        static boolean browseDirectory(File dir, Platform platform, DirectoryOpener opener)
+        {
+            if (Thread.currentThread().isInterrupted()) return false;
+            try
+            {
+                // xdg-open follows the active desktop session; AWT can use X11.
+                if (platform.is$nix() && tryDirectoryCommand("xdg-open", dir, opener, true))
+                    return true;
+
+                try
+                {
+                    if (opener.desktopOpen(dir))
                     {
-                        Process opener = new ProcessBuilder(cmd, dir.getAbsolutePath())
-                            .inheritIO()
-                            .start();
-                        if (!openerAccepted(opener)) continue;
-                        Scarlet.LOG.info("Opened directory via {}: {}", cmd, dir);
+                        Scarlet.LOG.info("Opened directory via Desktop.open(): {}", dir);
                         return true;
                     }
-                    catch (InterruptedException interrupted)
-                    {
-                        Thread.currentThread().interrupt();
-                        return false;
-                    }
-                    catch (IOException ex)
-                    {
-                        // Command not available — try next
-                    }
-                    catch (Exception ex)
-                    {
-                        Scarlet.LOG.warn("'{}' failed for {}: {}", cmd, dir, ex.getMessage());
-                    }
                 }
-            }
+                catch (Exception ex)
+                {
+                    Scarlet.LOG.warn("Desktop.open() failed for directory {}: {}", dir, ex.getMessage());
+                }
 
-            // Last resort: open as a file:// URI in whatever handles it
-            Scarlet.LOG.warn("No file manager found; falling back to browser for directory: {}", dir);
-            return browse(dir.toURI());
+                if (platform.isNT() && tryDirectoryCommand("explorer.exe", dir, opener, false))
+                    return true;
+
+                if (platform.is$nix())
+                {
+                    for (String command : new String[]{"nautilus", "dolphin", "thunar", "nemo", "pcmanfm", "caja"})
+                        if (tryDirectoryCommand(command, dir, opener, true)) return true;
+                }
+
+                Scarlet.LOG.warn("No file manager found; falling back to browser for directory: {}", dir);
+                return opener.browse(dir.toURI());
+            }
+            catch (InterruptedException interrupted)
+            {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        static boolean tryDirectoryCommand(String command, File dir, DirectoryOpener opener, boolean checkExit)
+            throws InterruptedException
+        {
+            try
+            {
+                Process process = opener.start(command, dir.getAbsolutePath());
+                if (checkExit && !openerAccepted(process)) return false;
+                Scarlet.LOG.info("Opened directory via {}: {}", command, dir);
+                return true;
+            }
+            catch (IOException ex)
+            {
+                // Command unavailable: continue to the next fallback.
+            }
+            catch (RuntimeException ex)
+            {
+                Scarlet.LOG.warn("'{}' failed for {}: {}", command, dir, ex.getMessage());
+            }
+            return false;
         }
 
         static boolean openerAccepted(Process process) throws InterruptedException
