@@ -1,6 +1,7 @@
 package net.sybyline.scarlet.log;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -27,6 +28,7 @@ public class ScarletLogger extends LegacyAbstractLogger
 
     // Offline migration must not create or append files inside the snapshot it owns.
     private static volatile boolean consoleOnly = Boolean.getBoolean("scarlet.offline");
+    private static volatile BoundedLogSink initializedFileSink;
     private static final java.util.concurrent.atomic.AtomicLong errors = new java.util.concurrent.atomic.AtomicLong();
 
     public static long errorCount() { return errors.get(); }
@@ -35,6 +37,31 @@ public class ScarletLogger extends LegacyAbstractLogger
     public static void setConsoleOnly(boolean value)
     {
         consoleOnly = value;
+    }
+
+    /** Content-free counters; reading them never writes a diagnostic through the logger. */
+    public static FileOutputStatus fileOutputStatus()
+    {
+        boolean enabled = !consoleOnly;
+        BoundedLogSink sink = initializedFileSink;
+        return new FileOutputStatus(enabled, enabled && sink != null ? sink.status() : null);
+    }
+
+    public static final class FileOutputStatus
+    {
+        public final boolean enabled;
+        public final int queuedEntries;
+        public final long writtenEntries, backlogDroppedEntries, outputFailures, lastSuccessNanos, lastFailureNanos;
+        private FileOutputStatus(boolean enabled, BoundedLogSink.Status status)
+        {
+            this.enabled = enabled;
+            this.queuedEntries = status == null ? 0 : status.queuedEntries;
+            this.writtenEntries = status == null ? 0L : status.writtenEntries;
+            this.backlogDroppedEntries = status == null ? 0L : status.backlogDroppedEntries;
+            this.outputFailures = status == null ? 0L : status.outputFailures;
+            this.lastSuccessNanos = status == null ? 0L : status.lastSuccessNanos;
+            this.lastFailureNanos = status == null ? 0L : status.lastFailureNanos;
+        }
     }
 
     private static final long serialVersionUID = -875763706664943747L;
@@ -176,13 +203,23 @@ public class ScarletLogger extends LegacyAbstractLogger
                 if (stream == null)
                 {
                     java.nio.file.Files.createDirectories(logFile.toPath().getParent());
-                    stream = new PrintStream(logFile, "UTF-8");
+                    stream = new PrintStream(new FileOutputStream(logFile, true), false, "UTF-8");
                 }
                 stream.print(entry.text); stream.flush();
                 if (stream.checkError()) throw new IllegalStateException("Log file write failed");
             }
-            catch (java.io.IOException failure) { throw new IllegalStateException("Could not open log file", failure); }
+            catch (java.io.IOException | RuntimeException failure)
+            {
+                PrintStream failed = stream;
+                stream = null;
+                if (failed != null) try { failed.close(); } catch (RuntimeException ignored) { }
+                throw new IllegalStateException("Log file output unavailable", failure);
+            }
         }, () -> { if (stream != null) stream.close(); });
-        static { Runtime.getRuntime().addShutdownHook(new Thread(() -> sink.close(1000), "Scarlet file drain")); }
+        static
+        {
+            initializedFileSink = sink;
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> sink.close(1000), "Scarlet file drain"));
+        }
     }
 }

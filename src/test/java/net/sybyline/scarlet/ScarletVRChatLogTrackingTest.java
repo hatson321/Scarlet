@@ -803,6 +803,153 @@ class ScarletVRChatLogTrackingTest
         }
         String diagnostic = captured.toString(StandardCharsets.UTF_8);
         assertTrue(diagnostic.contains("Log record handler failed"));
+        assertTrue(diagnostic.contains("event=authentication"), "Identify the failed event without raw record text");
+        assertTrue(diagnostic.contains("exception=invalid-argument"), "Retain a bounded exception category");
         assertFalse(diagnostic.contains(canary));
     }
+    @Test void rejectedRecordDiagnosticPersistsWhileLaterEventsStillProcess() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            f.tail.on_line(false, PREFIX + "[Behaviour] OnPlayerJoined Synthetic (" + USER + ")");
+            for (int i = 0; i < 1024; i++) f.tail.on_line(false, "continuation");
+            String first = f.logs.readerDiagnostic();
+            assertTrue(first.contains("reason=record-too-large, event=player-join"));
+            assertTrue(first.contains("buffered-lines=1024"));
+            assertTrue(first.contains("limit=lines"));
+            assertTrue(first.contains("processed-after-first-fault=0"));
+            f.accept(false, "[Behaviour] User Authenticated: " + AUTH);
+            f.tail.on_loop();
+            assertEquals(2, f.authentication.size());
+            assertTrue(f.logs.readerDiagnostic().contains("processed-after-first-fault=1"));
+            assertTrue(f.logs.readerDiagnostic().contains("event=player-join"));
+            assertFalse(f.logs.clientExitTrackingHealthy());
+            assertNotNull(f.logs.tailerHealth().failure);
+        }
+    }
+
+    @Test void characterLimitDiagnosticIsBoundedAndNeverIncludesRawRecord() throws Exception
+    {
+        String canary = "private-record-canary";
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            f.tail.on_line(false, PREFIX + canary);
+            for (int i = 0; i < 130; i++) f.tail.on_line(false, "x".repeat(8192));
+            String diagnostic = f.logs.readerDiagnostic();
+            assertTrue(diagnostic.contains("event=other"));
+            assertTrue(diagnostic.contains("limit=characters"));
+            assertFalse(diagnostic.contains(canary));
+            assertTrue(diagnostic.length() < 1500);
+            assertTrue(f.tail.buffer.isEmpty());
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void firstFaultRemainsVisibleWhenASecondDifferentHandlerFails() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            f.tail.on_overlong_line();
+            f.failListener = true;
+            f.accept(false, "[Behaviour] User Authenticated: " + AUTH);
+            String diagnostic = f.logs.readerDiagnostic();
+            assertTrue(diagnostic.startsWith("First fault: reason=line-too-large"));
+            assertTrue(diagnostic.contains("latest fault: reason=handler-failed, event=authentication"));
+            assertTrue(diagnostic.contains("exception=invalid-state"));
+            assertTrue(diagnostic.contains("failures=2; processed-after-first-fault=0"));
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void safeFailureSiteExcludesRawStackFrameAndExceptionData() throws Exception
+    {
+        String canary = "private-frame-canary";
+        for (String frameClass : new String[] {"net.dv8tion.jda.api.EmbedBuilder", canary})
+        {
+            ScarletVRChatLogs.Listener listener = (ScarletVRChatLogs.Listener) Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{ScarletVRChatLogs.Listener.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("log_userAuthenticated"))
+                    {
+                        IllegalArgumentException failure = new IllegalArgumentException(canary, new IOException(canary));
+                        failure.setStackTrace(new StackTraceElement[]{new StackTraceElement(frameClass, canary, canary, 123)});
+                        throw failure;
+                    }
+                    return null;
+                });
+            try (TestLogs logs = new TestLogs(listener))
+            {
+                File file = Files.createTempFile(temporary, "synthetic-diagnostic-", ".txt").toFile();
+                ScarletVRChatLogs.VRChatLogTail tail = logs.new VRChatLogTail(file);
+                set(logs, "currentTarget", file); set(logs, "currentTail", tail);
+                tail.on_line(false, PREFIX + "[Behaviour] User Authenticated: " + AUTH); tail.on_eof();
+                String diagnostic = logs.readerDiagnostic();
+                assertTrue(diagnostic.contains("event=authentication"));
+                assertTrue(diagnostic.contains("time=2026-10-12T12:34:56"));
+                assertTrue(diagnostic.contains("exception=invalid-argument"));
+                assertTrue(diagnostic.contains("site=" + (frameClass.equals(canary) ? "unclassified" : "discord-embed:123")));
+                assertFalse(diagnostic.contains(canary));
+                assertFalse(diagnostic.contains(USER));
+                assertTrue(diagnostic.length() < 1500);
+                assertFalse(tail.trackingValid);
+            }
+        }
+    }
+
+    @Test void readerIoFailureDiagnosticDoesNotExposeExceptionPath() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            f.tail.on_exception(new IOException("private-path-canary"));
+            String diagnostic = f.logs.readerDiagnostic();
+            assertTrue(diagnostic.contains("reason=reader-failed"));
+            assertTrue(diagnostic.contains("exception=io"));
+            assertFalse(diagnostic.contains("private-path-canary"));
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
+    @Test void successfulSessionDoesNotInventARecordFault() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            assertEquals("Reader diagnostic: no record-processing failure recorded.", f.logs.readerDiagnostic());
+            assertTrue(f.logs.clientExitTrackingHealthy());
+            assertNull(f.logs.tailerHealth().failure);
+        }
+    }
+
+    @Test void changedReaderCannotSupplyContextForAnEarlierHealthObservation() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy(); f.tail.on_overlong_line();
+            ScarletTailerHealth.Reader observed = f.logs.tailerHealth();
+            ScarletVRChatLogs.VRChatLogTail replacement = f.logs.new VRChatLogTail(f.file);
+            set(f.logs, "currentTail", replacement);
+            assertEquals("Reader diagnostic: session changed during observation.", f.logs.readerDiagnostic(observed));
+            assertEquals("Reader diagnostic: no record-processing failure recorded.", f.logs.readerDiagnostic(f.logs.tailerHealth()));
+        }
+    }
+
+    @Test void anUnavailableExceptionStackCannotBreakFailureDiagnostics() throws Exception
+    {
+        try (Fixture f = new Fixture())
+        {
+            f.healthy();
+            IOException failure = new IOException("private-message-canary") {
+                @Override public StackTraceElement[] getStackTrace() { throw new IllegalStateException("private-stack-canary"); }
+            };
+            assertDoesNotThrow(() -> f.tail.on_exception(failure));
+            String diagnostic = f.logs.readerDiagnostic();
+            assertTrue(diagnostic.contains("site=unavailable"));
+            assertFalse(diagnostic.contains("canary"));
+            assertFalse(f.logs.clientExitTrackingHealthy());
+        }
+    }
+
 }

@@ -125,6 +125,27 @@ public class ScarletVRChatLogs implements Closeable
         return new ScarletTailerHealth.Reader(tail, fileStart, completed, failure);
     }
 
+    /** Diagnostic context only; never grants reader or automatic-action trust. */
+    String readerDiagnostic() { return this.readerDiagnostic((Object)this.currentTail); }
+
+    String readerDiagnostic(ScarletTailerHealth.Reader observation)
+    { return this.readerDiagnostic(observation == null ? null : observation.session); }
+
+    private String readerDiagnostic(Object observedSession)
+    {
+        VRChatLogTail tail = this.currentTail;
+        if (tail != observedSession) return "Reader diagnostic: session changed during observation.";
+        if (tail == null) return "Reader diagnostic: no current reader.";
+        RecordDiagnostics snapshot = tail.recordDiagnostics;
+        RecordFailure first = snapshot.first, latest = snapshot.latest;
+        if (first == null) return "Reader diagnostic: no record-processing failure recorded.";
+        long since = Math.max(0L, tail.successfulRecords - first.successfulRecords);
+        String detail = "First fault: " + first.summary;
+        if (latest != null && latest != first) detail += "; latest fault: " + latest.summary;
+        detail += "; failures=" + snapshot.failures + "; processed-after-first-fault=" + since;
+        return tail == this.currentTail ? detail : "Reader diagnostic: session changed during observation.";
+    }
+
     /**
      * Whether the current live parser has recently finished processing available log
      * entries. Quiet logs remain healthy; stale, stopped or damaged tracking cannot
@@ -512,6 +533,94 @@ public class ScarletVRChatLogs implements Closeable
         try { return LocalDateTime.parse(name.substring(11, 30), dtf); }
         catch (java.time.DateTimeException invalid) { return null; }
     }
+    private enum RecordFault
+    {
+        INVALID_TIMESTAMP, RECORD_TOO_LARGE, LINE_TOO_LARGE, HANDLER_FAILED, READER_FAILED;
+        String code() { return this.name().toLowerCase(java.util.Locale.ROOT).replace('_', '-'); }
+    }
+
+    private static final class RecordFailure
+    {
+        final String summary;
+        final long successfulRecords;
+        RecordFailure(String summary, long successfulRecords)
+        { this.summary = summary; this.successfulRecords = successfulRecords; }
+    }
+
+    private static final class RecordDiagnostics
+    {
+        final RecordFailure first, latest;
+        final long failures;
+        RecordDiagnostics(RecordFailure first, RecordFailure latest, long failures)
+        { this.first = first; this.latest = latest; this.failures = failures; }
+    }
+
+    private static String recordKind(String text)
+    {
+        if (text == null) return "unclassified";
+        String body = text.startsWith("[Behaviour] ") ? text.substring(12) : text;
+        if (body.startsWith("[User Authenticated: ") || body.startsWith("User Authenticated: ")) return "authentication";
+        if (text.startsWith("[Behaviour] "))
+        {
+            if (body.startsWith("Joining ")) return "room-join";
+            if (body.startsWith("OnLeftRoom")) return "room-leave";
+            if (body.startsWith("OnPlayerJoined ")) return "player-join";
+            if (body.startsWith("OnPlayerLeft ")) return "player-leave";
+            if (body.startsWith("Switching ")) return "avatar-switch";
+            return "other-behaviour";
+        }
+        if (text.startsWith("[API] [")) return "api-record";
+        if (text.startsWith("[ModerationManager] ")) return "moderation";
+        if (text.startsWith("[SharingManager] ")) return "pedestal";
+        if (text.startsWith("[StickersManager] ")) return "sticker";
+        if (text.startsWith("[VRCProps] ") || text.startsWith("[VRCItems] ")) return "prop";
+        if (text.startsWith("VRCApplication: HandleApplicationQuit at ")) return "client-quit";
+        if (text.startsWith("[USharpVideo] ") || text.startsWith("[<color=#9C6994>USharpVideo</color>] ")) return "video";
+        return "other";
+    }
+
+    private static String exceptionKind(Exception failure)
+    {
+        if (failure == null) return "none";
+        if (failure instanceof IllegalArgumentException) return "invalid-argument";
+        if (failure instanceof IndexOutOfBoundsException) return "bad-index";
+        if (failure instanceof NullPointerException) return "null-value";
+        if (failure instanceof SecurityException) return "access-denied";
+        if (failure instanceof IOException) return "io";
+        if (failure instanceof InterruptedException) return "interrupted";
+        if (failure instanceof IllegalStateException) return "invalid-state";
+        return "other";
+    }
+
+    private static String failureSite(Exception failure)
+    {
+        if (failure == null) return "unavailable";
+        StackTraceElement[] frames;
+        try { frames = failure.getStackTrace(); }
+        catch (RuntimeException unavailable) { return "unavailable"; }
+        if (frames == null) return "unavailable";
+        for (int i = 0; i < Math.min(frames.length, 32); i++)
+        {
+            StackTraceElement frame = frames[i];
+            if (frame == null) continue;
+            String label;
+            switch (frame.getClassName())
+            {
+            case "net.sybyline.scarlet.ScarletVRChatLogs": label = "parser"; break;
+            case "net.sybyline.scarlet.ScarletVRChatLogs$VRChatLogTail": label = "reader"; break;
+            case "net.sybyline.scarlet.ScarletEventListener": label = "event-listener"; break;
+            case "net.sybyline.scarlet.ScarletDiscordJDA": label = "discord-output"; break;
+            case "net.sybyline.scarlet.ScarletStartupFailureLoop": label = "startup-markers"; break;
+            case "net.dv8tion.jda.api.EmbedBuilder": label = "discord-embed"; break;
+            case "net.dv8tion.jda.internal.utils.Checks": label = "discord-validation"; break;
+            default: continue;
+            }
+            int line = frame.getLineNumber();
+            return label + (line > 0 && line <= 1000000 ? ":" + line : "");
+        }
+        return "unclassified";
+    }
+
     class VRChatLogTail extends Tail
     {
         static final int MAX_ENTRY_CHARS = 1024 * 1024, MAX_ENTRY_LINES = 1024;
@@ -531,6 +640,8 @@ public class ScarletVRChatLogs implements Closeable
         long lastPolled;
         volatile boolean isInPreamble;
         volatile boolean trackingValid = true;
+        volatile RecordDiagnostics recordDiagnostics = new RecordDiagnostics(null, null, 0L);
+        volatile long successfulRecords;
         volatile long completedLoopNanos;
         volatile long lastHealthyLoopNanos;
         volatile long watchdogLoopNanos;
@@ -552,7 +663,7 @@ public class ScarletVRChatLogs implements Closeable
                 try { this.entryLdt = LocalDateTime.parse(matcher.group("ldt"), entry_dtf); }
                 catch (java.time.DateTimeException invalid)
                 {
-                    this.rejectEntry("invalid-timestamp");
+                    this.rejectEntry(RecordFault.INVALID_TIMESTAMP);
                     return;
                 }
                 this.entryLvl = matcher.group("lvl");
@@ -561,7 +672,7 @@ public class ScarletVRChatLogs implements Closeable
             if (!this.discardEntry)
             {
                 if (line.length() > MAX_ENTRY_CHARS - this.bufferedChars || this.buffer.size() >= MAX_ENTRY_LINES)
-                    this.rejectEntry("record-too-large");
+                    this.rejectEntry(RecordFault.RECORD_TOO_LARGE);
                 else
                 {
                     this.buffer.add(line);
@@ -657,21 +768,38 @@ public class ScarletVRChatLogs implements Closeable
         {
             this.invalidateTracking();
             if (!(ex instanceof InterruptedException))
-                LOG.warn("Log reader failed ({}); automatic actions remain blocked", ex.getClass().getSimpleName());
+                LOG.warn("Log reader failed; {}; automatic actions remain blocked", this.recordFailure(RecordFault.READER_FAILED, ex));
         }
-        @Override protected void on_overlong_line() { this.rejectEntry("line-too-large"); }
+        @Override protected void on_overlong_line() { this.rejectEntry(RecordFault.LINE_TOO_LARGE); }
 
-        private void rejectEntry(String reason)
+        private String recordFailure(RecordFault reason, Exception exception)
+        {
+            String limit = reason == RecordFault.RECORD_TOO_LARGE
+                ? (this.buffer.size() >= MAX_ENTRY_LINES ? "lines" : "characters") : "none";
+            String summary = "reason=" + reason.code() + ", event=" + recordKind(this.entryTxt)
+                + ", time=" + (this.entryLdt == null ? "unavailable" : this.entryLdt)
+                + ", phase=" + (this.isInPreamble ? "catchup" : "live")
+                + ", buffered-lines=" + this.buffer.size() + ", buffered-chars=" + this.bufferedChars
+                + ", limit=" + limit + ", exception=" + exceptionKind(exception) + ", site=" + failureSite(exception);
+            RecordFailure failure = new RecordFailure(summary, this.successfulRecords);
+            RecordDiagnostics previous = this.recordDiagnostics;
+            this.recordDiagnostics = new RecordDiagnostics(previous.first == null ? failure : previous.first,
+                failure, previous.failures < Long.MAX_VALUE ? previous.failures + 1L : Long.MAX_VALUE);
+            return summary;
+        }
+
+        private void rejectEntry(RecordFault reason)
         {
             boolean firstFailure = this.trackingValid;
             this.invalidateTracking();
+            String diagnostic = this.recordFailure(reason, null);
             this.buffer.clear();
             this.bufferedChars = 0;
             this.entryLdt = null;
             this.entryLvl = null;
             this.entryTxt = null;
             this.discardEntry = true;
-            if (firstFailure) LOG.warn("Log record rejected ({}); automatic actions remain blocked", reason);
+            if (firstFailure) LOG.warn("Log record rejected ({}); {}; automatic actions remain blocked", reason.code(), diagnostic);
         }
 
         @Override public void stop()
@@ -696,12 +824,13 @@ public class ScarletVRChatLogs implements Closeable
                     this.startupFailures.accept(this.isInPreamble, this.entryLdt, this.entryLvl, this.entryTxt,
                         ScarletVRChatLogs.this.trackingNowNanos());
                     ScarletVRChatLogs.this.handleEntry(this.file, this.isInPreamble, this.entryLdt, this.entryLvl, this.entryTxt, this.buffer);
+                    if (this.successfulRecords < Long.MAX_VALUE) this.successfulRecords++;
                 }
             }
             catch (Exception ex)
             {
                 this.invalidateTracking();
-                LOG.error("Log record handler failed ({}); automatic actions remain blocked", ex.getClass().getSimpleName());
+                LOG.error("Log record handler failed; {}; automatic actions remain blocked", this.recordFailure(RecordFault.HANDLER_FAILED, ex));
             }
             finally
             {

@@ -21,7 +21,7 @@ final class BoundedLogSink
     private final int capacity, characterBudget;
     private final Thread worker;
     private int characters;
-    private long dropped, reported, clipped;
+    private long dropped, reported, clipped, written, outputFailures, lastSuccessNanos, lastFailureNanos;
     private boolean stopping, writing;
 
     BoundedLogSink(String name, int capacity, int characterBudget, Consumer<Entry> output, Runnable finish)
@@ -39,14 +39,23 @@ final class BoundedLogSink
                         if (this.queue.isEmpty()) break;
                         entry = this.queue.removeFirst(); this.characters -= entry.text.length();
                         this.writing = true;
-                        lost = this.dropped - this.reported; this.reported = this.dropped;
+                        lost = this.dropped - this.reported;
                     }
                     try
                     {
-                        if (lost != 0) output.accept(new Entry("[Scarlet logging] " + lost + " entries dropped due to output backlog.\n", true, true));
-                        output.accept(entry);
+                        if (lost != 0) try
+                        {
+                            output.accept(new Entry("[Scarlet logging] " + lost + " entries dropped due to output backlog.\n", true, true));
+                            synchronized (this) { this.reported += lost; }
+                        }
+                        catch (RuntimeException failure) { this.outputFailed(); }
+                        try
+                        {
+                            output.accept(entry);
+                            synchronized (this) { this.written++; this.lastSuccessNanos = System.nanoTime(); }
+                        }
+                        catch (RuntimeException failure) { this.outputFailed(); }
                     }
-                    catch (RuntimeException failure) { synchronized (this) { this.dropped++; } }
                     finally { synchronized (this) { this.writing = false; this.notifyAll(); } }
                 }
             }
@@ -82,6 +91,31 @@ final class BoundedLogSink
     synchronized int characters() { return this.characters; }
     synchronized long dropped() { return this.dropped; }
     synchronized long clipped() { return this.clipped; }
+    private synchronized void outputFailed()
+    {
+        this.outputFailures++;
+        this.lastFailureNanos = System.nanoTime();
+    }
+    synchronized Status status()
+    {
+        return new Status(this.queue.size(), this.written, this.dropped, this.outputFailures,
+            this.lastSuccessNanos, this.lastFailureNanos);
+    }
+    static final class Status
+    {
+        final int queuedEntries;
+        final long writtenEntries, backlogDroppedEntries, outputFailures, lastSuccessNanos, lastFailureNanos;
+        Status(int queuedEntries, long writtenEntries, long backlogDroppedEntries, long outputFailures,
+            long lastSuccessNanos, long lastFailureNanos)
+        {
+            this.queuedEntries = queuedEntries;
+            this.writtenEntries = writtenEntries;
+            this.backlogDroppedEntries = backlogDroppedEntries;
+            this.outputFailures = outputFailures;
+            this.lastSuccessNanos = lastSuccessNanos;
+            this.lastFailureNanos = lastFailureNanos;
+        }
+    }
     synchronized boolean awaitIdle(long timeoutMillis)
     {
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(0, timeoutMillis));

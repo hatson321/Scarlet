@@ -200,7 +200,7 @@ public class Scarlet implements Closeable
             if (implementationVersion != null && !implementationVersion.trim().isEmpty())
                 return implementationVersion.trim();
         }
-        return "0.6.2-T4";
+        return "0.6.2-T5";
     }
 
     public static void main(String[] args) throws Exception
@@ -2882,18 +2882,23 @@ Send-ScarletIPC -GroupID 'grp_00000000-0000-0000-0000-000000000000' -Message 'st
     private void checkTailerHealth()
     {
         ScarletTailerHealth.Clients clients = ScarletTailerHealth.captureClients(ScarletUI.findVRChatPids());
-        ScarletTailerHealth.Change change = this.tailerHealth.observe(System.nanoTime(), clients, this.logs.tailerHealth());
+        ScarletTailerHealth.Reader reader = this.logs.tailerHealth();
+        ScarletTailerHealth.Change change = this.tailerHealth.observe(System.nanoTime(), clients, reader);
         if (change == ScarletTailerHealth.Change.STALLED)
         {
             long minutes = this.tailerHealth.unhealthyMinutes();
-            LOG.warn("VRChat log reader health unconfirmed for {} minutes ({})", minutes, this.tailerHealth.reason());
+            ScarletLogger.FileOutputStatus output = ScarletLogger.fileOutputStatus();
+            String diagnostic = this.logs.readerDiagnostic(reader) + "\nFile logging: "
+                + (output.enabled ? "written=" + output.writtenEntries + ", failed-writes=" + output.outputFailures
+                    + ", backlog-drops=" + output.backlogDroppedEntries + ", queued=" + output.queuedEntries : "disabled");
+            LOG.warn("VRChat log reader health unconfirmed for {} minutes ({}); {}", minutes, this.tailerHealth.reason(), diagnostic);
             this.splash.queueFeedbackPopup(null, 10_000L,
                 I18n.tr("health.tailerStalled"), I18n.tr("health.tailerStalledDetail", minutes),
                 java.awt.Color.ORANGE, java.awt.Color.ORANGE);
             this.discord.emitOpsAlert("VRChat log reader needs attention",
                 "Scarlet has been unable to confirm a healthy log reader for the current VRChat session for " + minutes
-                + " minutes. Instance monitoring may be unavailable. Check Scarlet's log for the tracking diagnostic."
-                + " A quiet but healthy log does not trigger this alert.", 0xE74C3C);
+                + " minutes. Some events may still be logged. Processing errors keep automatic client actions blocked."
+                + "\nReason: `" + this.tailerHealth.reason() + "`.\n" + diagnostic, 0xE74C3C);
         }
         else if (change == ScarletTailerHealth.Change.RECOVERED)
         {
