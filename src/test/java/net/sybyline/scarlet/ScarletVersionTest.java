@@ -133,7 +133,7 @@ class ScarletVersionTest
         assertTrue(MiscUtils.isPreviewVersion("0.6.2-a1"));
         assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", "0.6.1") > 0);
         assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", "0.6.2") < 0);
-        assertEquals("0.6.2-T5", Scarlet.VERSION);
+        assertEquals("0.6.2-T6", Scarlet.VERSION);
         assertTrue(MiscUtils.isPreviewVersion(Scarlet.VERSION));
         assertTrue(MiscUtils.compareScarletVersion(Scarlet.VERSION, "0.6.2-a1") > 0);
         assertTrue(MiscUtils.compareScarletVersion("0.6.2-a1", Scarlet.VERSION) < 0);

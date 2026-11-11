@@ -637,6 +637,8 @@ public class ScarletVRChatLogs implements Closeable
         final List<String> buffer;
         int bufferedChars;
         boolean discardEntry;
+        // A known diagnostic body may continue after an intermediate EOF.
+        boolean udonDiagnostic;
         long lastPolled;
         volatile boolean isInPreamble;
         volatile boolean trackingValid = true;
@@ -656,10 +658,12 @@ public class ScarletVRChatLogs implements Closeable
             ScarletVRChatLogs.this.startupProgress.incrementAndGet();
             this.completedLoopNanos = 0L;
             Matcher matcher = entry.matcher(line);
-            if (matcher.find())
+            boolean startsEntry = matcher.find();
+            if (startsEntry)
             {
                 this.handleCurrentEntry();
                 this.discardEntry = false;
+                this.udonDiagnostic = false;
                 try { this.entryLdt = LocalDateTime.parse(matcher.group("ldt"), entry_dtf); }
                 catch (java.time.DateTimeException invalid)
                 {
@@ -668,8 +672,12 @@ public class ScarletVRChatLogs implements Closeable
                 }
                 this.entryLvl = matcher.group("lvl");
                 this.entryTxt = matcher.group("txt");
+                this.udonDiagnostic = "Error".equals(this.entryLvl) && this.entryTxt.equals(
+                    "[UdonBehaviour] An exception occurred during Udon execution, this UdonBehaviour will be halted.");
             }
-            if (!this.discardEntry)
+            // Retain the header; the known Udon stack/heap dump has no tracking payload.
+            // Every subsequent timestamped header is still parsed normally.
+            if (!this.discardEntry && (!this.udonDiagnostic || startsEntry))
             {
                 if (line.length() > MAX_ENTRY_CHARS - this.bufferedChars || this.buffer.size() >= MAX_ENTRY_LINES)
                     this.rejectEntry(RecordFault.RECORD_TOO_LARGE);
@@ -799,6 +807,7 @@ public class ScarletVRChatLogs implements Closeable
             this.entryLvl = null;
             this.entryTxt = null;
             this.discardEntry = true;
+            this.udonDiagnostic = false;
             if (firstFailure) LOG.warn("Log record rejected ({}); {}; automatic actions remain blocked", reason.code(), diagnostic);
         }
 
