@@ -206,6 +206,11 @@ public interface VrcLaunch
         return MANAGED_CLIENTS.confirmedClientPids();
     }
 
+    static VrcClientPresence clientPresence()
+    {
+        return MANAGED_CLIENTS.clientPresence();
+    }
+
     /** Shared client arguments; an account ID is not a numeric VRChat profile selector. */
     static java.util.List<String> clientArguments(String location, String shortName, LaunchMode mode)
     {

@@ -861,9 +861,10 @@ public class ScarletEventListener implements ScarletVRChatLogs.Listener
         // the VRChat API.
         if (this.clientLocation == null)
             return;
-        if (ScarletUI.findVRChatPids().isEmpty())
+        net.sybyline.scarlet.ext.VrcClientPresence presence = net.sybyline.scarlet.ext.VrcLaunch.clientPresence();
+        if (presence.state != net.sybyline.scarlet.ext.VrcClientPresence.State.PRESENT)
         {
-            Scarlet.LOG.debug("Skipping avatar info rescan: VRChat is not running");
+            Scarlet.LOG.debug("Skipping avatar info rescan: {}", presence.rescanSkipReason());
             return;
         }
         this.rescanCurrentAvatarAdvisories();

@@ -234,6 +234,8 @@ public final class ManagedVrcClient
         private final Processes processes;
         private final Clock clock;
         private final LongSupplier nanos;
+        private final VrcClientPresence.LogGate diagnosticLog = new VrcClientPresence.LogGate();
+        private final java.util.function.Consumer<String> diagnosticSink;
         private final Pause pause;
         private final SingleVrcClient shutdownClients;
         private final AtomicBoolean launching = new AtomicBoolean();
@@ -260,6 +262,14 @@ public final class ManagedVrcClient
 
         Tracker(Processes processes, Clock clock, LongSupplier nanos, Pause pause)
         {
+            this(processes, clock, nanos, pause,
+                message -> org.slf4j.LoggerFactory.getLogger("Scarlet/VrcLaunch").info("{}", message));
+        }
+
+        Tracker(Processes processes, Clock clock, LongSupplier nanos, Pause pause,
+            java.util.function.Consumer<String> diagnosticSink)
+        {
+            this.diagnosticSink = Objects.requireNonNull(diagnosticSink, "diagnosticSink");
             this.processes = processes;
             this.clock = clock;
             this.nanos = nanos;
@@ -290,6 +300,16 @@ public final class ManagedVrcClient
         /** Process metadata only. Uncertainty must never be interpreted as an empty machine. */
         private List<ProcessInfo> checkedSnapshot()
         {
+            try { return this.readCheckedSnapshot(); }
+            catch (RuntimeException | LinkageError failure)
+            {
+                this.reportPresence(VrcClientPresence.unverified(failure));
+                throw failure;
+            }
+        }
+
+        private List<ProcessInfo> readCheckedSnapshot()
+        {
             Set<Long> roots;
             synchronized (this)
             {
@@ -298,13 +318,19 @@ public final class ManagedVrcClient
                 if (this.managed != null) roots.add(this.managed.pid);
             }
             List<ProcessInfo> snapshot = this.processes.discoverySnapshot(roots);
-            if (snapshot == null || snapshot.size() > 100_000) throw new IllegalStateException("Process inventory is unavailable or exceeds its bound");
+            if (snapshot == null) throw new VrcClientPresence.Failure(VrcClientPresence.Reason.INVENTORY_UNAVAILABLE, null);
+            if (snapshot.size() > 100_000) throw new VrcClientPresence.Failure(VrcClientPresence.Reason.INVENTORY_LIMIT, null);
             Set<Long> pids = new HashSet<>();
             for (ProcessInfo process : snapshot)
-                if (process == null || process.pid() < 0L || !pids.add(process.pid())
-                    || process.executable() == null || process.executable().isBlank()
-                    || uncertainWineIdentity(process))
-                    throw new IllegalStateException("Process inventory is incomplete");
+            {
+                if (process == null) throw new VrcClientPresence.Failure(VrcClientPresence.Reason.INVALID_RECORD, null);
+                if (process.pid() < 0L) throw new VrcClientPresence.Failure(VrcClientPresence.Reason.INVALID_PID, process);
+                if (!pids.add(process.pid())) throw new VrcClientPresence.Failure(VrcClientPresence.Reason.DUPLICATE_PID, process);
+                if (process.executable() == null || process.executable().isBlank())
+                    throw new VrcClientPresence.Failure(VrcClientPresence.Reason.EXECUTABLE_UNAVAILABLE, process);
+                if (uncertainWineIdentity(process))
+                    throw new VrcClientPresence.Failure(VrcClientPresence.Reason.WINE_IDENTITY_UNVERIFIED, process);
+            }
             return snapshot;
         }
 
@@ -318,12 +344,34 @@ public final class ManagedVrcClient
         /** Positive detection for health/privacy callers; pending startup is not a live client. */
         public List<String> confirmedClientPids()
         {
+            return this.clientPresence().clientPids();
+        }
+
+        public VrcClientPresence clientPresence()
+        {
             try
             {
-                return this.checkedSnapshot().stream().filter(process -> process.pid() > 0L && isClient(process))
-                    .map(process -> Long.toString(process.pid())).collect(Collectors.toList());
+                List<ProcessInfo> clients = this.checkedSnapshot().stream()
+                    .filter(process -> process.pid() > 0L && isClient(process)).collect(Collectors.toList());
+                VrcClientPresence presence = VrcClientPresence.verified(clients.stream()
+                    .map(process -> Long.toString(process.pid())).collect(Collectors.toList()),
+                    clients.stream().filter(ProcessInfo::inventoryOnly).count());
+                this.reportPresence(presence);
+                return presence;
             }
-            catch (RuntimeException | LinkageError unknown) { return List.of(); }
+            catch (RuntimeException | LinkageError unknown) { return VrcClientPresence.unverified(unknown); }
+        }
+
+        private void reportPresence(VrcClientPresence presence)
+        {
+            if (this.diagnosticLog.shouldLog(presence, this.nanos.getAsLong()))
+                this.diagnostic("VRChat process diagnostic: " + presence.diagnostic());
+        }
+
+        private void diagnostic(String message)
+        {
+            try { this.diagnosticSink.accept(message); }
+            catch (RuntimeException | LinkageError unavailable) { /* Diagnostics cannot change process decisions. */ }
         }
 
         public void cancelPendingLaunches()
@@ -414,6 +462,7 @@ public final class ManagedVrcClient
                 if (!this.launching.compareAndSet(false, true))
                     throw new IOException("A VRChat launch or restart is already in progress. Wait for it to finish.");
             }
+            this.diagnostic("VRChat launch diagnostic: stage=request-received");
             this.launchThread = Thread.currentThread();
             long generation = this.cancellation.get();
             long token = 0L;
@@ -473,7 +522,12 @@ public final class ManagedVrcClient
                 this.unresolvedUntil = this.nanos.getAsLong() + STARTUP_NANOS;
                 Exception startFailure = null;
                 ProcessInfo launcher = null;
-                try { launcher = starter.start(() -> this.checkCancelled(generation)); }
+                try
+                {
+                    this.diagnostic("VRChat launch diagnostic: stage=dispatch-entered");
+                    launcher = starter.start(() -> this.checkCancelled(generation));
+                    this.diagnostic("VRChat launch diagnostic: stage=dispatch-returned");
+                }
                 catch (InterruptedException interrupted) { throw interrupted; }
                 catch (Exception failure) { startFailure = failure; }
                 this.launchCompleted(token, launcher);
@@ -486,6 +540,7 @@ public final class ManagedVrcClient
                     {
                         this.checkCancelled(generation);
                         success = true;
+                        this.diagnostic("VRChat launch diagnostic: stage=ownership-verified");
                         this.unresolvedUntil = 0L;
                         synchronized (this) { this.unresolvedProcesses.clear(); }
                         return;
@@ -508,6 +563,8 @@ public final class ManagedVrcClient
             }
             finally
             {
+                if (!success)
+                    this.diagnostic("VRChat launch diagnostic: stage=not-confirmed");
                 if (!success && token != 0L) this.launchFailed(token);
                 this.launchThread = null;
                 this.launching.set(false);
@@ -983,11 +1040,11 @@ public final class ManagedVrcClient
     static ProcessInfo resolveLinuxMetadata(ProcessInfo before, String commandName, String firstArgument, ProcessInfo after)
     {
         if (before == null || !sameProcess(before, after) || before.parentPid() != after.parentPid())
-            throw new IllegalStateException("Process identity changed during Linux inventory");
+            throw new VrcClientPresence.Failure(VrcClientPresence.Reason.LINUX_IDENTITY_CHANGED, before);
         if (before.executable() == null)
         {
             if (!validCommandName(commandName) || basename(commandName).startsWith("wine"))
-                throw new IllegalStateException("Process inventory is incomplete");
+                throw new VrcClientPresence.Failure(VrcClientPresence.Reason.EXECUTABLE_UNAVAILABLE, before);
             return new ProcessInfo(before.pid(), before.startedAt(), before.user(), commandName,
                 before.arguments(), before.parentPid(), null, null, true);
         }
@@ -1005,6 +1062,54 @@ public final class ManagedVrcClient
         }
         return new ProcessInfo(before.pid(), before.startedAt(), before.user(), before.executable(),
             before.arguments(), before.parentPid(), null, program, true);
+    }
+
+    @FunctionalInterface interface ProcInput { java.io.InputStream open() throws IOException; }
+
+    /** The same bounded metadata reads used for detection; failures expose no raw values. */
+    static ProcessInfo readLinuxMetadata(ProcessInfo before, ProcInput command, ProcInput argument,
+        java.util.function.Supplier<ProcessInfo> reread, BooleanSupplier alive)
+    {
+        VrcClientPresence.Reason stage = VrcClientPresence.Reason.PROC_NAME_UNAVAILABLE;
+        try
+        {
+            String name, firstArgument = null;
+            try (java.io.InputStream input = command.open()) { name = readProcCommandName(input); }
+            if (before.executable() != null)
+            {
+                stage = VrcClientPresence.Reason.PROC_ARGV0_UNAVAILABLE;
+                try (java.io.InputStream input = argument.open()) { firstArgument = readProcFirstArgument(input); }
+            }
+            stage = VrcClientPresence.Reason.JAVA_METADATA_UNAVAILABLE;
+            ProcessInfo after = reread.get();
+            if (after == null) return null;
+            ProcessInfo resolved = resolveLinuxMetadata(before, name, firstArgument, after);
+            if (uncertainWineIdentity(resolved))
+                throw new VrcClientPresence.Failure(linuxRejection(before, name, firstArgument), before);
+            return resolved;
+        }
+        catch (IOException | RuntimeException failure)
+        {
+            if (!alive.getAsBoolean()) return null;
+            if (failure instanceof VrcClientPresence.Failure) throw (VrcClientPresence.Failure)failure;
+            throw new VrcClientPresence.Failure(stage, before);
+        }
+    }
+
+    private static VrcClientPresence.Reason linuxRejection(ProcessInfo before, String name, String argument)
+    {
+        if (!completeIdentity(before)) return VrcClientPresence.Reason.WINE_IDENTITY_INCOMPLETE;
+        if (!validCommandName(name)) return VrcClientPresence.Reason.WINE_NAME_INVALID;
+        if (!isProgramArgument(argument)) return VrcClientPresence.Reason.WINE_ARGV0_NOT_PROGRAM;
+        String program = basename(argument);
+        if (!program.equals(name.toLowerCase(Locale.ROOT))) return VrcClientPresence.Reason.WINE_NAME_MISMATCH;
+        if (!"vrchat.exe".equals(program) && !WINE_HELPERS.contains(program)) return VrcClientPresence.Reason.WINE_PROGRAM_UNRECOGNIZED;
+        if (!before.arguments().isEmpty())
+        {
+            String first = basename(before.arguments().get(0));
+            if (first.endsWith(".exe") && !first.equals(program)) return VrcClientPresence.Reason.WINE_ARGUMENT_CONFLICT;
+        }
+        return VrcClientPresence.Reason.WINE_IDENTITY_UNVERIFIED;
     }
 
     private static boolean validCommandName(String name)
@@ -1155,29 +1260,16 @@ public final class ManagedVrcClient
                 ProcessInfo after = rawInfo(process);
                 if (after == null) return null;
                 if (!sameProcess(before, after) || before.parentPid() != after.parentPid())
-                    throw new IllegalStateException("Process identity changed during Linux inventory");
+                    throw new VrcClientPresence.Failure(VrcClientPresence.Reason.LINUX_IDENTITY_CHANGED, before);
                 return before;
             }
             if (before.executable() != null && (!WINE_LOADERS.contains(basename(before.executable())) || namesWineProgram(before)))
                 return before;
-            try
-            {
-                java.nio.file.Path directory = java.nio.file.Path.of("/proc", Long.toString(process.pid()));
-                String name, argument = null;
-                try (java.io.InputStream input = java.nio.file.Files.newInputStream(directory.resolve("comm")))
-                { name = readProcCommandName(input); }
-                if (before.executable() != null)
-                    try (java.io.InputStream input = java.nio.file.Files.newInputStream(directory.resolve("cmdline")))
-                    { argument = readProcFirstArgument(input); }
-                ProcessInfo after = rawInfo(process);
-                if (after == null) return null;
-                return resolveLinuxMetadata(before, name, argument, after);
-            }
-            catch (IOException | RuntimeException failure)
-            {
-                if (!process.isAlive()) return null;
-                throw new IllegalStateException("Process inventory is incomplete", failure);
-            }
+            java.nio.file.Path directory = java.nio.file.Path.of("/proc", Long.toString(process.pid()));
+            return readLinuxMetadata(before,
+                () -> java.nio.file.Files.newInputStream(directory.resolve("comm")),
+                () -> java.nio.file.Files.newInputStream(directory.resolve("cmdline")),
+                () -> rawInfo(process), process::isAlive);
         }
 
         private static ProcessInfo rawInfo(ProcessHandle process)
