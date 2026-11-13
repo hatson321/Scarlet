@@ -47,7 +47,8 @@ public final class ManagedVrcClient
 {
     private static final Set<String> WINE_LOADERS = Set.of("wine", "wine64", "wine-preloader", "wine64-preloader");
     private static final Set<String> WINE_HELPERS = Set.of("services.exe", "winedevice.exe", "plugplay.exe",
-        "rpcss.exe", "svchost.exe", "explorer.exe", "conhost.exe");
+        "rpcss.exe", "svchost.exe", "explorer.exe", "conhost.exe", "steam.exe", "tabtip.exe", "xalia.exe",
+        "unitycrashhandler64.exe");
 
     private ManagedVrcClient() {}
 
@@ -998,8 +999,8 @@ public final class ManagedVrcClient
         // Proton may expose the Wine loader as the executable. Accept only its first
         // argument naming VRChat.exe, never a loose substring or a later shell argument.
         return WINE_LOADERS.contains(executable)
-            && ((namesWineProgram(process) && "vrchat.exe".equals(basename(process.arguments().get(0))))
-                || "vrchat.exe".equals(process.wineProgram));
+            && (process.wineProgram != null ? "vrchat.exe".equals(process.wineProgram)
+                : namesWineProgram(process) && "vrchat.exe".equals(basename(process.arguments().get(0))));
     }
 
     /** Unknown Wine metadata is not evidence that another client can be launched. */
@@ -1048,10 +1049,20 @@ public final class ManagedVrcClient
             return new ProcessInfo(before.pid(), before.startedAt(), before.user(), commandName,
                 before.arguments(), before.parentPid(), null, null, true);
         }
-        if (!WINE_LOADERS.contains(basename(before.executable())) || namesWineProgram(before)) return before;
+        if (!WINE_LOADERS.contains(basename(before.executable()))) return before;
+        // Proton's Steam wrapper passes VRChat.exe as its first argument. Java omits argv[0],
+        // so corroborate the wrapper itself before mistaking its launch target for a client.
+        if (namesWineProgram(before))
+        {
+            if (isClient(before) && completeIdentity(before) && "steam.exe".equalsIgnoreCase(commandName)
+                && isProgramArgument(firstArgument) && "steam.exe".equals(basename(firstArgument)))
+                return new ProcessInfo(before.pid(), before.startedAt(), before.user(), before.executable(),
+                    before.arguments(), before.parentPid(), null, "steam.exe", true);
+            return before;
+        }
         if (!completeIdentity(before) || !validCommandName(commandName) || !isProgramArgument(firstArgument)) return before;
         String program = basename(firstArgument);
-        if (!program.equals(commandName.toLowerCase(Locale.ROOT))
+        if (!matchesWineCommandName(commandName, program)
             || (!"vrchat.exe".equals(program) && !WINE_HELPERS.contains(program))) return before;
         // A conflicting first argument may be a different Windows executable, not
         // argv[0] omitted by Java. Do not reinterpret that ambiguity as a helper.
@@ -1067,12 +1078,32 @@ public final class ManagedVrcClient
     @FunctionalInterface interface ProcInput { java.io.InputStream open() throws IOException; }
 
     /** The same bounded metadata reads used for detection; failures expose no raw values. */
-    static ProcessInfo readLinuxMetadata(ProcessInfo before, ProcInput command, ProcInput argument,
+    static ProcessInfo readLinuxMetadata(ProcessInfo before, ProcInput stat, ProcInput command, ProcInput argument,
         java.util.function.Supplier<ProcessInfo> reread, BooleanSupplier alive)
     {
         VrcClientPresence.Reason stage = VrcClientPresence.Reason.PROC_NAME_UNAVAILABLE;
         try
         {
+            if (before.executable() == null)
+            {
+                stage = VrcClientPresence.Reason.PROC_STAT_UNAVAILABLE;
+                boolean kernelThread;
+                try (java.io.InputStream input = stat.open()) { kernelThread = readProcKernelThread(input, before.pid()); }
+                if (kernelThread)
+                {
+                    stage = VrcClientPresence.Reason.JAVA_METADATA_UNAVAILABLE;
+                    ProcessInfo after = reread.get();
+                    if (after == null) return null;
+                    if (!sameProcess(before, after) || before.parentPid() != after.parentPid())
+                        throw new VrcClientPresence.Failure(VrcClientPresence.Reason.LINUX_IDENTITY_CHANGED, before);
+                    if (before.startedAt() == null || before.user() == null || before.user().isBlank()
+                        || !before.arguments().isEmpty())
+                        throw new VrcClientPresence.Failure(VrcClientPresence.Reason.EXECUTABLE_UNAVAILABLE, before);
+                    // PF_KTHREAD is kernel metadata; a comm name alone cannot exclude a process.
+                    return null;
+                }
+            }
+            stage = VrcClientPresence.Reason.PROC_NAME_UNAVAILABLE;
             String name, firstArgument = null;
             try (java.io.InputStream input = command.open()) { name = readProcCommandName(input); }
             if (before.executable() != null)
@@ -1102,7 +1133,7 @@ public final class ManagedVrcClient
         if (!validCommandName(name)) return VrcClientPresence.Reason.WINE_NAME_INVALID;
         if (!isProgramArgument(argument)) return VrcClientPresence.Reason.WINE_ARGV0_NOT_PROGRAM;
         String program = basename(argument);
-        if (!program.equals(name.toLowerCase(Locale.ROOT))) return VrcClientPresence.Reason.WINE_NAME_MISMATCH;
+        if (!matchesWineCommandName(name, program)) return VrcClientPresence.Reason.WINE_NAME_MISMATCH;
         if (!"vrchat.exe".equals(program) && !WINE_HELPERS.contains(program)) return VrcClientPresence.Reason.WINE_PROGRAM_UNRECOGNIZED;
         if (!before.arguments().isEmpty())
         {
@@ -1117,6 +1148,41 @@ public final class ManagedVrcClient
         return name != null && !name.isBlank() && name.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 15
             && name.indexOf('\0') < 0 && name.indexOf('\n') < 0 && name.indexOf('\r') < 0
             && name.indexOf('/') < 0 && name.indexOf('\\') < 0;
+    }
+
+    private static boolean matchesWineCommandName(String name, String program)
+    {
+        String command = name.toLowerCase(Locale.ROOT);
+        // Linux truncates comm to 15 bytes. Only an exact, known ASCII helper argv[0]
+        // may corroborate that prefix; neither an unknown program nor VRChat gains this fallback.
+        return program.equals(command) || (WINE_HELPERS.contains(program) && program.length() > 15
+            && program.substring(0, 15).equals(command));
+    }
+
+    /** Kernel workers can have extended comm names; classify them without interpreting those names. */
+    static boolean readProcKernelThread(java.io.InputStream input, long expectedPid) throws IOException
+    {
+        byte[] value = input.readNBytes(4097);
+        if (expectedPid <= 0L || value.length == 0 || value.length > 4096 || value[value.length - 1] != '\n')
+            throw new IOException("Incomplete process status");
+        String record = new String(value, java.nio.charset.StandardCharsets.ISO_8859_1);
+        String prefix = Long.toString(expectedPid) + " (";
+        int end = record.lastIndexOf(") ");
+        if (!record.startsWith(prefix) || end < prefix.length() || end - prefix.length() > 63
+            || record.indexOf('\0') >= 0 || record.indexOf('\r') >= 0 || record.indexOf('\n') != record.length() - 1)
+            throw new IOException("Invalid process status");
+        // The comm field may contain spaces or parentheses. Numeric fields follow its final ')'.
+        String[] fields = record.substring(end + 2, record.length() - 1).split(" ", -1);
+        if (fields.length < 20 || fields[0].length() != 1 || "RSDZTtXxKWPI".indexOf(fields[0].charAt(0)) < 0)
+            throw new IOException("Invalid process status fields");
+        for (int i = 1; i < fields.length; i++)
+            if (!fields[i].matches("-?[0-9]+")) throw new IOException("Invalid process status number");
+        try
+        {
+            if (fields[6].startsWith("-")) throw new NumberFormatException();
+            return (Long.parseUnsignedLong(fields[6]) & 0x00200000L) != 0L;
+        }
+        catch (NumberFormatException invalid) { throw new IOException("Invalid process flags"); }
     }
 
     static String readProcCommandName(java.io.InputStream input) throws IOException
@@ -1263,10 +1329,12 @@ public final class ManagedVrcClient
                     throw new VrcClientPresence.Failure(VrcClientPresence.Reason.LINUX_IDENTITY_CHANGED, before);
                 return before;
             }
-            if (before.executable() != null && (!WINE_LOADERS.contains(basename(before.executable())) || namesWineProgram(before)))
+            if (before.executable() != null && (!WINE_LOADERS.contains(basename(before.executable()))
+                || (namesWineProgram(before) && !isClient(before))))
                 return before;
             java.nio.file.Path directory = java.nio.file.Path.of("/proc", Long.toString(process.pid()));
             return readLinuxMetadata(before,
+                () -> java.nio.file.Files.newInputStream(directory.resolve("stat")),
                 () -> java.nio.file.Files.newInputStream(directory.resolve("comm")),
                 () -> java.nio.file.Files.newInputStream(directory.resolve("cmdline")),
                 () -> rawInfo(process), process::isAlive);

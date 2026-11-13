@@ -62,6 +62,11 @@ class VrcProcessDiagnosticTest
         return new ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8));
     }
 
+    private static ManagedVrcClient.ProcInput userStat()
+    {
+        return () -> bytes("987654321 (synthetic) S 0 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 1\n");
+    }
+
     private static VrcClientPresence failed(Runnable operation)
     {
         Throwable failure = assertThrows(IllegalStateException.class, operation::run);
@@ -162,7 +167,7 @@ class VrcProcessDiagnosticTest
 
     @Test void procNameReadFailureIsIdentifiedWithoutReadingArgumentsOrAnotherIdentity()
     {
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(),
             () -> { throw new IOException("/proc/" + PRIVATE + "/comm"); },
             () -> { fail("No argument read after name failure"); return null; },
             () -> { fail("No reread after name failure"); return null; }, () -> true)), "proc-name-unavailable");
@@ -171,58 +176,58 @@ class VrcProcessDiagnosticTest
     @Test void malformedAndOversizedProcNamesUseTheSameSafeReadFailure()
     {
         for (String value : List.of("", "x".repeat(20), "VRChat.exe\nextra", "bad\0name\n"))
-            reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes(value),
+            reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes(value),
                 () -> bytes(PRIVATE), () -> loader(), () -> true)), "proc-name-unavailable");
     }
 
     @Test void argvZeroFailureIsIdentifiedWithoutReadingTheRestOfTheCommandLine()
     {
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("VRChat.exe\n"),
             () -> { throw new IOException(PRIVATE); }, () -> loader(), () -> true)), "proc-argv0-unavailable");
         ByteArrayInputStream huge = bytes("x".repeat(4096) + "\0" + PRIVATE);
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("VRChat.exe\n"),
             () -> huge, () -> loader(), () -> true)), "proc-argv0-unavailable");
         assertEquals(0, huge.read(), "The existing bounded parser must not consume more than 4096 bytes");
     }
 
     @Test void secondJavaIdentityFailureIsDistinguishedFromProcReadFailure()
     {
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("VRChat.exe\n"),
             () -> bytes("VRChat.exe\0"), () -> { throw new SecurityException(PRIVATE); }, () -> true)), "java-metadata-unavailable");
     }
 
     @Test void changingIdentityCannotBeTurnedIntoConfirmedPresence()
     {
         ProcessInfo changed = new ProcessInfo(987654321L, NOW.plusSeconds(1), PRIVATE, loader().executable(), List.of());
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("VRChat.exe\n"),
             () -> bytes("VRChat.exe\0"), () -> changed, () -> true)), "linux-identity-changed");
     }
 
     @Test void processExitDuringMetadataFailureIsStillIgnored()
     {
-        assertNull(ManagedVrcClient.readLinuxMetadata(loader(), () -> { throw new IOException(PRIVATE); },
+        assertNull(ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> { throw new IOException(PRIVATE); },
             () -> bytes(""), () -> loader(), () -> false));
-        assertNull(ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("VRChat.exe\n"),
+        assertNull(ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("VRChat.exe\n"),
             () -> bytes("VRChat.exe\0"), () -> null, () -> false));
     }
 
     @Test void mismatchedNamesAndUnsupportedProgramsHaveActionableReasons()
     {
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("services.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("services.exe\n"),
             () -> bytes("VRChat.exe\0"), () -> loader(), () -> true)), "wine-name-mismatch");
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("other.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("other.exe\n"),
             () -> bytes("C:/" + PRIVATE + "/other.exe\0"), () -> loader(), () -> true)), "wine-program-unrecognized");
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(loader(), userStat(), () -> bytes("VRChat.exe\n"),
             () -> bytes("--" + PRIVATE + "\0"), () -> loader(), () -> true)), "wine-argv0-not-program");
     }
 
     @Test void incompleteIdentityAndConflictingArgumentsStayUntrusted()
     {
         ProcessInfo incomplete = new ProcessInfo(987654321L, null, PRIVATE, loader().executable(), List.of());
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(incomplete, () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(incomplete, userStat(), () -> bytes("VRChat.exe\n"),
             () -> bytes("VRChat.exe\0"), () -> incomplete, () -> true)), "wine-identity-incomplete");
         ProcessInfo conflict = process(loader().executable(), List.of("--private.exe"));
-        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(conflict, () -> bytes("VRChat.exe\n"),
+        reason(failed(() -> ManagedVrcClient.readLinuxMetadata(conflict, userStat(), () -> bytes("VRChat.exe\n"),
             () -> bytes("VRChat.exe\0"), () -> conflict, () -> true)), "wine-argument-conflict");
     }
 
@@ -230,7 +235,7 @@ class VrcProcessDiagnosticTest
     {
         ProcessInfo raw = loader();
         ByteArrayInputStream arguments = bytes("C:/" + PRIVATE + "/VRChat.exe\0--private-argument\0");
-        ProcessInfo result = ManagedVrcClient.readLinuxMetadata(raw, () -> bytes("VRChat.exe\n"),
+        ProcessInfo result = ManagedVrcClient.readLinuxMetadata(raw, userStat(), () -> bytes("VRChat.exe\n"),
             () -> arguments, () -> raw, () -> true);
         assertEquals('-', arguments.read());
         assertTrue(result.inventoryOnly());
@@ -247,12 +252,12 @@ class VrcProcessDiagnosticTest
     @Test void nameOnlyFallbackDoesNotReadArgumentsAndKnownHelpersRemainNonClients()
     {
         ProcessInfo hidden = process(null, List.of());
-        ProcessInfo fallback = ManagedVrcClient.readLinuxMetadata(hidden, () -> bytes("VRChat.exe\n"),
+        ProcessInfo fallback = ManagedVrcClient.readLinuxMetadata(hidden, userStat(), () -> bytes("VRChat.exe\n"),
             () -> { fail("No argv read for the existing name-only fallback"); return null; }, () -> hidden, () -> true);
         assertTrue(fallback.inventoryOnly());
         assertTrue(ManagedVrcClient.isClient(fallback));
         ProcessInfo raw = loader();
-        ProcessInfo helper = ManagedVrcClient.readLinuxMetadata(raw, () -> bytes("services.exe\n"),
+        ProcessInfo helper = ManagedVrcClient.readLinuxMetadata(raw, userStat(), () -> bytes("services.exe\n"),
             () -> bytes("services.exe\0"), () -> raw, () -> true);
         assertFalse(ManagedVrcClient.isClient(helper));
         assertFalse(ManagedVrcClient.uncertainWineIdentity(helper));
